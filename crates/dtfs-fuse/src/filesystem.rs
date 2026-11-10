@@ -806,8 +806,8 @@ pub struct DtfsFilesystem {
     /// path -> `(failed id, boundary)` per failed background batch: ids
     /// strictly between them were drained before its restore and must not
     /// commit (`fail_bg_batch`, `bg_is_doomed`). Ids never repeat, so a stale
-    /// range dooms nothing new; write() drops the entry once the path has no
-    /// batch in flight (`bg_may_start`).
+    /// range dooms nothing new; write() (`bg_may_start`), commit_all, unlink
+    /// and rename drop the entry once the path has no batch in flight.
     bg_doom: DashMap<String, Vec<(u64, u64)>>,
     /// Woken whenever a background upload ends (`wait_bg_uploads`).
     bg_done: tokio::sync::Notify,
@@ -2478,6 +2478,8 @@ impl DtfsFilesystem {
         // ALL of write()'s background batches are committed or restored (an
         // error is then pending on the fh). Callers hold `path_guard`: no new one starts.
         self.wait_bg_uploads(&path).await;
+        // Nothing in flight under the guard: no doomed id can still be pushed.
+        self.bg_doom.remove(&path);
 
         // P0-1: if a lease is held and is past the renewal threshold,
         // renew BEFORE issuing the cluster writes. Otherwise a large flush
@@ -2958,6 +2960,7 @@ impl DtfsFilesystem {
         // A background batch commits by path: let it land in the old file
         // before the name can be deleted and re-created.
         self.wait_bg_uploads(path).await;
+        self.bg_doom.remove(path);
         let response = self
             .client
             .delete_file(path)
@@ -3222,6 +3225,7 @@ impl DtfsFilesystem {
         // No background upload may commit or restore across the re-key.
         for (p, _) in &guards {
             self.wait_bg_uploads(p).await;
+            self.bg_doom.remove(p);
         }
         let res = self.rename_inner(from, to).await;
         for (p, g) in guards {
@@ -6695,6 +6699,26 @@ mod async_commit_fs_tests {
         assert!(pending(fs.unlink("/f")).await, "unlink ran without the path guard");
         fs.drop_path_guard("/f", g);
         assert!(fs.unlink("/f").await.is_err(), "no managers");
+    }
+
+    /// Audit 17: `bg_doom` must not only grow. Once a path has no batch in
+    /// flight under its guard (commit_all, unlink, rename), its ranges are
+    /// dropped; a path whose guard is not held keeps its ranges.
+    #[tokio::test]
+    async fn bg_doom_dropped_once_nothing_is_in_flight() {
+        let fs = fs(true);
+        for p in ["/f", "/u", "/a", "/b", "/g"] {
+            fs.bg_doom.insert(p.to_string(), vec![(1, 3)]);
+        }
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let _ = fs.commit_all(fh).await;
+        assert!(!fs.bg_doom.contains_key("/f"), "commit_all kept /f's doom ranges");
+        assert!(fs.unlink("/u").await.is_err(), "no managers");
+        assert!(!fs.bg_doom.contains_key("/u"), "unlink kept /u's doom ranges");
+        assert!(fs.rename("/a", "/b").await.is_err(), "no managers");
+        assert!(!fs.bg_doom.contains_key("/a"), "rename kept from's doom ranges");
+        // Unguarded paths keep theirs: `to` without an open writer, any other.
+        assert!(fs.bg_doom.contains_key("/b") && fs.bg_doom.contains_key("/g"));
     }
 
     /// R2-3: a commit sends the committing fh's own lease, not the first

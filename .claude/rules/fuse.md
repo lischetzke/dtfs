@@ -287,8 +287,8 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   chunks instead of uploading/committing above the hole. write() starts no
   new batch while one of the path is doomed (`bg_may_start`; else each new
   batch takes the restored chunks and is doomed in turn); once they ended,
-  batches retry them lowest index first, one batch size each, and write() drops the ranges when
-  the path has none in flight. The
+  batches retry them lowest index first, one batch size each, and write(), `commit_all`, unlink and rename drop
+  the ranges of a path whose `path_guard` they hold when the path has none in flight. The
   per-file dirty cap is `max(128 MB, (n + 1) x batch limit)` (`dirty_cap_for`;
   n = 1 when async_commit is off). The task
   (`bg_upload`) renews the lease (`renew_if_due`), keeps `begin_inflight`
