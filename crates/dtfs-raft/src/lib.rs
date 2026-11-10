@@ -871,6 +871,10 @@ pub enum ClientRequest {
         /// Proposer wall-clock (A.3.1 / CR-2-5); `0` falls back to `log_id.index`.
         #[serde(default)]
         now_ms: u64,
+        /// Same as `RemoveChunkLocation.chunk_hash`: `Some` matches only a
+        /// row of that hash and refuses another-hash row; `None` is hash-blind.
+        #[serde(default)]
+        chunk_hash: Option<String>,
     },
 }
 

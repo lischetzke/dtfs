@@ -2389,8 +2389,7 @@ pub(crate) fn apply_request(
             apply_set_chunk_cooldown(sm, path, chunk_indexes, *expires_at_ms)
         }
 
-        ClientRequest::RemoveDeadNodeReplica { path, chunk_index, node_id, disk_id, .. } => {
-            let nid: Option<u64> = node_id.parse().ok();
+        ClientRequest::RemoveDeadNodeReplica { path, chunk_index, node_id, disk_id, chunk_hash, .. } => {            let nid: Option<u64> = node_id.parse().ok();
             let dead = nid
                 .and_then(|n| sm.nodes.get(&n))
                 .map(|n| {
@@ -2409,10 +2408,26 @@ pub(crate) fn apply_request(
             let Some(file) = sm.files.get(path) else {
                 return ClientResponse::Success;
             };
-            let is_row = |c: &ChunkLocationEntry| {
+            let at_loc = |c: &ChunkLocationEntry| {
                 c.chunk_index == *chunk_index && c.node_id == *node_id && c.disk_id == *disk_id
             };
+            let is_row = |c: &ChunkLocationEntry| {
+                at_loc(c) && chunk_hash.as_deref().map_or(true, |h| c.chunk_hash == h)
+            };
             if !file.chunks.iter().any(is_row) {
+                // MGR-1 — same rule as RemoveChunkLocation: a row at the
+                // location with another hash means the file was replaced.
+                if let Some(h) = chunk_hash {
+                    if file.chunks.iter().any(at_loc) {
+                        tracing::warn!(%path, chunk_index, %node_id, disk_id, "RemoveDeadNodeReplica refused: row holds another chunk_hash");
+                        return ClientResponse::Error {
+                            message: format!(
+                                "RemoveDeadNodeReplica refused: {path}#{chunk_index} on node {node_id} disk {disk_id} \
+                                 holds another chunk_hash than the planned {h}"
+                            ),
+                        };
+                    }
+                }
                 return ClientResponse::Success; // idempotent
             }
             if file

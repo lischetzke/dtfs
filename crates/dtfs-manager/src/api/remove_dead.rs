@@ -211,6 +211,7 @@ pub(super) async fn remove_dead_node_endpoint(
                 node_id: nid_str.clone(),
                 disk_id: r.disk_id,
                 now_ms: crate::metadata::stamp_now_ms(),
+                chunk_hash: r.chunk_hash.clone(),
             };
             match propose(&state, req).await {
                 Ok(()) => loss_removed += 1,
@@ -233,6 +234,7 @@ pub(super) async fn remove_dead_node_endpoint(
                 node_id: nid_str.clone(),
                 disk_id: r.disk_id,
                 now_ms: crate::metadata::stamp_now_ms(),
+                chunk_hash: r.chunk_hash.clone(),
             };
             match propose(&state, req).await {
                 Ok(()) => loss_removed += 1,

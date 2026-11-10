@@ -251,11 +251,23 @@ fn remove_dead_node_replica_wire_shape() {
     )
     .unwrap();
     match r {
-        ClientRequest::RemoveDeadNodeReplica { path, chunk_index, node_id, disk_id, now_ms } => {
+        ClientRequest::RemoveDeadNodeReplica { path, chunk_index, node_id, disk_id, now_ms, chunk_hash } => {
             assert_eq!((path.as_str(), chunk_index, node_id.as_str(), disk_id, now_ms), ("/a", 2, "7", 1, 0));
+            assert_eq!(chunk_hash, None, "pre-MGR-1 entry stays hash-blind");
         }
         other => panic!("wrong variant: {}", variant_name(&other)),
     }
+}
+
+/// MGR-1 — the v2 entry carries the planned hash.
+#[test]
+fn remove_dead_node_replica_v2_entry_carries_chunk_hash() {
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V2).unwrap();
+    let hash = reqs.iter().find_map(|r| match r {
+        ClientRequest::RemoveDeadNodeReplica { chunk_hash, .. } => Some(chunk_hash.clone()),
+        _ => None,
+    });
+    assert_eq!(hash, Some(Some(chunk(0).chunk_hash)));
 }
 
 fn testdata(name: &str) -> std::path::PathBuf {

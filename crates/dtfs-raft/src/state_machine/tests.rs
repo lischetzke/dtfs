@@ -1659,7 +1659,32 @@ mod posix_path_regression {
     fn dead_req(node: &str) -> ClientRequest {
         ClientRequest::RemoveDeadNodeReplica {
             path: "/x".into(), chunk_index: 0, node_id: node.into(), disk_id: 0, now_ms: 77,
+            chunk_hash: None,
         }
+    }
+
+    /// MGR-1 — a named RemoveDeadNodeReplica removes only a row of that
+    /// hash; another-hash row at the location (file replaced) is refused.
+    #[test]
+    fn remove_dead_node_replica_named_hash_matches_or_refuses() {
+        use dtfs_common::types::{DiskTier, HealthStatus};
+        let mut sm = sm_with_chunk("/x", 0, "h", &[(10, "leli", DiskTier::Cold)]);
+        sm.nodes.get_mut(&10).unwrap().health = HealthStatus::Down;
+        let named = |h: &str| ClientRequest::RemoveDeadNodeReplica {
+            path: "/x".into(), chunk_index: 0, node_id: "10".into(), disk_id: 0, now_ms: 77,
+            chunk_hash: Some(h.into()),
+        };
+        let mut refused = sm.clone();
+        match apply_request(&mut refused, &mk_log_id(1), &named("other")) {
+            ClientResponse::Error { message } => {
+                assert!(message.contains("holds another chunk_hash than the planned other"), "{message}")
+            }
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        assert_eq!(refused.files["/x"].chunks.len(), 1, "other-hash row kept");
+        assert!(matches!(apply_request(&mut sm, &mk_log_id(2), &named("h")), ClientResponse::Success));
+        assert!(!sm.files.contains_key("/x"), "matching row removed (file moved to lost)");
+        assert!(sm.files["/.dtfs-lost/x"].chunks.is_empty());
     }
 
     /// Remove-dead-node data-loss arm: refuses a live node and a chunk that
@@ -1749,6 +1774,7 @@ mod posix_path_regression {
         sm.nodes.get_mut(&10).unwrap().health = HealthStatus::Down;
         let req = |p: &str| ClientRequest::RemoveDeadNodeReplica {
             path: p.into(), chunk_index: 0, node_id: "10".into(), disk_id: 0, now_ms: 5,
+            chunk_hash: None,
         };
         // Occupy the first target so the suffix path is exercised.
         sm.files.insert("/.dtfs-lost/a/x".into(), FileMetadata { path: "/.dtfs-lost/a/x".into(), ..sm.files["/other"].clone() });
@@ -1769,6 +1795,7 @@ mod posix_path_regression {
         sm.nodes.get_mut(&11).unwrap().health = HealthStatus::Down;
         let again = ClientRequest::RemoveDeadNodeReplica {
             path: "/.dtfs-lost/a/x.1".into(), chunk_index: 1, node_id: "11".into(), disk_id: 0, now_ms: 6,
+            chunk_hash: None,
         };
         assert!(matches!(apply_request(&mut sm, &mk_log_id(2), &again), ClientResponse::Success));
         assert!(sm.files.contains_key("/.dtfs-lost/a/x.1"), "stays in place");
