@@ -1089,6 +1089,12 @@ pub struct FuseClientConfig {
     /// `chunk_size_mb` to that volume's chunk size.
     #[serde(default)]
     pub volume_id: String,
+    /// Process names (`/proc/<pid>/comm`, exact match, kernel truncates to
+    /// 15 chars) whose reads through this mount are untracked: chunks are
+    /// fetched (and verified) with no requester DC and no cache-hit
+    /// notification, so a library scan never promotes or pre-caches.
+    #[serde(default)]
+    pub untracked_read_processes: Vec<String>,
 }
 
 impl FuseClientConfig {
@@ -2420,5 +2426,15 @@ max_message_size_mb = 0
             let err = cfg.validate().unwrap_err();
             assert!(err.contains("volume_id"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn fuse_client_untracked_read_processes_defaults_empty_and_parses() {
+        let parse = |extra: &str| -> FuseClientConfig {
+            toml::from_str(&format!("manager_addr = \"m:1\"\n{extra}")).unwrap()
+        };
+        assert!(parse("").untracked_read_processes.is_empty());
+        let cfg = parse("untracked_read_processes = [\"Plex Media Scan\"]");
+        assert_eq!(cfg.untracked_read_processes, vec!["Plex Media Scan".to_string()]);
     }
 }

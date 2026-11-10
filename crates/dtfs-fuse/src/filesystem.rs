@@ -216,6 +216,18 @@ fn should_notify(last: Option<u32>, current: u32) -> bool {
     last != Some(current)
 }
 
+/// `record_cache_hit` fires on a chunk transition of a tracked fh only.
+fn cache_hit_notify_wanted(is_new_chunk: bool, untracked: bool) -> bool {
+    is_new_chunk && !untracked
+}
+
+/// `untracked_read_processes` match: exact, after trimming the trailing
+/// newline of `/proc/<pid>/comm`. A partial name never matches.
+pub(crate) fn comm_matches(comm: &str, untracked: &[String]) -> bool {
+    let comm = comm.trim();
+    !comm.is_empty() && untracked.iter().any(|p| p == comm)
+}
+
 /// CR2-8-3 (FUSE-11) — decide whether a read looks like a viewer
 /// (playback) rather than a scanner (stat + header read) for the disk
 /// cache's atime hint.
@@ -794,6 +806,10 @@ struct OpenFile {
     /// no longer counts as another writer for `defer_close_commit`. Sticky:
     /// a dup'd fd closing early only makes other closes commit more.
     close_seen: bool,
+    /// Opened by a process in `untracked_read_processes`: reads through this
+    /// fh (and the readahead they start) carry no requester DC and send no
+    /// `record_cache_hit`; bytes are verified as usual.
+    untracked: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,6 +1152,25 @@ impl DtfsFilesystem {
         Ok(entries)
     }
 
+    /// Mark `fh` untracked when the opening process (`/proc/<pid>/comm`) is
+    /// in `untracked_read_processes`. Unreadable comm (process gone, no
+    /// /proc) leaves the fh tracked.
+    pub fn mark_untracked_by_pid(&self, fh: u64, pid: u32) {
+        let list = &self.config.client.untracked_read_processes;
+        if list.is_empty() {
+            return;
+        }
+        let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+            return;
+        };
+        if comm_matches(&comm, list) {
+            if let Some(mut f) = self.open_files.get_mut(&fh) {
+                f.untracked = true;
+            }
+            debug!(fh, pid, comm = comm.trim(), "open by an untracked read process");
+        }
+    }
+
     /// Open a file and return a file handle; the caller signals `O_APPEND`. Used by the
     /// fuse3 adapter when the kernel passes the open-flag bitmask, so every
     /// subsequent write lands at the current end-of-file (F-021).
@@ -1305,6 +1340,7 @@ impl DtfsFilesystem {
                 write_error: None,
                 failed_chunks: Vec::new(),
                 close_seen: false,
+                untracked: false,
             },
         );
         self.inherit_bg_failure(fh);
@@ -1393,12 +1429,12 @@ impl DtfsFilesystem {
         // stalled chunk fetch must not hold the open_files entry guard, or it
         // serializes / deadlocks concurrent opens of the same file. Mirrors
         // the write()/flush() idiom.
-        let (cached, chunk_size, file_path) = {
+        let (cached, chunk_size, file_path, untracked) = {
             let file = self
                 .open_files
                 .get(&fh)
                 .context("invalid file handle")?;
-            (file.locations.clone(), file.chunk_size, file.path.clone())
+            (file.locations.clone(), file.chunk_size, file.path.clone(), file.untracked)
         }; // guard dropped here, before the await loop below
         // `None` = a post-commit refresh failed and marked the snapshot stale.
         let locations = match cached {
@@ -1637,7 +1673,7 @@ impl DtfsFilesystem {
             // used to fire ~32 of these RPCs per chunk. Also bounded by
             // a semaphore: a permit-less notify is simply skipped (a
             // missed metrics ping is acceptable, unlike a stalled read).
-            if is_new_chunk_for_fh {
+            if cache_hit_notify_wanted(is_new_chunk_for_fh, untracked) {
                 if let Some(notify_addr) = cache_hit_notify_addr.clone() {
                     match self.cache_hit_notify_permits.clone().try_acquire_owned() {
                         Ok(permit) => {
@@ -1700,7 +1736,7 @@ impl DtfsFilesystem {
                                 // fetch it ourselves rather than failing
                                 // this read outright.
                                 let (_, d) = self
-                                    .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id)
+                                    .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id, !untracked)
                                     .await?;
                                 d
                             }
@@ -1708,7 +1744,7 @@ impl DtfsFilesystem {
                     }
                     ForegroundFetchClaim::Owner(tx) => {
                         let fetch_result = self
-                            .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id)
+                            .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id, !untracked)
                             .await;
                         let (node_addr, data) = match fetch_result {
                             Ok(v) => v,
@@ -1801,11 +1837,12 @@ impl DtfsFilesystem {
                     .chunks_in(first, chunk_idx as u64 + window as u64)
                     .map(|(idx, c)| (idx, c.chunk_id.clone(), self.read_candidates(c)))
                     .collect();
-                self.readahead.on_chunk_read(
+                self.readahead.on_chunk_read_as(
                     &file_path,
                     chunk_idx as u32,
                     total_chunks,
                     &chunk_locs,
+                    !untracked,
                 );
             }
 
@@ -3180,6 +3217,7 @@ impl DtfsFilesystem {
                 write_error: None,
                 failed_chunks: Vec::new(),
                 close_seen: false,
+                untracked: false,
             },
         );
         self.inherit_bg_failure(fh);
@@ -3818,11 +3856,12 @@ impl DtfsFilesystem {
         &self,
         candidates: &[String],
         chunk_id: &str,
+        track: bool,
     ) -> Result<(String, bytes::Bytes)> {
         let fetch_timeout_secs = self.config.client.chunk_read_timeout_secs;
         let mut last_err: Option<anyhow::Error> = None;
         for cand in candidates {
-            let fetch = self.client.read_chunk(cand, chunk_id);
+            let fetch = self.client.read_chunk_as(cand, chunk_id, track);
             let result = if fetch_timeout_secs == 0 {
                 fetch.await
             } else {
@@ -4444,7 +4483,7 @@ impl DtfsFilesystem {
         }
         let candidates = self.read_candidates(chunk);
         let (_, existing) = self
-            .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id)
+            .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id, true)
             .await
             .with_context(|| format!("RMW seed read failed for {path} chunk {chunk_idx}"))?;
         let keep = seed_len_within_eof(existing.len(), chunk_idx * chunk_size, eof);
@@ -6854,6 +6893,82 @@ mod commit_tracker_tests {
     }
 }
 
+#[cfg(test)]
+mod untracked_read_process_tests {
+    use super::*;
+
+    fn fs_with(list: &[&str]) -> DtfsFilesystem {
+        let mut cfg: FuseConfig =
+            toml::from_str(include_str!("../../../deploy/examples/fuse.toml")).unwrap();
+        cfg.client.untracked_read_processes = list.iter().map(|s| s.to_string()).collect();
+        DtfsFilesystem::new(DtfsClient::new(), cfg.location.clone(), cfg)
+    }
+
+    fn insert_fh(fs: &DtfsFilesystem) -> u64 {
+        let fh = fs.next_fh.fetch_add(1, Ordering::Relaxed);
+        fs.open_files.insert(
+            fh,
+            OpenFile {
+                path: "/f".to_string(),
+                flags: OpenFlags::ReadOnly,
+                append: false,
+                locations: None,
+                chunk_size: 4 << 20,
+                lease_id: None,
+                lease_deadline: None,
+                lease_owner_id: None,
+                committed_any: true,
+                last_read_chunk: None,
+                bytes_read_on_fh: 0,
+                holes_confirmed: None,
+                eof_refetch_at: None,
+                write_error: None,
+                failed_chunks: Vec::new(),
+                close_seen: false,
+                untracked: false,
+            },
+        );
+        fh
+    }
+
+    #[test]
+    fn comm_matches_is_exact() {
+        let l = vec!["Plex Media Scan".to_string()];
+        assert!(comm_matches("Plex Media Scan\n", &l));
+        assert!(!comm_matches("Plex Media Scanner\n", &l), "longer name");
+        assert!(!comm_matches("Plex Media", &l), "partial name");
+        assert!(!comm_matches("\n", &[String::new()]), "empty comm never matches");
+        assert!(!comm_matches("Plex Media Scan", &[]));
+    }
+
+    #[test]
+    fn untracked_fh_sends_no_cache_hit_notify() {
+        assert!(cache_hit_notify_wanted(true, false));
+        assert!(!cache_hit_notify_wanted(true, true), "untracked fh must not notify");
+        assert!(!cache_hit_notify_wanted(false, false), "no transition, no notify");
+    }
+
+    /// Opening process = this test binary: its comm decides the fh's flag.
+    #[test]
+    fn open_by_listed_process_marks_fh_untracked() {
+        let me = std::fs::read_to_string("/proc/self/comm").unwrap();
+        let pid = std::process::id();
+        let fs = fs_with(&[me.trim()]);
+        let fh = insert_fh(&fs);
+        fs.mark_untracked_by_pid(fh, pid);
+        assert!(fs.open_files.get(&fh).unwrap().untracked);
+
+        let fs = fs_with(&["no-such-process"]);
+        let fh = insert_fh(&fs);
+        fs.mark_untracked_by_pid(fh, pid);
+        assert!(!fs.open_files.get(&fh).unwrap().untracked, "unlisted process stays tracked");
+        let fs = fs_with(&[]);
+        let fh = insert_fh(&fs);
+        fs.mark_untracked_by_pid(fh, pid);
+        assert!(!fs.open_files.get(&fh).unwrap().untracked, "empty list tracks everything");
+    }
+}
+
 /// `write.async_commit` on a filesystem whose client has no manager: every
 /// upload attempt fails fast ("no managers configured"), so an `Err` proves
 /// an upload was attempted and `Ok` with the bytes still buffered proves none was.
@@ -6891,6 +7006,7 @@ mod async_commit_fs_tests {
                 write_error: None,
                 failed_chunks: Vec::new(),
                 close_seen: false,
+                untracked: false,
             },
         );
         fh
@@ -8603,7 +8719,7 @@ mod async_commit_fs_tests {
         let (a, b) = ("127.0.0.1:1".to_string(), "127.0.0.1:2".to_string());
         let chunk1 = committed_chunk_info(1, &"d".repeat(64), 10, vec![a.clone(), b.clone()], "warm");
         assert_eq!(fs.read_candidates(&chunk1), [a.clone(), b.clone()]);
-        assert!(fs.fetch_chunk_from_candidates(&[a.clone()], &"c".repeat(64)).await.is_err());
+        assert!(fs.fetch_chunk_from_candidates(&[a.clone()], &"c".repeat(64), true).await.is_err());
         assert_eq!(fs.read_candidates(&chunk1), [b.clone(), a.clone()], "dead replica still first");
         let now = Instant::now();
         let order = vec![a.clone(), b.clone()];

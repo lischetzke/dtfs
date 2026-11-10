@@ -641,7 +641,7 @@ impl Filesystem for DtfsFuse3Adapter {
 
     async fn open(
         &self,
-        _req: Request,
+        req: Request,
         inode: u64,
         flags: u32,
     ) -> FuseResult<ReplyOpen> {
@@ -655,6 +655,7 @@ impl Filesystem for DtfsFuse3Adapter {
             .await
         {
             Ok(fh) => {
+                self.fs.mark_untracked_by_pid(fh, req.pid);
                 // FUSE_ATOMIC_O_TRUNC: the kernel passes O_TRUNC here and
                 // skips its own truncate, so honour it or the stale tail
                 // of the old file survives (`echo hi > existing`).

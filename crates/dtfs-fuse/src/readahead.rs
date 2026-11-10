@@ -365,13 +365,26 @@ impl ReadAheadEngine {
     ///   `addrs[0]`. The explicit index also removes the positional aliasing
     ///   REV-2-1 fixed on the foreground path: a sparse file's
     ///   `chunk_locations[i]` is not chunk `i`.
-    #[instrument(skip(self, chunk_locations), fields(path = %file_path, chunk = chunk_index, total = total_chunks))]
     pub fn on_chunk_read(
         &self,
         file_path: &str,
         chunk_index: u32,
         total_chunks: u32,
         chunk_locations: &[(u64, String, Vec<String>)],
+    ) {
+        self.on_chunk_read_as(file_path, chunk_index, total_chunks, chunk_locations, true);
+    }
+
+    /// `on_chunk_read`; `track = false` makes the prefetches it spawns fetch
+    /// with no requester DC (an untracked fh's readahead).
+    #[instrument(skip(self, chunk_locations), fields(path = %file_path, chunk = chunk_index, total = total_chunks))]
+    pub fn on_chunk_read_as(
+        &self,
+        file_path: &str,
+        chunk_index: u32,
+        total_chunks: u32,
+        chunk_locations: &[(u64, String, Vec<String>)],
+        track: bool,
     ) {
         let n = self.mode.prefetch_chunks();
         if n == 0 {
@@ -434,6 +447,7 @@ impl ReadAheadEngine {
                     chunk_id.clone(),
                     file_path,
                     prev.take(),
+                    track,
                 ));
             }
         }
@@ -539,6 +553,7 @@ impl ReadAheadEngine {
         chunk_id: String,
         file_path: &str,
         prev_acquired: Option<oneshot::Receiver<()>>,
+        track: bool,
     ) -> oneshot::Receiver<()> {
         let client = self.client.clone();
         let fetch_timeout = self.fetch_timeout;
@@ -621,8 +636,8 @@ impl ReadAheadEngine {
 
             // FUSE-2 — bound the fetch so a hung replica releases the permit.
             let fetch = match fetch_timeout {
-                None => client.read_chunk(&node_addr, &chunk_id).await,
-                Some(t) => match tokio::time::timeout(t, client.read_chunk(&node_addr, &chunk_id)).await {
+                None => client.read_chunk_as(&node_addr, &chunk_id, track).await,
+                Some(t) => match tokio::time::timeout(t, client.read_chunk_as(&node_addr, &chunk_id, track)).await {
                     Ok(res) => res,
                     Err(_) => Err(anyhow::anyhow!(
                         "prefetch of {chunk_id} from {node_addr} timed out after {}s",

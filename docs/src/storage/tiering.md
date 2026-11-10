@@ -14,6 +14,14 @@ See [Volume Configuration](../configuration/volume-config.md#replication-classes
 
 The engine ticks every `tiering.evaluation_interval_secs` (default **3600**, one hour; set a shorter value if you want faster promotion). Only the leader acts; a follower skips the tick.
 
+### Scan exclusion
+
+A FUSE mount can list library-scanner process names in
+`untracked_read_processes` ([FUSE client](../configuration/fuse-client.md)).
+Their reads are still verified but carry no requester DC and send no
+cache-hit notification, so the engine never counts them as demand and a
+scan promotes nothing.
+
 ### Promotion math
 
 For each `(chunk, DC, cache-tier)` triple, the engine evaluates on
