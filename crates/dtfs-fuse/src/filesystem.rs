@@ -617,6 +617,20 @@ fn file_changed_under_lease(snap: &FileLocations, fresh: &FileLocations, quiet: 
             }))
 }
 
+/// #149: how long a replica that failed a chunk fetch is tried last.
+const FAILED_REPLICA_DEMOTE: Duration = Duration::from_secs(30);
+
+/// #149: `ordered` with the replicas that failed a fetch less than
+/// `FAILED_REPLICA_DEMOTE` ago moved to the end (both parts keep their
+/// order), so the next chunk (and its prefetch) does not try a dead node first.
+fn demote_failed(ordered: Vec<String>, failed: &DashMap<String, Instant>, now: Instant) -> Vec<String> {
+    let (recent, mut rest): (Vec<String>, Vec<String>) = ordered.into_iter().partition(|a| {
+        failed.get(a).is_some_and(|t| now.saturating_duration_since(*t) < FAILED_REPLICA_DEMOTE)
+    });
+    rest.extend(recent);
+    rest
+}
+
 /// read(): a missing chunk entry below the snapshot's size may be a chunk
 /// the snapshot missed (not a hole). Re-fetch once before serving zeros,
 /// unless this snapshot already came from such a re-fetch (`confirmed`).
@@ -811,6 +825,9 @@ pub struct DtfsFilesystem {
     /// Known node locations for nearest-node selection.
     /// Populated as we discover node addresses from metadata responses.
     known_locations: DashMap<String, Location>,
+    /// #149: replica address -> when a chunk fetch from it last failed;
+    /// `read_candidates` tries it last for `FAILED_REPLICA_DEMOTE`.
+    failed_replicas: DashMap<String, Instant>,
     /// In-flight commits per path; gates the post-commit incremental merge.
     commit_tracker: CommitTracker,
     /// `write.async_commit` only: serialises the background age commit with
@@ -937,6 +954,7 @@ impl DtfsFilesystem {
             )),
             foreground_inflight: DashMap::new(),
             known_locations: DashMap::new(),
+            failed_replicas: DashMap::new(),
             commit_tracker: CommitTracker::default(),
             path_locks: DashMap::new(),
             bg_uploads: DashMap::new(),
@@ -3710,13 +3728,18 @@ impl DtfsFilesystem {
                         last_err = Some(anyhow::anyhow!(
                             "chunk fetch from {cand} timed out after {fetch_timeout_secs}s"
                         ));
+                        self.failed_replicas.insert(cand.clone(), Instant::now());
                         continue;
                     }
                 }
             };
             match result {
-                Ok(d) => return Ok((cand.clone(), d)),
+                Ok(d) => {
+                    self.failed_replicas.remove(cand);
+                    return Ok((cand.clone(), d));
+                }
                 Err(e) => {
+                    self.failed_replicas.insert(cand.clone(), Instant::now());
                     // Bug BC-9 — distinguish a verify_on_read integrity
                     // fault from a transport error so operators see
                     // corruption fail-over clearly.
@@ -3788,7 +3811,7 @@ impl DtfsFilesystem {
             ordered.retain(|a| a != &winner);
             ordered.insert(0, winner);
         }
-        ordered
+        demote_failed(ordered, &self.failed_replicas, Instant::now())
     }
 
     /// Flush chunk segments to the cluster.
@@ -8098,6 +8121,24 @@ mod async_commit_fs_tests {
         assert_eq!(fetches.load(Ordering::Relaxed), 2, "one re-fetch per snapshot");
         assert!(fs.read(fh, 0, 10).await.is_err());
         assert_eq!(fetches.load(Ordering::Relaxed), 2, "confirmed snapshot re-fetched again");
+    }
+
+    /// #149: after chunk 0's fetch fails on node A, chunk 1 tries the next
+    /// replica first; a failure older than FAILED_REPLICA_DEMOTE no longer
+    /// demotes.
+    #[tokio::test]
+    async fn failed_read_replica_is_tried_last_for_the_next_chunk() {
+        let fs = fs(false);
+        let (a, b) = ("127.0.0.1:1".to_string(), "127.0.0.1:2".to_string());
+        let chunk1 = committed_chunk_info(1, &"d".repeat(64), 10, vec![a.clone(), b.clone()], "warm");
+        assert_eq!(fs.read_candidates(&chunk1), [a.clone(), b.clone()]);
+        assert!(fs.fetch_chunk_from_candidates(&[a.clone()], &"c".repeat(64)).await.is_err());
+        assert_eq!(fs.read_candidates(&chunk1), [b.clone(), a.clone()], "dead replica still first");
+        let now = Instant::now();
+        let order = vec![a.clone(), b.clone()];
+        let at = |d: Duration| demote_failed(order.clone(), &fs.failed_replicas, now + d);
+        assert_eq!(at(FAILED_REPLICA_DEMOTE - Duration::from_secs(1)), [b.clone(), a.clone()]);
+        assert_eq!(at(FAILED_REPLICA_DEMOTE), [a.clone(), b.clone()], "boundary: expired");
     }
 
     /// #134: a lapsed lease comes back as a FRESH grant (new id) while

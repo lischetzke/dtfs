@@ -361,6 +361,10 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   only, bounded by `PREFETCH_JOIN_TIMEOUT` (2 s), refusing to wait on a
   prefetch that has not yet acquired its slot; else fall through to the
   candidate loop (P0-2 fallover budget stays intact).
+- `read_candidates` moves a replica whose fetch failed (error or timeout)
+  in the last `FAILED_REPLICA_DEMOTE` (30 s) to the end (`demote_failed`,
+  `failed_replicas`, cleared by its next success), so the next chunk and
+  its prefetch skip a dead node (#149).
 - Foreground misses are single-flighted per chunk_id
   (`claim_foreground_fetch` / `complete_foreground_fetch`); a Waiter whose
   Owner failed fetches itself.
