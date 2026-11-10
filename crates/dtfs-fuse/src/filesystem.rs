@@ -4160,6 +4160,14 @@ impl DtfsFilesystem {
             }
             r => r,
         };
+        if let Err(e) = &res {
+            // #134 review: maybe applied; our snapshot may lack our own chunk
+            // ids, and a re-acquire would then refuse forever (EIO).
+            if commit_outcome_unknown(e) {
+                warn!(path, error = %format!("{e:#}"), "commit outcome unknown; marking handle locations stale");
+                self.invalidate_handle_locations(path);
+            }
+        }
         res.with_context(|| format!("commit_chunk_locations failed for {path}"))?;
 
         // A lease-less commit is union-merged by the manager, so the local
@@ -4945,6 +4953,27 @@ fn is_lease_conflict(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("commit_chunk_locations rejected: write lease no longer held")
 }
 
+/// #134 review: a commit error after which the manager may still have
+/// applied the commit (timeout, transport, unknown), as opposed to a
+/// definite refusal (rejected response, Raft apply error, auth).
+fn commit_outcome_unknown(e: &anyhow::Error) -> bool {
+    if format!("{e:#}").contains("commit_chunk_locations rejected") {
+        return false;
+    }
+    match e.chain().find_map(|c| c.downcast_ref::<tonic::Status>()) {
+        Some(s) => matches!(
+            s.code(),
+            tonic::Code::DeadlineExceeded
+                | tonic::Code::Unknown
+                | tonic::Code::Cancelled
+                | tonic::Code::Unavailable
+                | tonic::Code::Internal
+        ),
+        // No status: transport / pool errors, nothing proves it was not applied.
+        None => true,
+    }
+}
+
 /// #150: how long one chunk keeps re-putting to an unreachable target while
 /// it is short of quorum (the channel's per-RPC timeout).
 const PUT_RETRY_DEADLINE: Duration = Duration::from_secs(60);
@@ -5068,6 +5097,27 @@ where
             true
         }
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod commit_outcome_tests {
+    use super::*;
+
+    /// #134 review: only a definite refusal keeps the handle's snapshot.
+    #[test]
+    fn timeouts_and_transport_errors_are_unknown_refusals_are_not() {
+        let st = |s: tonic::Status| anyhow::Error::new(s).context("commit_chunk_locations RPC failed");
+        assert!(commit_outcome_unknown(&st(tonic::Status::deadline_exceeded("timeout"))));
+        assert!(commit_outcome_unknown(&st(tonic::Status::unknown("h2 reset"))));
+        assert!(commit_outcome_unknown(&st(tonic::Status::unavailable("forward failed"))));
+        assert!(commit_outcome_unknown(&anyhow::anyhow!("commit_chunk_locations: no managers reachable")));
+        assert!(!commit_outcome_unknown(&st(tonic::Status::failed_precondition("apply error"))));
+        assert!(!commit_outcome_unknown(&st(tonic::Status::permission_denied("hmac"))));
+        assert!(!commit_outcome_unknown(&anyhow::anyhow!(
+            "commit_chunk_locations rejected: write lease no longer held (x)"
+        )));
+        assert!(!commit_outcome_unknown(&anyhow::anyhow!("commit_chunk_locations rejected: below floor")));
     }
 }
 

@@ -19,6 +19,11 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   manager's file is not the handle's snapshot (`file_changed_under_lease`:
   other `created_at_ms`, or with no local commit overlapping the check
   fetch, a chunk id the snapshot lacks; no snapshot = not compared) (#134).
+  A commit failing with an unknown outcome (`commit_outcome_unknown`:
+  timeout, transport, Unknown/Unavailable/Internal; not a `rejected`
+  response or a definite status) sets the path's handles `locations =
+  None` before the restore: it may have applied our chunk ids, which the
+  snapshot lacks, and the re-acquire would refuse forever.
 - Background prefetch is bounded by `client.chunk_read_timeout_secs`
   like the foreground fetch (`0` = unbounded).
 - `flush()` drops the `lock_owner`'s POSIX locks (kernel close contract).
