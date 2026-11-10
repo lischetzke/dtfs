@@ -491,6 +491,28 @@ impl ChunkStore {
             f.sync_all().await.map_err(DtfsError::Io)?;
         }
 
+        let final_dat_path = chunk_dir.join(format!("{}.dat", chunk_id.as_hex()));
+        let final_meta_path = chunk_dir.join(format!("{}.meta", chunk_id.as_hex()));
+
+        // CR-4-6 (DATA-7) — same CO-5-5 dedup this store's whole-buffer
+        // `put_chunk` already applies, now also on the production streaming
+        // commit path: a re-upload of the same content-addressed chunk
+        // must not double-count `chunk_count`/`bytes_stored`. Must be
+        // captured BEFORE the rename below, which would otherwise
+        // overwrite (and hide) any pre-existing `.dat`.
+        // A pre-existing `.dat` with a missing/torn `.meta` (awaiting scrub
+        // repair) may be a registered replica: a failed re-upload must keep it.
+        // Audit F2 — a check error fails the commit: guessing "absent" could
+        // let the failure cleanup unlink a pre-existing `.dat`.
+        let check = |r: std::io::Result<bool>| {
+            r.map_err(|e| {
+                tracing::warn!(chunk_id = %chunk_id, error = %e, "put rejected: chunk existence check failed");
+                DtfsError::Io(e)
+            })
+        };
+        let dat_existed = check(fs::try_exists(&final_dat_path).await)?;
+        let already_present = dat_existed && check(fs::try_exists(&final_meta_path).await)?;
+
         // 1. WAL entry first.
         let wal_entry = WalEntry {
             operation: WalOperation::PutChunk,
@@ -504,21 +526,6 @@ impl ChunkStore {
         write_wal_entry(&wal_path, &wal_entry).await?;
 
         // 2. Atomic rename tmp → final.
-        let final_dat_path = chunk_dir.join(format!("{}.dat", chunk_id.as_hex()));
-        let final_meta_path = chunk_dir.join(format!("{}.meta", chunk_id.as_hex()));
-
-        // CR-4-6 (DATA-7) — same CO-5-5 dedup this store's whole-buffer
-        // `put_chunk` already applies, now also on the production streaming
-        // commit path: a re-upload of the same content-addressed chunk
-        // must not double-count `chunk_count`/`bytes_stored`. Must be
-        // captured BEFORE the rename below, which would otherwise
-        // overwrite (and hide) any pre-existing `.dat`.
-        let already_present = fs::try_exists(&final_dat_path).await.unwrap_or(false)
-            && fs::try_exists(&final_meta_path).await.unwrap_or(false);
-        // A pre-existing `.dat` with a missing/torn `.meta` (awaiting scrub
-        // repair) may be a registered replica: a failed re-upload must keep it.
-        let dat_existed = fs::try_exists(&final_dat_path).await.unwrap_or(false);
-
         fs::rename(tmp_path, &final_dat_path)
             .await
             .map_err(DtfsError::Io)?;
@@ -4077,6 +4084,43 @@ mod tests {
         assert_eq!(std::fs::read(&final_dat_path).unwrap(), data);
         let wal_path = wal_dir(tmp.path()).join(format!("{}.put.wal.json", chunk_id.as_hex()));
         assert!(!wal_path.exists(), "WAL entry cleared");
+    }
+
+    /// Audit F2 — an I/O error from the pre-rename existence check (here
+    /// ELOOP from a self-referencing symlink at the final `.dat` or `.meta`
+    /// path) must fail the commit before the rename: treating it as
+    /// "absent" would let a later meta failure unlink a pre-existing `.dat`
+    /// and double-count the counters.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn commit_fails_when_existence_check_errors() {
+        for ext in ["dat", "meta"] {
+            let (store, tmp) = make_test_store().await;
+            let data = b"existence-check-error";
+            let hash = checksum::compute(data);
+            let chunk_id = ChunkId::from_bytes(hash);
+            let volume_id = VolumeId::new("default".to_string());
+
+            let chunk_dir = chunk_data_dir(tmp.path(), &chunk_id);
+            std::fs::create_dir_all(&chunk_dir).unwrap();
+            let looped = chunk_dir.join(format!("{}.{ext}", chunk_id.as_hex()));
+            std::os::unix::fs::symlink(&looped, &looped).unwrap();
+            if ext == "meta" {
+                std::fs::write(chunk_dir.join(format!("{}.dat", chunk_id.as_hex())), data).unwrap();
+            }
+
+            let upload = tmp.path().join("tmp").join("loop.dat.tmp");
+            std::fs::write(&upload, data).unwrap();
+            let res = store
+                .commit_chunk_from_tmp(&chunk_id, &upload, &volume_id, DiskTier::Hot, data.len() as u64, hash)
+                .await;
+            assert!(matches!(res, Err(DtfsError::Io(_))), "{ext}: check error must fail the commit: {res:?}");
+            assert!(!upload.exists(), "{ext}: tmp removed");
+            assert!(std::fs::symlink_metadata(&looped).unwrap().file_type().is_symlink(), "{ext}: nothing renamed");
+            let wal_path = wal_dir(tmp.path()).join(format!("{}.put.wal.json", chunk_id.as_hex()));
+            assert!(!wal_path.exists(), "{ext}: no WAL entry left");
+            assert_eq!(store.stats().total_chunks, 0, "{ext}: not counted");
+        }
     }
 
     /// Audit #2 — WAL(Put) replay over a `.dat` that hashes to its id with a
