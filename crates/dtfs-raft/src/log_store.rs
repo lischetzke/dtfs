@@ -286,9 +286,12 @@ pub fn blank_sm_startup_allowed(sm_is_blank: bool, last_purged: Option<LogId>) -
              Refusing to start as a voter: an election win here would \
              apply only the log's surviving suffix onto an empty state \
              machine and lose everything before the purge point, \
-             cluster-wide, on this node's next snapshot. See the manager \
-             recovery runbook: stop this node, wipe raft-log + raft-sm, \
-             and re-bootstrap it as a learner from a healthy peer.",
+             cluster-wide, on this node's next snapshot. The undecodable \
+             file was kept as raft-sm/snapshot.bin.undecodable-<ts>: if a \
+             different DTFS version wrote it (rollback), move it back to \
+             raft-sm/snapshot.bin and start that version. Otherwise see the \
+             manager recovery runbook: stop this node, wipe raft-log + \
+             raft-sm, and re-bootstrap it as a learner from a healthy peer.",
             lp.index
         )),
         _ => Ok(()),

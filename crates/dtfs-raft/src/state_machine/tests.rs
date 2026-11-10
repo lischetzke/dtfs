@@ -119,10 +119,10 @@ mod snapshot_persistence_tests {
             let data = sm.data.read().await;
             assert!(data.files.is_empty(), "blank state after discarding corrupt snapshot");
         }
-        // The corrupt file is removed so it cannot wedge subsequent opens.
+        // The corrupt file is moved aside so it cannot wedge subsequent opens.
         assert!(
             !dir.path().join("snapshot.bin").exists(),
-            "corrupt snapshot.bin must be deleted"
+            "corrupt snapshot.bin must be moved aside"
         );
         // A partial (non-bincode) payload is likewise tolerated.
         std::fs::write(dir.path().join("snapshot.bin"), b"\x00\x01garbage").expect("write junk");
@@ -130,6 +130,31 @@ mod snapshot_persistence_tests {
             StateMachineStore::open_at(dir.path()).is_ok(),
             "partial snapshot envelope tolerated"
         );
+    }
+
+    /// Issue #142 — an undecodable `snapshot.bin` (e.g. written by a newer
+    /// binary before a rollback) is renamed to `snapshot.bin.undecodable-<ts>`
+    /// with its bytes intact, never deleted, so the operator can put it back.
+    #[tokio::test]
+    async fn issue_142_undecodable_snapshot_is_renamed_not_deleted() {
+        let dir = tmp_dir();
+        let bytes = b"\x00\x01garbage-from-a-newer-binary".to_vec();
+        std::fs::write(dir.path().join("snapshot.bin"), &bytes).expect("write junk");
+        StateMachineStore::open_at(dir.path()).expect("open tolerates undecodable snapshot");
+        assert!(!dir.path().join("snapshot.bin").exists());
+        let kept: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with("snapshot.bin.undecodable-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1, "exactly one undecodable copy kept");
+        assert_eq!(std::fs::read(kept[0].path()).unwrap(), bytes, "original bytes kept");
+        // Negative: a valid-but-absent case leaves no undecodable copy.
+        let empty = tmp_dir();
+        StateMachineStore::open_at(empty.path()).unwrap();
+        assert_eq!(std::fs::read_dir(empty.path()).unwrap().count(), 0);
     }
 
     /// Bug BP-2 — a stray `snapshot.bin.tmp` left by an interrupted write is

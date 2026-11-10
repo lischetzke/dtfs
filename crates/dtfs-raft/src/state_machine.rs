@@ -630,7 +630,7 @@ impl StateMachineStore {
             // Bug BP-2 — a snapshot truncated by a disk-full / crash mid-write
             // (0-byte or partial) must NOT hard-error the open (that wedged
             // the manager on `Read Snapshot EOF`, ISSUE-SCAN-2026-06-02 F3).
-            // Treat an unreadable snapshot as absent: log, delete it, and
+            // Treat an unreadable snapshot as absent: log, move it aside, and
             // start blank — openraft log-catchup from a healthy peer brings
             // the node current.
             let decoded: Option<(crate::SnapshotMeta, StateMachineSnapshot)> =
@@ -652,7 +652,17 @@ impl StateMachineStore {
                     }
                 };
             let Some((persisted_meta, snap)) = decoded else {
-                let _ = std::fs::remove_file(&path);
+                // Issue #142 — never delete: an "undecodable" file may be a
+                // valid snapshot from another binary version (rollback). Move
+                // it aside so the operator can restore it under the right one.
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let aside = dir.join(format!("snapshot.bin.undecodable-{ts}"));
+                std::fs::rename(&path, &aside)?;
+                tracing::error!(path = ?path, kept_as = ?aside,
+                    "undecodable snapshot.bin moved aside; starting blank");
                 return Ok(store);
             };
             let mut sm = store

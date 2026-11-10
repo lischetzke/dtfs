@@ -123,6 +123,11 @@ If startup instead logs a refusal naming a purged log index (RAFT-6 /
 CR2-7-6: the on-disk snapshot was corrupt/unreadable and this node's log
 has already been purged past it, so no local copy of the pre-purge
 history survives), treat it like Case B below — do not force a restart.
+The manager never deletes an undecodable snapshot: it renames it to
+`raft-sm/snapshot.bin.undecodable-<unix ts>`. If the refusal follows a
+rollback to an older binary, the file is likely a valid snapshot from the
+newer one: move it back to `raft-sm/snapshot.bin` and start the version
+that wrote it, instead of wiping.
 
 
 
