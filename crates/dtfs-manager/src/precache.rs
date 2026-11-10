@@ -862,6 +862,103 @@ pub(crate) fn plan_precache(
     plan
 }
 
+// ---------------------------------------------------------------------------
+// Engine glue kernels: rate limit, yield, protection, leader-local state.
+// ---------------------------------------------------------------------------
+
+/// Seconds between pre-cache passes.
+pub(crate) const PRECACHE_TICK_SECS: u64 = 30;
+/// Scheduler live tasks (any class) at or above which pre-cache schedules nothing.
+pub(crate) const PRECACHE_YIELD_LIVE_TASKS: usize = 24;
+/// Token-bucket depth in seconds of `precache_max_mbps`.
+pub(crate) const PRECACHE_BURST_SECS: u64 = 120;
+
+/// Leader-memory state of the pre-cache loop. Never held across an await.
+#[derive(Debug, Default)]
+pub(crate) struct PrecacheState {
+    /// (file, dc) reads fed by `TieringEngine::report_access`; kept across leader changes.
+    pub activity: HashMap<(String, String), FileActivity>,
+    pub series_lru: BTreeMap<(String, String, String), SeriesEntry>,
+    /// (chunk_id, node_id) cache copies the idle demote must leave alone.
+    pub protected: HashSet<(String, u64)>,
+    /// (chunk_id, target node) pairs this loop has a live task for.
+    pub scheduled: HashSet<(String, u64)>,
+    /// Token balance in bytes and when it was last refilled.
+    pub tokens: u64,
+    pub tokens_at_ms: u64,
+    pub status: PrecacheStatus,
+    /// Volumes already warned about as `policy_invalid` (log once per transition).
+    pub invalid_logged: HashSet<String>,
+}
+
+impl PrecacheState {
+    /// Leadership lost: drop everything derived from leader tenure; activity stays.
+    pub(crate) fn reset_leader_state(&mut self) {
+        self.protected.clear();
+        self.scheduled.clear();
+        self.series_lru.clear();
+        self.invalid_logged.clear();
+        self.status = PrecacheStatus::default();
+    }
+}
+
+/// Add `rate_mbps` worth of bytes for the elapsed time, capped at `burst_secs` of rate.
+pub(crate) fn refill_tokens(tokens: u64, last_ms: u64, now_ms: u64, rate_mbps: u64, burst_secs: u64) -> u64 {
+    if now_ms < last_ms {
+        return tokens;
+    }
+    let per_sec = u128::from(rate_mbps) * 125_000;
+    let cap = per_sec * u128::from(burst_secs);
+    let add = per_sec * u128::from(now_ms - last_ms) / 1000;
+    (u128::from(tokens) + add).min(cap) as u64
+}
+
+/// Leading copies (in plan order) that fit the token balance, skipping pairs with a live
+/// task. Stops at the first copy that does not fit so rank order is never skipped over.
+pub(crate) fn pick_within_budget<'a>(
+    copies: &'a [PrecacheCopy],
+    active: &HashSet<(String, u64)>,
+    tokens: u64,
+) -> Vec<&'a PrecacheCopy> {
+    let mut left = tokens;
+    let mut out = Vec::new();
+    for c in copies {
+        if active.contains(&(c.chunk_id.clone(), c.target_node)) {
+            continue;
+        }
+        if c.bytes > left {
+            break;
+        }
+        left -= c.bytes;
+        out.push(c);
+    }
+    out
+}
+
+pub(crate) fn should_yield(live_tasks: usize) -> bool {
+    live_tasks >= PRECACHE_YIELD_LIVE_TASKS
+}
+
+/// Drop idle demotions of protected copies; returns how many were dropped.
+pub(crate) fn retain_unprotected(
+    demotions: &mut Vec<crate::tiering::TickDemotion>,
+    protected: &HashSet<(String, u64)>,
+) -> usize {
+    let before = demotions.len();
+    demotions.retain(|d| !protected.contains(&(d.chunk_id.clone(), d.node_id)));
+    before - demotions.len()
+}
+
+/// Volumes newly `policy_invalid` since the last pass; `logged` becomes the current set.
+pub(crate) fn newly_invalid<'a>(
+    logged: &mut HashSet<String>,
+    skipped: &'a [SkippedVolume],
+) -> Vec<&'a SkippedVolume> {
+    let fresh = skipped.iter().filter(|s| !logged.contains(&s.volume)).collect();
+    *logged = skipped.iter().map(|s| s.volume.clone()).collect();
+    fresh
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1465,5 +1562,104 @@ mod planner_tests {
                 assert!(b <= room[&n], "node {n} planned {b} > room {}", room[&n]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+    use crate::tiering::TickDemotion;
+
+    fn copy(chunk: &str, target: u64, bytes: u64) -> PrecacheCopy {
+        PrecacheCopy {
+            chunk_id: chunk.into(),
+            file_path: "/f".into(),
+            chunk_index: 0,
+            source_node: 1,
+            target_node: target,
+            tier: DiskTier::Warm,
+            bytes,
+            rank: (0, 0, 0),
+        }
+    }
+
+    fn demotion(chunk: &str, node: u64) -> TickDemotion {
+        TickDemotion {
+            chunk_id: chunk.into(),
+            chunk_index: 0,
+            file_path: "/f".into(),
+            node_id: node,
+            disk_id: 0,
+            tier: DiskTier::Warm,
+            reason: "idle",
+            cooldown_until_ms_at_snapshot: 0,
+            enforce_anchor: None,
+        }
+    }
+
+    #[test]
+    fn refill_tokens_rate_cap_and_clock_skew() {
+        assert_eq!(refill_tokens(0, 0, 30_000, 10, 120), 37_500_000);
+        assert_eq!(refill_tokens(0, 0, 10_000_000_000, 10, 120), 150_000_000);
+        assert_eq!(refill_tokens(5, 10_000, 9_000, 10, 120), 5, "now < last leaves tokens unchanged");
+    }
+
+    #[test]
+    fn pick_within_budget_skips_active_and_stops_at_first_overrun() {
+        let mb = 1_000_000;
+        let copies = vec![copy("a", 2, 10 * mb), copy("b", 2, 50 * mb), copy("c", 2, mb)];
+        let none = HashSet::new();
+        let ids: Vec<_> = pick_within_budget(&copies, &none, 20 * mb).iter().map(|c| c.chunk_id.clone()).collect();
+        assert_eq!(ids, vec!["a"], "c fits but must not jump ahead of b");
+        assert!(pick_within_budget(&copies, &none, 0).is_empty());
+        let active = HashSet::from([("a".to_string(), 2u64)]);
+        let ids: Vec<_> = pick_within_budget(&copies, &active, 100 * mb).iter().map(|c| c.chunk_id.clone()).collect();
+        assert_eq!(ids, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn yield_boundary() {
+        assert!(should_yield(PRECACHE_YIELD_LIVE_TASKS));
+        assert!(!should_yield(PRECACHE_YIELD_LIVE_TASKS - 1));
+        assert_eq!(PRECACHE_YIELD_LIVE_TASKS, 24);
+    }
+
+    #[test]
+    fn retain_unprotected_removes_exactly_protected_pairs() {
+        let mut d = vec![demotion("a", 2), demotion("a", 3), demotion("b", 2)];
+        let protected = HashSet::from([("a".to_string(), 2u64)]);
+        assert_eq!(retain_unprotected(&mut d, &protected), 1);
+        assert_eq!(d.len(), 2);
+        assert!(d.iter().all(|x| (x.chunk_id.as_str(), x.node_id) != ("a", 2)));
+        assert_eq!(retain_unprotected(&mut d, &HashSet::new()), 0);
+    }
+
+    #[test]
+    fn reset_leader_state_keeps_activity() {
+        let mut st = PrecacheState::default();
+        let reads = HashMap::from([("toro".to_string(), 1u32)]);
+        note_read(&mut st.activity, "/tv/a.mkv", "c1", &reads, 5);
+        st.protected.insert(("c1".into(), 2));
+        st.scheduled.insert(("c1".into(), 2));
+        st.series_lru.insert(
+            ("v".into(), "toro".into(), "/tv".into()),
+            SeriesEntry { cursor: "/tv/a.mkv".into(), last_read_ms: 5 },
+        );
+        st.status.is_leader = true;
+        st.reset_leader_state();
+        assert!(st.protected.is_empty() && st.scheduled.is_empty() && st.series_lru.is_empty());
+        assert!(!st.status.is_leader);
+        assert_eq!(st.activity.len(), 1);
+    }
+
+    #[test]
+    fn newly_invalid_logs_once_per_transition() {
+        let sk = |v: &str| SkippedVolume { volume: v.into(), reason: "policy_invalid", detail: String::new() };
+        let mut logged = HashSet::new();
+        let first = vec![sk("m")];
+        assert_eq!(newly_invalid(&mut logged, &first).len(), 1);
+        assert!(newly_invalid(&mut logged, &first).is_empty(), "same volume is not re-logged");
+        assert!(newly_invalid(&mut logged, &[]).is_empty());
+        assert_eq!(newly_invalid(&mut logged, &first).len(), 1, "valid then invalid again logs again");
     }
 }

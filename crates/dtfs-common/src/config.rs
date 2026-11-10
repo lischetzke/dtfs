@@ -751,6 +751,14 @@ pub struct TieringConfig {
     /// behaviour.
     #[serde(default)]
     pub enable_cache_redundancy_escalation: bool,
+    /// Average bandwidth (Mbit/s) the predictive pre-cache may start copies
+    /// at; a token bucket in the manager's pre-cache loop. Must be > 0.
+    #[serde(default = "default_precache_max_mbps")]
+    pub precache_max_mbps: u64,
+}
+
+fn default_precache_max_mbps() -> u64 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -766,7 +774,8 @@ pub struct MonitoringConfig {
 impl TieringConfig {
     /// `tokio::time::interval(ZERO)` panics inside the spawned tiering task.
     pub fn validate(&self) -> Result<(), String> {
-        nonzero("[tiering] evaluation_interval_secs", self.evaluation_interval_secs)
+        nonzero("[tiering] evaluation_interval_secs", self.evaluation_interval_secs)?;
+        nonzero("[tiering] precache_max_mbps", self.precache_max_mbps)
     }
 }
 
@@ -1865,6 +1874,10 @@ mod tests {
         assert!(t.validate().is_ok());
         t.evaluation_interval_secs = 0;
         assert_eq!(t.validate().unwrap_err(), "[tiering] evaluation_interval_secs must be > 0");
+        t.evaluation_interval_secs = 1;
+        assert_eq!(t.precache_max_mbps, 10);
+        t.precache_max_mbps = 0;
+        assert_eq!(t.validate().unwrap_err(), "[tiering] precache_max_mbps must be > 0");
         let mut m: MonitoringConfig = toml::from_str("").unwrap();
         assert!(m.validate().is_ok());
         m.heartbeat_interval_secs = 0;

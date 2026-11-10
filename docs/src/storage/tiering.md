@@ -215,6 +215,26 @@ When the target tier differs from the chunk's current tier, a replication to a n
 
 Disks declare their tier in `data.toml` (`[[disks]]`, `tier = "hot|warm|cold|tape"`); see [Data Node Configuration](../configuration/data-node.md) and [Tape Storage](./tape.md).
 
+## Pre-caching
+
+Reactive promotion waits for reads to reach a datacenter. Pre-caching copies the files a reader will open next into that datacenter's cache tier before they are opened. It is opt-in per volume (`precache.mode`, see [Volume Configuration](../configuration/volume-config.md#pre-caching-policy)) and runs on the leader every 30 s.
+
+**Signal.** Reads reported by the data nodes (the same 30 s batches that feed reactive promotion) are remembered per (file, datacenter). Reads with no datacenter, or from the `unknown` bucket, are ignored; this is also how FUSE `untracked_read_processes` keeps library scans from counting. A file counts as being played when a chunk from index 9 on (and not within the last 2 chunks) was read, or more than 64 distinct chunks were read. Header and tail probes by scanners therefore never start pre-caching. The most recently played file per directory (`files`) or per series (`plex`) is the cursor, active while its last read is within the volume's `promote_window_secs`.
+
+**Modes and ordering.** In `files` mode the next files in the cursor's directory are taken in natural order (`E2` before `E10`, case-insensitive text). In `plex` mode the series root is the nearest of the parent or grandparent directory holding a regular file named `.plexmatch`; all files under it are ordered component by component (`Season 02/E10` before `Season 10/E01`). Specials, Extras, Trailers and similar folders are not part of the playback order. Directories, symlinks, dot-files, files under 16 MiB and files with an active write lease are skipped.
+
+**Selection.** Whole files, contiguous after the cursor, until the budget (`series_max_gb`, or `next_files` / `next_max_gb`) runs out; the leftover budget caches the head of the next file (whole chunks only), then selection stops. The file being watched is excluded: read-ahead and reactive promotion own it. New episodes are picked up on the next pass.
+
+**Capacity and eviction order.** One copy per chunk and datacenter, on the hottest tier with `cache_replicas.<t>.max > 0` and no mandatory replicas, placed like a reactive promotion. A node's room is its serviceable cache-tier disks minus the placement headroom and a 10% reserve; when it runs out planning stops and the datacenter shows `capacity_limited`. Pre-caching never deletes anything. Protection from the idle demote ends in this order: series beyond `max_series` (oldest first), then file cursors beyond 8 per datacenter, then cursors older than the window. Unprotected copies are removed only by the existing idle demote, which skips protected copies. An operator `flush_cache` removes protected copies too and its cooldown stops re-copying.
+
+**Bandwidth and yield.** Copies start at an average of `[tiering] precache_max_mbps` (default 10, 120 s burst); a copy that does not fit the balance waits, later ones do not jump ahead. The normal scheduler limits (6 copies at once, 2 per target node) still apply. With 24 or more live scheduler tasks of any class (repair included) pre-caching schedules nothing.
+
+**Anchor.** Pre-caching only adds cache replicas through the verified replication path. Chunks without a live anchor copy (anchor-pending) are not copied.
+
+**Leader change.** Copy tasks are Raft state and finish on their own. The new leader starts with an empty protection set and rebuilds cursors within 30 to 90 s; idle demote is refused for `promote_window_secs` after a new leader's tenure starts, so nothing is lost in between. A volume whose policy stops validating (for example after `set-cache` removed the cache tier) is skipped and logged once.
+
+**Recommended profile.** Plex library volume: `plex` mode, `series_max_gb` 20, `max_series` 3, a warm cache tier with `max = 1` and `per_dc = true`, `promote_window_secs` 14400 or more, and `precache_max_mbps` at most half the DC's link.
+
 ## Operator controls
 
 - `dtfs-cli` volume commands set `mandatory_replicas`, `cache_replicas` and the anchor ([Volume Configuration](../configuration/volume-config.md)).

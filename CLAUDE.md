@@ -93,6 +93,7 @@ Load-bearing ownership only; history per row in `docs/src/internals/invariants.m
 | `dtfs-raft/src/lib.rs::ClientRequest` | Command enum; new mutation = new variant + arm (+ `now_ms`) |
 | `dtfs-manager/src/scheduler.rs` + `scheduler/*.rs` | SOLE owner of replica repair; leader-gated, bounded, Raft-remove-before-byte-delete; disk-keyed orphan reap; leader re-checked before every delete batch |
 | `dtfs-manager/src/tiering.rs` | Cache-tick planner; never holds SM read lock across await |
+| `dtfs-manager/src/precache.rs` | Predictive pre-cache: pure kernels + `plan_precache`; engine loop is `TieringEngine::run_precache` (leader-only, 30 s, token bucket `[tiering] precache_max_mbps`, yields at 24 live tasks); copies only via `schedule_replications`, never removes; protected set filters only `tick_av_cache` demotions |
 | `dtfs-manager/src/monitor.rs` | Heartbeat health detection only, leader-only, staleness counted from max(last_seen, leader tenure start); MUST NOT schedule repair |
 | `dtfs-manager/src/metadata.rs` | ManagerService gRPC over `raft_write`; follower writes forward via `forwardable()` allow-list |
 | `dtfs-manager/src/api.rs` + `api/*.rs` | REST router; handlers per resource; decommission refuses while replicas remain; volume delete refuses `default`, entries without `delete_files` and leased files, re-checks for entries before `DeleteVolume` |

@@ -21,7 +21,7 @@ prefetch_max_inflight  = 2
 | `cache_mb` | 64 | Byte budget of the prefetch memory cache |
 | `prefetch_max_inflight` | 2 | Prefetch `GetChunk` streams on the wire at once |
 
-> **All three non-disabled modes currently behave the same.** After each chunk read the engine prefetches the next `prefetch_chunks` chunks of the same file. Cross-file prefetch for `folder-sequential` (`prefetch_next_files`) and any `fadvise`-driven behaviour for `file-only` are not implemented. There are no per-directory overrides and no read-ahead CLI.
+> **All three non-disabled modes currently behave the same.** After each chunk read the engine prefetches the next `prefetch_chunks` chunks of the same file. Cross-file prefetch for `folder-sequential` (`prefetch_next_files`) and any `fadvise`-driven behaviour for `file-only` are not implemented. There are no per-directory overrides and no read-ahead CLI. Cross-file prefetch is done by the manager instead: the volume's [pre-caching](../storage/tiering.md#pre-caching) copies the next episodes or files into the reader's datacenter cache tier.
 
 ## How it works
 

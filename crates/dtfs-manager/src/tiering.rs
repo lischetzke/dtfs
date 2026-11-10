@@ -107,6 +107,8 @@ pub struct TieringEngine {
     leader_since_ms: std::sync::atomic::AtomicU64,
     /// #119 — newest sample ts among rings evicted at the key cap (0 = never).
     evicted_newest_sample_ms: std::sync::atomic::AtomicU64,
+    /// Predictive pre-cache leader memory. Never held across an await.
+    precache: parking_lot::Mutex<crate::precache::PrecacheState>,
 }
 
 impl TieringEngine {
@@ -126,7 +128,125 @@ impl TieringEngine {
             read_windows: RwLock::new(HashMap::new()),
             leader_since_ms: std::sync::atomic::AtomicU64::new(0),
             evicted_newest_sample_ms: std::sync::atomic::AtomicU64::new(0),
+            precache: parking_lot::Mutex::new(Default::default()),
         }
+    }
+
+    /// Pre-cache loop: every `PRECACHE_TICK_SECS`, leader only. Spawned from main.rs.
+    pub async fn run_precache(&self) {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(crate::precache::PRECACHE_TICK_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            self.precache_tick().await;
+        }
+    }
+
+    async fn precache_tick(&self) {
+        use crate::precache::*;
+        use crate::scheduler::ScheduleOutcome;
+        let (enabled, rate_mbps) = {
+            let c = self.config.read().await;
+            (c.enabled, c.precache_max_mbps)
+        };
+        if !enabled {
+            return;
+        }
+        // In-flight tasks are Raft state and finish on their own; only leader memory is dropped.
+        if !self.scheduler.is_leader() {
+            self.precache.lock().reset_leader_state();
+            return;
+        }
+        let now_ms = now_millis();
+        let snap = {
+            let st = self.precache.lock();
+            PrecacheSnapshot { activity: st.activity.clone(), series_lru: st.series_lru.clone() }
+        };
+        let mut plan = {
+            let sm = self.state_data.read().await;
+            plan_precache(&sm, &snap, now_ms, self.scheduler.placement_cfg())
+        };
+        let active = self.scheduler.active_replication_pairs().await;
+        plan.status.is_leader = true;
+        plan.status.rate_mbps = rate_mbps;
+        plan.status.inflight_tasks = active.len() as u64;
+
+        let mut protected = std::mem::take(&mut plan.protected);
+        let mut scheduled: std::collections::HashSet<(String, u64)> = Default::default();
+        let mut batch = LastBatch::default();
+        // Copies with a live task stay protected even when nothing new is scheduled.
+        for c in &plan.copies {
+            let pair = (c.chunk_id.clone(), c.target_node);
+            if active.contains(&pair) {
+                batch.already += 1;
+                protected.insert(pair.clone());
+                scheduled.insert(pair);
+            }
+        }
+        if should_yield(active.len()) {
+            plan.status.yielded_to_repair = true;
+        } else {
+            let tokens = {
+                let mut st = self.precache.lock();
+                st.tokens = refill_tokens(st.tokens, st.tokens_at_ms, now_ms, rate_mbps, PRECACHE_BURST_SECS);
+                st.tokens_at_ms = now_ms;
+                st.tokens
+            };
+            let picked = pick_within_budget(&plan.copies, &active, tokens);
+            let reqs: Vec<(&str, u64, u64, DiskTier)> = picked
+                .iter()
+                .map(|c| (c.chunk_id.as_str(), c.source_node, c.target_node, c.tier))
+                .collect();
+            let outcomes = if reqs.is_empty() {
+                Vec::new()
+            } else {
+                self.scheduler
+                    .schedule_replications(&reqs, reqs.len(), PRECACHE_YIELD_LIVE_TASKS)
+                    .await
+            };
+            for (c, o) in picked.iter().zip(&outcomes) {
+                let pair = (c.chunk_id.clone(), c.target_node);
+                match o {
+                    ScheduleOutcome::New => {
+                        batch.new += 1;
+                        batch.bytes += c.bytes;
+                        protected.insert(pair.clone());
+                        scheduled.insert(pair);
+                    }
+                    ScheduleOutcome::AlreadyScheduled => {
+                        batch.already += 1;
+                        protected.insert(pair.clone());
+                        scheduled.insert(pair);
+                    }
+                    ScheduleOutcome::Deferred | ScheduleOutcome::Refused => batch.deferred += 1,
+                }
+            }
+            if batch.deferred > 0 {
+                debug!(deferred = batch.deferred, "precache: scheduling deferred, re-planned next tick");
+            }
+            if batch.new > 0 {
+                let (cursors, series) = (plan.status.cursors.len(), plan.status.series.len());
+                info!(new = batch.new, deferred = batch.deferred, bytes = batch.bytes, cursors, series, "precache: copies scheduled");
+                self.audit.log(
+                    "tiering",
+                    "cache.precache",
+                    &format!("new={} bytes={} cursors={} series={}", batch.new, batch.bytes, cursors, series),
+                    "scheduled",
+                );
+            }
+        }
+        plan.status.last_batch = batch.clone();
+
+        let mut st = self.precache.lock();
+        st.tokens = st.tokens.saturating_sub(batch.bytes);
+        for s in newly_invalid(&mut st.invalid_logged, &plan.status.skipped_volumes) {
+            warn!(volume = %s.volume, detail = %s.detail, "precache: volume policy no longer valid, skipped");
+        }
+        st.protected = protected;
+        st.scheduled = scheduled;
+        st.series_lru = plan.series_lru;
+        st.status = plan.status;
     }
 
     /// Inject the alert dispatcher after construction.
@@ -257,6 +377,8 @@ impl TieringEngine {
         profile.current_tier = current_tier;
         profile.current_node = current_node;
         drop(stats);
+
+        crate::precache::note_read(&mut self.precache.lock().activity, file_path, chunk_id, &reads_by_dc, now_ms);
 
         // Bug AV (AV-4-1c fix) — feed per-(chunk, dc) reads into the
         // read-window store. The data-node's `harvest_per_chunk`
@@ -520,7 +642,14 @@ impl TieringEngine {
             .read()
             .await
             .enable_cache_redundancy_escalation;
-        let plan = plan_cache_tick(&snapshot, now_ms, enable_redundancy_escalation);
+        let mut plan = plan_cache_tick(&snapshot, now_ms, enable_redundancy_escalation);
+
+        // Pre-cached copies the planner wants kept are not idle-demoted. Only this
+        // path is filtered; operator flush_cache still removes protected copies.
+        let kept = crate::precache::retain_unprotected(&mut plan.demotions, &self.precache.lock().protected);
+        if kept > 0 {
+            debug!(kept, "idle demote skipped pre-cache protected copies");
+        }
 
         // CO-1-2 [HIGH anchor] — surface any demote the planner refused
         // because it would have stranded the volume's anchor DC. The
@@ -3800,5 +3929,46 @@ mod audit_co_tests {
             1_000 + 9_999,
             "newest sample must be retained"
         );
+    }
+}
+
+#[cfg(test)]
+mod precache_wiring_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn report_access_feeds_precache_activity() {
+        let h = crate::api::test_support::harness().await;
+        let engine = TieringEngine::new(
+            h.state.config.tiering.clone(),
+            h.state.scheduler.clone(),
+            h.state.audit_log.clone(),
+            h.state.sm_data.clone(),
+        );
+        let reads = HashMap::from([("TORO".to_string(), 1u32), ("unknown".to_string(), 2u32)]);
+        engine.report_access("c1", "/tv/a.mkv", 1, 1, reads, DiskTier::Cold, 1).await;
+        let st = engine.precache.lock();
+        let a = st.activity.get(&("/tv/a.mkv".to_string(), "toro".to_string())).expect("toro activity");
+        assert!(a.chunk_ids.contains("c1"));
+        assert_eq!(st.activity.len(), 1, "unknown dc is ignored");
+    }
+
+    /// A follower tick drops leader memory but keeps the read activity.
+    #[tokio::test]
+    async fn precache_tick_on_follower_resets_leader_state_only() {
+        let h = crate::api::test_support::harness().await; // never leader
+        let engine = TieringEngine::new(
+            h.state.config.tiering.clone(),
+            h.state.scheduler.clone(),
+            h.state.audit_log.clone(),
+            h.state.sm_data.clone(),
+        );
+        let reads = HashMap::from([("toro".to_string(), 1u32)]);
+        engine.report_access("c1", "/tv/a.mkv", 1, 1, reads, DiskTier::Cold, 1).await;
+        engine.precache.lock().protected.insert(("c1".into(), 2));
+        engine.precache_tick().await;
+        let st = engine.precache.lock();
+        assert!(st.protected.is_empty());
+        assert_eq!(st.activity.len(), 1);
     }
 }

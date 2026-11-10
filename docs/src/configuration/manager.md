@@ -145,6 +145,7 @@ A replication count creates replicas only if something maintains them: the volum
 | `frozen_threshold_days` | u32 | `60` | Keep above `cold_threshold_days`. | cluster |
 | `evaluation_interval_secs` | u64 | `3600` | **Validated**: > 0. | cluster |
 | `enable_cache_redundancy_escalation` | bool | `false` | `true`: the cache planner may raise a chunk's cache replicas from `min` toward `max` once reads reach 2 x `promote_reads`. | cluster |
+| `precache_max_mbps` | u64 | `10` | **Validated**: > 0. Average Mbit/s at which predictive pre-caching starts copies (token bucket, 120 s burst). Per-volume policy: [pre-caching](../storage/tiering.md#pre-caching). | cluster |
 
 ## `[monitoring]`
 

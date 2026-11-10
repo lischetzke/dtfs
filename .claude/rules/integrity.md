@@ -95,7 +95,10 @@ text there.
 - `mandatory_replicas.<tier>`: only `check_under_replicated` maintains
   them, counting only LIVE replicas (`live_replica_tier`).
 - `cache_replicas.<tier>.{min,max}`: only the tiering engine creates them;
-  the under-replication scheduler never backfills them.
+  the under-replication scheduler never backfills them. Pre-cache copies
+  (`precache.rs`, driven by `TieringEngine::run_precache`) are cache replicas
+  made via `schedule_replications`; pre-cache never removes them, only the
+  idle demote does (skipping protected ones; `flush_cache` overrides).
 - Write ack floor counts only distinct (node_id, disk_id) replicas on RF>0
   tiers; allocation fills it across maintained tiers; the only lowering is
   the capacity clamp (healthy maintained nodes, same eligibility rule as the

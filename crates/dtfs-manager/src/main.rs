@@ -14,7 +14,6 @@ mod metadata;
 mod monitor;
 mod placement;
 mod placement_state;
-#[cfg(test)]
 mod precache;
 mod rest_auth;
 mod scheduler;
@@ -398,6 +397,11 @@ async fn main() -> anyhow::Result<()> {
         tiering_ref.run().await;
     });
 
+    let precache_ref = tiering_engine.clone();
+    let precache_handle = tokio::spawn(async move {
+        precache_ref.run_precache().await;
+    });
+
     // --- Health monitor background task ---
 
     // Bug CH — the monitor detects and alerts only; repair is owned by
@@ -549,6 +553,10 @@ async fn main() -> anyhow::Result<()> {
         }
         _ = tiering_handle => {
             tracing::error!("Tiering engine exited unexpectedly");
+            server_failed = true;
+        }
+        _ = precache_handle => {
+            tracing::error!("Pre-cache loop exited unexpectedly");
             server_failed = true;
         }
     }
