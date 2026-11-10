@@ -401,6 +401,31 @@ fn check_create_volume(requested: Option<&str>, exists: bool) -> Result<(), Stat
     }
 }
 
+/// #120 — refuse a CreateFile that would replace an entry of the other
+/// kind: a directory over a file/symlink (apply drops its chunk rows) or a
+/// file over a directory (its children are orphaned). Proposer-side, so
+/// apply stays identical on every manager during a mixed-version rollout.
+fn check_create_type(sm: &StateMachineData, path: &str) -> Result<(), Status> {
+    let is_dir = path.ends_with('/') && path != "/";
+    let canonical = if is_dir { path.trim_end_matches('/') } else { path };
+    let existing = sm.files.get(canonical);
+    let clash = if is_dir {
+        existing.is_some_and(|f| !f.is_directory)
+    } else {
+        let prefix = format!("{canonical}/");
+        existing.is_some_and(|f| f.is_directory)
+            || sm.files.range(prefix.clone()..).next().is_some_and(|(k, _)| k.starts_with(&prefix))
+    };
+    if clash {
+        tracing::warn!(path = canonical, is_dir, "CreateFile refused: path holds an entry of the other type");
+        return Err(Status::already_exists(format!(
+            "'{canonical}' already exists as {}",
+            if is_dir { "a non-directory" } else { "a directory" }
+        )));
+    }
+    Ok(())
+}
+
 /// #115 — status a `ReportChunkStatus` may write, `None` for a sticky
 /// state (Maintenance/Draining/Quarantined) the report must not clear.
 fn chunk_report_status(current: HealthStatus, has_corrupt: bool) -> Option<&'static str> {
@@ -1564,6 +1589,7 @@ impl ManagerService for MetadataService {
         let chunk_size = {
             let sm = self.sm_data.read().await;
             check_create_volume(req.volume_id.as_deref(), sm.volumes.contains_key(&volume_id))?;
+            check_create_type(&sm, &req.path)?;
             resolve_create_chunk_size(
                 sm.volumes.get(&volume_id).map(|v| v.chunk_size_bytes),
                 self.config.defaults.chunk_size_mb,

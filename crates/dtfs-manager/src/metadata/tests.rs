@@ -36,6 +36,53 @@ mod chunk_status_disk_grouping_tests {
         assert!(group_corrupt_by_disk(&[cs("e", "healthy", None)]).is_empty());
     }
 
+    fn entry(path: &str, is_dir: bool, chunks: usize) -> dtfs_raft::state_machine::FileMetadata {
+        dtfs_raft::state_machine::FileMetadata {
+            path: path.into(),
+            volume_id: "default".into(),
+            chunk_size: 1024,
+            chunks: (0..chunks as u64)
+                .map(|i| dtfs_raft::ChunkLocationEntry {
+                    chunk_index: i, chunk_hash: format!("h{i}"), node_id: "7".into(), disk_id: 0, size_bytes: 1024,
+                })
+                .collect(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: is_dir,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            ever_committed: None,
+        }
+    }
+
+    // #120 — CreateFile must not replace an entry of the other type.
+    #[test]
+    fn issue_120_create_refuses_type_clash() {
+        use super::check_create_type;
+        let mut sm = super::StateMachineData::default();
+        sm.files.insert("/a/x.mkv".into(), entry("/a/x.mkv", false, 2));
+        sm.files.insert("/d".into(), entry("/d", true, 0));
+        sm.files.insert("/implicit/child".into(), entry("/implicit/child", false, 1));
+        let code = |p: &str| check_create_type(&sm, p).unwrap_err().code();
+        assert_eq!(code("/a/x.mkv/"), tonic::Code::AlreadyExists, "mkdir over a file with chunks");
+        assert_eq!(code("/d"), tonic::Code::AlreadyExists, "file over a directory marker");
+        assert_eq!(code("/implicit"), tonic::Code::AlreadyExists, "file over a directory with children");
+    }
+
+    #[test]
+    fn issue_120_create_allows_same_type_and_free_paths() {
+        use super::check_create_type;
+        let mut sm = super::StateMachineData::default();
+        sm.files.insert("/a/x.mkv".into(), entry("/a/x.mkv", false, 2));
+        sm.files.insert("/d".into(), entry("/d", true, 0));
+        assert!(check_create_type(&sm, "/a/x.mkv").is_ok(), "O_CREAT re-open keeps preserve path");
+        assert!(check_create_type(&sm, "/d/").is_ok(), "mkdir over a directory");
+        assert!(check_create_type(&sm, "/new/").is_ok());
+        assert!(check_create_type(&sm, "/new").is_ok());
+        assert!(check_create_type(&sm, "/a/x.mk").is_ok(), "prefix of a file name is not its child");
+    }
+
     // #115 — a chunk report must not overwrite a sticky operator state.
     #[test]
     fn issue_115_chunk_report_keeps_sticky_states() {
