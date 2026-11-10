@@ -57,8 +57,10 @@ For each existing cache-tier placement:
    be 0 (no reads from this DC inside `promote_window_secs`).
 3. **Anchor safety** — at least one other **live** replica must
    satisfy the anchor (datacenter, and tier if `required_tier` is
-   set). A replica on a Down node or Failed disk, or one already
-   slated for demotion in the same plan, does not count. The apply
+   set). A replica on a Down, Failed, Maintenance or Quarantined node
+   (or one with a quarantine record), on a Failed or Removed disk, or
+   one already slated for demotion in the same plan, does not count
+   (`survivor_replica_tier`, #114). The apply
    path re-checks via `enforce_anchor` on `RemoveChunkLocation`.
 4. **Read history** — read windows live only in the leader's memory.
    After an election or leader restart no idle demotion runs until this
