@@ -224,11 +224,18 @@ later transparently re-acquires on the next write.
 **Memory backpressure.** If a data node returns `RESOURCE_EXHAUSTED`
 (Bug G shed path), the client retries with backoff
 (`put_chunk_retry_backoff`, up to 6 retries, 15.75 s). The caller sees a
-slow write, not an error. A full disk (`disk full`, `no eligible disk`)
-and a failed connect are not retried (the writer reroutes or proceeds on
-the other targets); any other `UNAVAILABLE` gets two retries (0.75 s).
-A put waits for its slowest target, so a dead target costs one connect
-timeout (5 s) per chunk until placement stops choosing it.
+slow write, not an error. A full disk (`disk full`) gets one retry on
+the same node (it may land on another disk), then the writer reroutes;
+`no eligible disk` and a failed connect are not retried there; any
+other `UNAVAILABLE` gets two retries (0.75 s). While a chunk has fewer
+acks than the ack floor (`AllocateChunksResponse.ack_floor`, capped at
+its target count), the FUSE writer re-puts to a target that answered
+`UNAVAILABLE` (failed connect, restarting node) on the 0.25 s to 8 s
+ladder within 60 s (`put_targets`), so a write rides out a data-node
+restart. Once the floor acked it stops waiting on targets in that retry
+ladder; it always waits for every target's first attempt (the anchor
+copy must land), so a dead target still costs one connect timeout (5 s)
+per chunk until placement stops choosing it.
 
 **Long partitions.** If every manager is unreachable past the retry
 budget, the syscall returns `EIO` to the application. Plex shows

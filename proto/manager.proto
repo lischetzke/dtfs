@@ -374,6 +374,11 @@ message ChunkPlacement {
 
 message AllocateChunksResponse {
   repeated ChunkPlacement placements = 1;
+  // #150 — the write_safety ack floor the commit gate resolves for this
+  // path. The writer retries an unreachable target while a chunk has fewer
+  // acks than this (capped at its target count). 0 = older manager: the
+  // writer assumes the default floor 2.
+  uint32 ack_floor = 2;
 }
 
 // --- CommitChunkLocations ---

@@ -186,6 +186,14 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   `bg_upload` commits under the fh's current path (a detached fh fails,
   never lands in a file re-created at the old path). Do not unbound it: puts share a fixed 60 s
   deadline and each buffers ~3 MiB per target (put channel depth 2).
+  A segment's targets go through `put_targets` (#150): quorum
+  `put_quorum` = max(ceil(N/2), min(manager `ack_floor`, N); 0 from an
+  old manager = 2); an `Unavailable` target is re-put on the put ladder
+  within `PUT_RETRY_DEADLINE` (60 s) while short of quorum; once met, a
+  target in that retry ladder is dropped (never registered, its late
+  copy is an orphan), but every target's FIRST attempt is awaited (the
+  anchor target is not identifiable client-side). Only acked targets are
+  committed.
 - Every drain that goes to `flush_segments_to_cluster` (write flush, cap
   drains, `commit_all`) holds `WriteBuffer::begin_inflight` (`Bytes`
   clones, no copy) until the restore (failure) or

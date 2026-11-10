@@ -3926,6 +3926,7 @@ impl DtfsFilesystem {
             );
         }
         let placements = &alloc_response.placements;
+        let first_ack_floor = alloc_response.ack_floor;
         let volume_id = volume_id.as_str();
 
         // For each segment: write the chunk to the primary AND every replica
@@ -3944,6 +3945,7 @@ impl DtfsFilesystem {
             }
             let segment = &segments[i];
             let mut placement = placements[i].clone();
+            let mut ack_floor = first_ack_floor;
 
             // Bug BU-2 — bounded reroute. If the assigned placement can't
             // accept the write because its target-tier disk is full
@@ -3975,33 +3977,26 @@ impl DtfsFilesystem {
                     }
                 }
                 let rf = targets.len();
-                let min_ok = ((rf + 1) / 2).max(1);
+                let min_ok = put_quorum(rf, ack_floor);
                 // Bug AV (AV-4-1d) — pass the manager-resolved tier through to
                 // the data-node so it lands the chunk on the right tier.
                 let tier = fuse_tier_for_placement(&placement.tier).to_string();
 
                 // Issue writes in parallel — Bytes is refcounted so cloning is
                 // cheap (zero-copy), so the buffer is shared across replicas.
-                let writes = targets.iter().map(|addr| {
+                // #150: an unreachable target is re-put while the chunk is
+                // short of quorum; `put_targets` stops waiting on a target
+                // in its retry ladder once the quorum acked.
+                let put = |addr: String| {
                     let client = self.client.clone();
-                    let addr = addr.clone();
                     let data = segment.data.clone();
                     let tier = tier.clone();
                     let expected_chunk_id = expected_chunk_id.clone();
+                    let chunk_index = segment.chunk_index;
                     async move {
-                        let res = client
-                            .write_chunk_bytes(&addr, &expected_chunk_id, &volume_id, &tier, data)
-                            .await;
-                        (addr, res)
-                    }
-                });
-                let results = futures_util::future::join_all(writes).await;
-
-                let mut successes: Vec<(String, _)> = Vec::with_capacity(rf);
-                let mut last_err: Option<anyhow::Error> = None;
-                let mut exhausted_addrs: Vec<String> = Vec::new();
-                for (addr, res) in results {
-                    match res {
+                        let put_resp = client
+                            .write_chunk_bytes(&addr, &expected_chunk_id, volume_id, &tier, data)
+                            .await?;
                         // CR-1-5 — a data node that returns a DIFFERENT
                         // chunk_id than what we declared and hashed
                         // ourselves means the bytes it stored don't match
@@ -4011,22 +4006,26 @@ impl DtfsFilesystem {
                         // replica so this node is excluded from `successes`
                         // and the quorum check below can still succeed on
                         // the other replicas, or fail the whole segment.
-                        Ok(put_resp) if put_resp.chunk_id != expected_chunk_id => {
-                            warn!(
-                                chunk_index = segment.chunk_index,
-                                node = %addr,
-                                expected = %expected_chunk_id,
-                                got = %put_resp.chunk_id,
-                                "write_chunk returned a mismatched chunk_id; not committing this replica"
-                            );
-                            last_err = Some(anyhow::anyhow!(
+                        // Logged once by the caller ("write_chunk failed on replica").
+                        if put_resp.chunk_id != expected_chunk_id {
+                            bail!(
                                 "chunk_id mismatch for chunk_index {} on {}: expected {}, got {}",
-                                segment.chunk_index,
+                                chunk_index,
                                 addr,
                                 expected_chunk_id,
                                 put_resp.chunk_id
-                            ));
+                            );
                         }
+                        Ok(put_resp)
+                    }
+                };
+                let results = put_targets(&targets, min_ok, PUT_RETRY_DEADLINE, put).await;
+
+                let mut successes: Vec<(String, _)> = Vec::with_capacity(rf);
+                let mut last_err: Option<anyhow::Error> = None;
+                let mut exhausted_addrs: Vec<String> = Vec::new();
+                for (addr, res) in results {
+                    match res {
                         Ok(put_resp) => successes.push((addr, put_resp)),
                         Err(e) => {
                             if is_resource_exhausted(&e) {
@@ -4038,7 +4037,7 @@ impl DtfsFilesystem {
                                 error = %e,
                                 "write_chunk failed on replica",
                             );
-                            last_err = Some(anyhow::anyhow!(e));
+                            last_err = Some(e);
                         }
                     }
                 }
@@ -4083,6 +4082,7 @@ impl DtfsFilesystem {
                     .allocate_chunks_excluding(path, 1, &volume_id, preferred_tier, &excluded)
                     .await
                     .with_context(|| format!("BU-2 reroute allocate failed for {path}"))?;
+                ack_floor = realloc.ack_floor;
                 placement = realloc.placements.into_iter().next().with_context(|| {
                     format!(
                         "BU-2 reroute for {path} chunk {}: no eligible placement (tier exhausted)",
@@ -4945,6 +4945,98 @@ fn is_lease_conflict(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("commit_chunk_locations rejected: write lease no longer held")
 }
 
+/// #150: how long one chunk keeps re-putting to an unreachable target while
+/// it is short of quorum (the channel's per-RPC timeout).
+const PUT_RETRY_DEADLINE: Duration = Duration::from_secs(60);
+
+/// #150: the acks a chunk needs: the manager's ack floor capped at the
+/// target count, at least ceil(rf/2). An older manager sends 0: assume the
+/// default `write_safety.min_replicas_before_ack` (2).
+fn put_quorum(rf: usize, ack_floor: u32) -> usize {
+    let floor = if ack_floor == 0 { 2 } else { ack_floor as usize };
+    floor.min(rf).max(rf.div_ceil(2)).max(1)
+}
+
+/// #150: a put failure saying the target node is unreachable or restarting
+/// (connect error, dropped channel), worth re-putting to the same node.
+fn put_err_node_unavailable(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("code=Unavailable")
+}
+
+/// One put attempt of `put_targets`, after `delay`. A single fn so every
+/// attempt has the same future type.
+async fn put_attempt<T, F, Fut>(put: &F, i: usize, addr: String, n: u32, delay: Duration) -> (usize, u32, Result<T>)
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+    (i, n, put(addr).await)
+}
+
+/// #150: puts one chunk to every target and returns each target's last
+/// result, in target order. A target failing with Unavailable is re-put on
+/// the put ladder while fewer than `quorum` acked and the next try starts
+/// before `deadline`. Returns once every attempt ended, or once `quorum`
+/// acked and every target's FIRST attempt ended: a target in its retry
+/// ladder is dropped then (a copy it lands later is never committed and is
+/// reaped as an orphan). A first attempt is always awaited: the writer
+/// cannot tell the anchor target apart, and its copy must land synchronously.
+async fn put_targets<T, F, Fut>(
+    targets: &[String],
+    quorum: usize,
+    deadline: Duration,
+    put: F,
+) -> Vec<(String, Result<T>)>
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    use futures_util::StreamExt;
+    let start = tokio::time::Instant::now();
+    let mut inflight: futures_util::stream::FuturesUnordered<_> = targets
+        .iter()
+        .enumerate()
+        .map(|(i, a)| put_attempt(&put, i, a.clone(), 0, Duration::ZERO))
+        .collect();
+    let mut out: Vec<Option<Result<T>>> = targets.iter().map(|_| None).collect();
+    let (mut first_pending, mut acked) = (targets.len(), 0usize);
+    while let Some((i, n, res)) = inflight.next().await {
+        if n == 0 {
+            first_pending -= 1;
+        }
+        match res {
+            Ok(v) => {
+                acked += 1;
+                out[i] = Some(Ok(v));
+            }
+            Err(e) => {
+                let retry = (acked < quorum && put_err_node_unavailable(&e))
+                    .then(|| dtfs_client::client::put_retry_ladder(n))
+                    .flatten()
+                    .filter(|d| start.elapsed() + *d < deadline);
+                if let Some(d) = retry {
+                    debug!(node = %targets[i], attempt = n + 1, backoff_ms = d.as_millis() as u64,
+                        "put target unavailable while short of quorum; retrying");
+                    inflight.push(put_attempt(&put, i, targets[i].clone(), n + 1, d));
+                }
+                out[i] = Some(Err(e));
+            }
+        }
+        if acked >= quorum && first_pending == 0 {
+            break;
+        }
+    }
+    targets
+        .iter()
+        .cloned()
+        .zip(out)
+        .map(|(a, r)| (a, r.expect("every target's first attempt ended")))
+        .collect()
+}
+
 /// Runs `upload(i)` for every segment index of a flush batch and returns the
 /// results in index order, or the lowest-index error. At most `concurrency`
 /// uploads run at once (`1` = sequential); after the first error in index
@@ -4976,6 +5068,88 @@ where
             true
         }
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod put_quorum_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU32;
+
+    const UNAVAILABLE: &str = "put_chunk RPC failed (code=Unavailable, attempts=1): connect: refused";
+
+    #[derive(Clone, Copy)]
+    enum Target {
+        Ok,
+        /// Fails Unavailable this many times, then acks.
+        Restarting(u32),
+        /// Fails Unavailable once, then every retry hangs.
+        FailThenHang,
+        Dead,
+        Refuses,
+    }
+
+    /// Runs `put_targets` over `targets` (address = index) and returns the
+    /// per-target results plus attempt counts.
+    async fn run(targets: &[Target], quorum: usize, deadline: Duration) -> (Vec<Result<()>>, Vec<u32>) {
+        let addrs: Vec<String> = (0..targets.len()).map(|i| i.to_string()).collect();
+        let tries: Vec<Arc<AtomicU32>> = targets.iter().map(|_| Arc::new(AtomicU32::new(0))).collect();
+        let put = |addr: String| {
+            let i: usize = addr.parse().unwrap();
+            let (kind, n) = (targets[i], tries[i].fetch_add(1, Ordering::SeqCst));
+            async move {
+                match kind {
+                    Target::Ok => Ok(()),
+                    Target::Restarting(k) if n >= k => Ok(()),
+                    Target::FailThenHang if n > 0 => std::future::pending().await,
+                    Target::Refuses => bail!("put_chunk RPC failed (code=InvalidArgument, attempts=1): bad"),
+                    _ => bail!(UNAVAILABLE),
+                }
+            }
+        };
+        let res = put_targets(&addrs, quorum, deadline, put).await;
+        assert_eq!(res.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>(), addrs);
+        (res.into_iter().map(|(_, r)| r).collect(), tries.iter().map(|t| t.load(Ordering::SeqCst)).collect())
+    }
+
+    #[test]
+    fn quorum_is_the_ack_floor_capped_at_the_targets() {
+        assert_eq!(put_quorum(2, 2), 2, "default floor 2 over two targets");
+        assert_eq!(put_quorum(3, 2), 2);
+        assert_eq!(put_quorum(3, 1), 2, "at least ceil(rf/2)");
+        assert_eq!(put_quorum(1, 2), 1, "capped at the target count");
+        assert_eq!(put_quorum(3, 0), 2, "older manager: the default floor 2");
+        assert_eq!(put_quorum(1, 0), 1);
+    }
+
+    /// #150: quorum met; a target in its retry ladder is not waited for.
+    /// Short of quorum, the same target is still waited for.
+    #[tokio::test(start_paused = true)]
+    async fn quorum_met_does_not_wait_for_a_retrying_target() {
+        let within = |q| tokio::time::timeout(Duration::from_secs(1), run(&[Target::Ok, Target::FailThenHang], q, PUT_RETRY_DEADLINE));
+        let (res, _) = within(1).await.expect("returned once the quorum acked");
+        assert!(res[0].is_ok());
+        assert!(format!("{:#}", res[1].as_ref().unwrap_err()).contains("code=Unavailable"));
+        assert!(within(2).await.is_err(), "short quorum keeps waiting on the retry");
+    }
+
+    /// #150: a target restarting (Unavailable twice) is re-put while the
+    /// chunk is short of quorum, and acks.
+    #[tokio::test(start_paused = true)]
+    async fn short_quorum_retries_a_restarting_target() {
+        let (res, tries) = run(&[Target::Ok, Target::Restarting(2)], 2, PUT_RETRY_DEADLINE).await;
+        assert!(res[1].is_ok(), "{:?}", res[1]);
+        assert_eq!(tries, [1, 3]);
+    }
+
+    /// #150: a target that never comes back fails with its own error once
+    /// the next backoff would cross the deadline; a refusal is not retried.
+    #[tokio::test(start_paused = true)]
+    async fn short_quorum_gives_up_at_the_deadline() {
+        // 0 + 0.25 + 0.5 s retries fit in 1 s, the next 1 s backoff does not.
+        let (res, tries) = run(&[Target::Ok, Target::Dead, Target::Refuses], 3, Duration::from_secs(1)).await;
+        assert_eq!(format!("{:#}", res[1].as_ref().unwrap_err()), UNAVAILABLE);
+        assert_eq!(tries, [1, 3, 1], "boundary: 3 attempts in 1 s, refusal once");
     }
 }
 

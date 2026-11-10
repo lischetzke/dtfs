@@ -2826,7 +2826,7 @@ impl ManagerService for MetadataService {
                         tier: chunk_placement_tier_string(effective_tier),
                     })
                     .collect();
-                return Ok(Response::new(AllocateChunksResponse { placements }));
+                return Ok(Response::new(AllocateChunksResponse { placements, ack_floor: floor }));
             }
         }
 
@@ -2988,7 +2988,7 @@ impl ManagerService for MetadataService {
                     });
                 }
                 fill_ack_floor(&mut placements, spill_tier);
-                return Ok(Response::new(AllocateChunksResponse { placements }));
+                return Ok(Response::new(AllocateChunksResponse { placements, ack_floor: floor }));
             }
             let rf = (replication as usize).min(node_list.len());
 
@@ -3016,7 +3016,7 @@ impl ManagerService for MetadataService {
 
         fill_ack_floor(&mut placements, effective_tier);
 
-        Ok(Response::new(AllocateChunksResponse { placements }))
+        Ok(Response::new(AllocateChunksResponse { placements, ack_floor: floor }))
     }
 
     async fn commit_chunk_locations(

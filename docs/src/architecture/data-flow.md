@@ -15,7 +15,7 @@ This page traces what happens, step by step, for the common operations and for t
       |                         | 4. hash chunk (BLAKE3)     |                     |
       |                         | 5. PutChunk (stream) ------------------------->  all targets
       |                         |    in parallel             |        tmp, fsync, rename, .meta
-      |                         | 6. need ceil(N/2) acks     |                     |
+      |                         | 6. need ack-floor acks     |                     |
       |                         | 7. CommitChunkLocations -->| (Raft) checks       |
       |                         |    one row per acked replica   min_replicas_before_ack
       |<-- ok ------------------|                            |                     |
@@ -26,7 +26,7 @@ This page traces what happens, step by step, for the common operations and for t
 3. **Allocate.** The manager places each chunk by the file's own registered volume, using the hash ring over healthy nodes with room, forcing one replica into the anchor datacenter (see [Data Distribution](./data-distribution.md)).
 4. **Hash.** The client hashes the chunk once. The hash is the chunk id and is sent as the declared id, so the data node can reject a bit flip between the client buffer and its own incremental hash.
 5. **Put.** The client streams the chunk to every target in parallel. Each data node writes `tmp/<uuid>.dat.tmp` incrementally while hashing, fsyncs, renames to `chunks/<aa>/<bb>/<id>.dat`, then writes `.meta` the same way, fsyncs the chunk directory once for both renames, then clears the WAL entry. If a disk is full (`RESOURCE_EXHAUSTED`), the client re-allocates that chunk excluding the full node (bounded retries).
-6. **Quorum on the client.** The write proceeds when at least `ceil(N/2)` targets acknowledged with a matching chunk id. A node that returns a different id is treated as failed.
+6. **Quorum on the client.** The write proceeds when at least `max(ceil(N/2), min(ack_floor, N))` targets acknowledged with a matching chunk id (`ack_floor` from the allocation); an `UNAVAILABLE` target is re-put while the chunk is short of that. A node that returns a different id is treated as failed.
 7. **Commit.** `CommitChunkLocations` is one Raft command. The manager rejects it when any chunk has fewer distinct `(node_id, disk_id)` replicas than the volume's `write_safety.min_replicas_before_ack` (counting only replicas on maintained tiers; allocation fills the floor across such tiers, and the floor is clamped only to what the cluster can hold). Replicas that missed the quorum are created later by the repair scheduler.
 
 Large writes flush in batches of complete chunks (`write.flush_batch_chunks`, default 4) so memory stays bounded. The chunks of one batch are put up to `write.upload_concurrency` (default 2) at a time, each to all its targets; the batch's single `CommitChunkLocations` is sent only after every chunk reached its quorum, so one failed chunk commits nothing of the batch. If a flush fails, the drained bytes are restored to the buffer. On `release`, a file that never committed a chunk (a create that failed) is unlinked (the "ghost" case); a file that has ever committed is never ghost-unlinked.

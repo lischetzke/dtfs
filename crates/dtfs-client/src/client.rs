@@ -111,9 +111,9 @@ const PUT_CHUNK_UNAVAILABLE_MAX_RETRIES: u32 = 2;
 /// Decide how long to back off before retry on a put_chunk failure.
 /// Returns `None` when the caller should give up (non-retryable status
 /// or attempts exhausted). The long ladder is for memory shedding only; a
-/// full disk and a failed connect (the 5 s connect timeout already ran or
-/// the host refused) are not retried: the writer reroutes or proceeds on
-/// the other targets.
+/// full disk gets one retry, no eligible disk and a failed connect (the
+/// 5 s connect timeout already ran or the host refused) none: the writer
+/// reroutes, or re-puts to the target while short of quorum.
 ///
 /// Pure function so we can unit-test the policy without running gRPC.
 pub(crate) fn put_chunk_retry_backoff(
@@ -122,11 +122,10 @@ pub(crate) fn put_chunk_retry_backoff(
     attempt_zero_based: u32,
 ) -> Option<std::time::Duration> {
     let max = match code {
-        tonic::Code::ResourceExhausted
-            if message.contains("disk full") || message.contains("no eligible disk") =>
-        {
-            return None
-        }
+        tonic::Code::ResourceExhausted if message.contains("no eligible disk") => return None,
+        // #150 review: one retry; the node then skips the full disk (8cecd02
+        // reserve) and may land the chunk on another one.
+        tonic::Code::ResourceExhausted if message.contains("disk full") => 1,
         tonic::Code::ResourceExhausted => PUT_CHUNK_MAX_RETRIES,
         tonic::Code::Unavailable if message.starts_with("connect:") => return None,
         tonic::Code::Unavailable => PUT_CHUNK_UNAVAILABLE_MAX_RETRIES,
@@ -139,6 +138,13 @@ pub(crate) fn put_chunk_retry_backoff(
         .saturating_mul(1 << attempt_zero_based)
         .min(PUT_CHUNK_MAX_BACKOFF_MS);
     Some(std::time::Duration::from_millis(ms))
+}
+
+/// #150: the full put ladder (0.25 s doubling to 8 s, 6 retries) for a
+/// writer that re-puts to an unreachable target while its chunk is short
+/// of quorum.
+pub fn put_retry_ladder(attempt_zero_based: u32) -> Option<std::time::Duration> {
+    put_chunk_retry_backoff(tonic::Code::ResourceExhausted, "", attempt_zero_based)
 }
 
 /// Bug CF — retry policy for re-walking the manager pool after a full
@@ -1479,9 +1485,16 @@ mod put_chunk_retry_tests {
         assert_eq!(un(1), Some(Duration::from_millis(500)));
         assert_eq!(un(PUT_CHUNK_UNAVAILABLE_MAX_RETRIES), None, "boundary: third retry");
         assert_eq!(put_chunk_retry_backoff(tonic::Code::Unavailable, "connect: refused", 0), None);
-        for msg in ["put_chunk commit: disk full (ENOSPC)", "allocate tmp: no eligible disk: all failed"] {
-            assert_eq!(put_chunk_retry_backoff(tonic::Code::ResourceExhausted, msg, 0), None, "{msg}");
-        }
+        let no_disk = "allocate tmp: no eligible disk: all failed";
+        assert_eq!(put_chunk_retry_backoff(tonic::Code::ResourceExhausted, no_disk, 0), None);
+        // #150 review: a full disk gets ONE retry on the same node (the data
+        // node then skips that disk); the second refusal reroutes.
+        let full = "put_chunk commit: disk full (ENOSPC)";
+        assert_eq!(
+            put_chunk_retry_backoff(tonic::Code::ResourceExhausted, full, 0),
+            Some(Duration::from_millis(PUT_CHUNK_BASE_BACKOFF_MS))
+        );
+        assert_eq!(put_chunk_retry_backoff(tonic::Code::ResourceExhausted, full, 1), None, "boundary");
         assert!(put_chunk_retry_backoff(tonic::Code::ResourceExhausted, SHED, PUT_CHUNK_MAX_RETRIES - 1).is_some());
     }
 
