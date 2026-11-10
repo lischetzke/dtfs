@@ -806,7 +806,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(5),
-            &ClientRequest::UpdateChunkLocations { now_ms: 0,
+            &ClientRequest::UpdateChunkLocations { now_ms: 0, extent_from_request: false,
                 path: "/movies/.foo.GQhlto".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -890,7 +890,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(3),
-            &ClientRequest::UpdateChunkLocations { now_ms: 0,
+            &ClientRequest::UpdateChunkLocations { now_ms: 0, extent_from_request: false,
                 path: "/f.bin".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -962,7 +962,7 @@ mod posix_path_regression {
         apply_request(
             &mut sm,
             &mk_log_id(12),
-            &ClientRequest::UpdateChunkLocations { now_ms: 0,
+            &ClientRequest::UpdateChunkLocations { now_ms: 0, extent_from_request: false,
                 path: "/series/episode-01.mkv".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -1300,7 +1300,7 @@ mod posix_path_regression {
         let resp = apply_request(
             &mut sm,
             &mk_log_id(5),
-            &ClientRequest::UpdateChunkLocations { now_ms: 0,
+            &ClientRequest::UpdateChunkLocations { now_ms: 0, extent_from_request: false,
                 path: "/x.bin".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -1328,7 +1328,7 @@ mod posix_path_regression {
         let resp = apply_request(
             &mut sm,
             &mk_log_id(6),
-            &ClientRequest::UpdateChunkLocations { now_ms: 0,
+            &ClientRequest::UpdateChunkLocations { now_ms: 0, extent_from_request: false,
                 path: "/x.bin".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -1364,7 +1364,7 @@ mod posix_path_regression {
         let resp = apply_request(
             &mut sm,
             &mk_log_id(2),
-            &ClientRequest::UpdateChunkLocations { now_ms: 0,
+            &ClientRequest::UpdateChunkLocations { now_ms: 0, extent_from_request: false,
                 path: "/y.bin".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -3110,7 +3110,7 @@ mod posix_path_regression {
             &ClientRequest::SetFileSize { now_ms: 0, path: "/f".into(), new_size: 0 });
         assert_eq!(sm.files.get("/f").unwrap().logical_size, Some(0));
         seed_lease(&mut sm, "/f");
-        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::UpdateChunkLocations { now_ms: 0,
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::UpdateChunkLocations { now_ms: 0, extent_from_request: false,
             path: "/f".into(),
             chunks: vec![ChunkLocationEntry {
                 chunk_index: 0, chunk_hash: "h".into(), node_id: "10".into(),
@@ -3134,7 +3134,7 @@ mod posix_path_regression {
         let six_mb = 6 * 1024 * 1024u64;
         apply_request(&mut sm, &mk_log_id(2),
             &ClientRequest::SetFileSize { now_ms: 0, path: "/f".into(), new_size: six_mb });
-        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::UpdateChunkLocations { now_ms: 0,
+        apply_request(&mut sm, &mk_log_id(3), &ClientRequest::UpdateChunkLocations { now_ms: 0, extent_from_request: false,
             path: "/f".into(),
             chunks: vec![ChunkLocationEntry {
                 chunk_index: 0, chunk_hash: "h".into(), node_id: "10".into(),
@@ -3257,6 +3257,7 @@ mod posix_path_regression {
             }],
             lease_id: String::new(),
             now_ms: 5_000,
+            extent_from_request: false,
         };
         let mut sm1 = StateMachineData::default();
         apply_request(&mut sm1, &mk_log_id(1), &ClientRequest::CreateFile { now_ms: 0,
@@ -3463,7 +3464,7 @@ mod audit_co_tests {
             chunk_size: 1024,
         });
         seed_lease(&mut sm, "/keep.bin");
-        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::UpdateChunkLocations { now_ms: 0,
+        apply_request(&mut sm, &mk_log_id(2), &ClientRequest::UpdateChunkLocations { now_ms: 0, extent_from_request: false,
             path: "/keep.bin".into(),
             chunks: vec![ChunkLocationEntry {
                 chunk_index: 0,
@@ -3522,7 +3523,7 @@ mod audit_co_tests {
         });
         // Commit chunks on /b under the original lease.
         let resp = apply_request(&mut sm, &mk_log_id(4),
-            &ClientRequest::UpdateChunkLocations { now_ms: 0,
+            &ClientRequest::UpdateChunkLocations { now_ms: 0, extent_from_request: false,
                 path: "/b".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -3615,7 +3616,7 @@ mod audit_co_tests {
         });
         // A different writer commits with an EMPTY lease_id while A holds it.
         let resp = apply_request(&mut sm, &mk_log_id(3),
-            &ClientRequest::UpdateChunkLocations { now_ms: 0,
+            &ClientRequest::UpdateChunkLocations { now_ms: 0, extent_from_request: false,
                 path: "/f".into(),
                 chunks: vec![ChunkLocationEntry {
                     chunk_index: 0,
@@ -3872,7 +3873,7 @@ mod raft_audit_fix_tests {
 
     fn upd(sm: &mut StateMachineData, i: u64, lease: &str, rows: Vec<ChunkLocationEntry>) -> ClientResponse {
         apply_request(sm, &lid(i), &ClientRequest::UpdateChunkLocations {
-            path: "/f".into(), chunks: rows, lease_id: lease.into(), now_ms: 0,
+            path: "/f".into(), chunks: rows, lease_id: lease.into(), now_ms: 0, extent_from_request: false,
         })
     }
 
@@ -4212,6 +4213,7 @@ mod ever_committed_tests {
     fn commit(sm: &mut StateMachineData, idx: u64, path: &str, i: u64) {
         let r = apply_request(sm, &lid(idx), &ClientRequest::UpdateChunkLocations {
             path: path.into(), chunks: vec![row(i)], lease_id: "seed".into(), now_ms: 0,
+            extent_from_request: false,
         });
         assert_eq!(r, ClientResponse::Success);
     }
@@ -4269,7 +4271,7 @@ mod ever_committed_tests {
         let mut copy = row(0);
         copy.node_id = "8".into();
         let r = apply_request(&mut sm, &lid(3), &ClientRequest::UpdateChunkLocations {
-            path: "/u".into(), chunks: vec![copy], lease_id: String::new(), now_ms: 0,
+            path: "/u".into(), chunks: vec![copy], lease_id: String::new(), now_ms: 0, extent_from_request: false,
         });
         assert_eq!(r, ClientResponse::Success);
         assert_eq!(sm.files["/u"].ever_committed, Some(true));
@@ -4378,7 +4380,7 @@ mod ever_committed_tests {
                     now_ms: 0, path: p, volume_id: "default".into(), chunk_size: MIB,
                 },
                 1 | 2 => ClientRequest::UpdateChunkLocations {
-                    path: p, chunks: vec![row(next() % 4)], lease_id: String::new(), now_ms: 0,
+                    path: p, chunks: vec![row(next() % 4)], lease_id: String::new(), now_ms: 0, extent_from_request: false,
                 },
                 3 => ClientRequest::SetFileSize { path: p, new_size: (next() % 5) * MIB, now_ms: 0 },
                 _ => ClientRequest::DeleteFile { path: p, now_ms: 0 },
@@ -4392,7 +4394,7 @@ mod ever_committed_tests {
                     if sm.files.contains_key(path) && next_bool(i) {
                         seed_lease(&mut sm, path);
                         apply_request(&mut sm, &lid(i as u64 + 1), &ClientRequest::UpdateChunkLocations {
-                            path: path.clone(), chunks: chunks.clone(), lease_id: "seed".into(), now_ms: 0,
+                            path: path.clone(), chunks: chunks.clone(), lease_id: "seed".into(), now_ms: 0, extent_from_request: false,
                         });
                         sm.write_leases.remove(path);
                         continue;
@@ -4531,5 +4533,81 @@ mod named_remove_gate_tests {
         assert!(!cluster_understands_named_remove(&data_role));
         // No membership at all (fresh SM).
         assert!(!cluster_understands_named_remove(&StateMachineData::default()));
+    }
+
+    #[test]
+    fn issue_121_request_extent_gate_needs_every_member_at_0_1_15() {
+        assert!(cluster_understands_request_extent(&sm_with(["v0.1.15", "v0.1.15", "v0.2.0"])));
+        // Boundary: a v0.1.14 member keeps the legacy extent rule.
+        assert!(!cluster_understands_request_extent(&sm_with(["v0.1.15", "v0.1.14", "v0.1.15"])));
+        assert!(!cluster_understands_request_extent(&sm_with(["v0.1.15", "v0.1.15", "v0.0.0-dev"])));
+        assert!(!cluster_understands_request_extent(&StateMachineData::default()));
+    }
+}
+
+/// #121 — a non-aligned truncate keeps the tail row at its old full size;
+/// a later leased commit of a LOWER chunk must not grow logical_size back.
+#[cfg(test)]
+mod issue_121_truncate_extent_tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn lid(idx: u64) -> LogId {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        openraft::LogId::new(leader, idx)
+    }
+
+    fn row(i: u64, hash: &str) -> ChunkLocationEntry {
+        ChunkLocationEntry {
+            chunk_index: i, chunk_hash: hash.into(), node_id: "7".into(), disk_id: 1, size_bytes: 4 * MIB,
+        }
+    }
+
+    fn commit(sm: &mut StateMachineData, idx: u64, rows: Vec<ChunkLocationEntry>, from_request: bool) {
+        let r = apply_request(sm, &lid(idx), &ClientRequest::UpdateChunkLocations {
+            path: "/f".into(), chunks: rows, lease_id: "seed".into(), now_ms: 0,
+            extent_from_request: from_request,
+        });
+        assert_eq!(r, ClientResponse::Success);
+    }
+
+    /// 4 MiB chunks, 8 MiB file, truncate to 5 MiB, then rewrite chunk 0.
+    fn truncated_then_rewrite_chunk0(from_request: bool) -> StateMachineData {
+        let mut sm = StateMachineData::default();
+        apply_request(&mut sm, &lid(1), &ClientRequest::CreateFile {
+            now_ms: 0, path: "/f".into(), volume_id: "default".into(), chunk_size: 4 * MIB,
+        });
+        apply_request(&mut sm, &lid(2), &ClientRequest::SetFileSize { path: "/f".into(), new_size: 0, now_ms: 0 });
+        seed_lease(&mut sm, "/f");
+        commit(&mut sm, 3, vec![row(0, "a0"), row(1, "a1")], from_request);
+        assert_eq!(sm.files["/f"].logical_size, Some(8 * MIB));
+        apply_request(&mut sm, &lid(4), &ClientRequest::SetFileSize { path: "/f".into(), new_size: 5 * MIB, now_ms: 0 });
+        assert_eq!(sm.files["/f"].logical_size, Some(5 * MIB));
+        commit(&mut sm, 5, vec![row(0, "b0")], from_request);
+        sm
+    }
+
+    #[test]
+    fn issue_121_lower_chunk_commit_keeps_truncated_size() {
+        let sm = truncated_then_rewrite_chunk0(true);
+        assert_eq!(sm.files["/f"].logical_size, Some(5 * MIB));
+    }
+
+    /// Legacy request shape (old proposer / gate closed) keeps the old rule,
+    /// byte for byte, so a mixed-version cluster applies identically.
+    #[test]
+    fn issue_121_legacy_request_keeps_whole_file_extent() {
+        let sm = truncated_then_rewrite_chunk0(false);
+        assert_eq!(sm.files["/f"].logical_size, Some(8 * MIB));
+    }
+
+    /// The incoming rows still grow the file (append past EOF).
+    #[test]
+    fn issue_121_request_rows_still_grow_the_file() {
+        let mut sm = truncated_then_rewrite_chunk0(true);
+        commit(&mut sm, 6, vec![row(2, "b2")], true);
+        assert_eq!(sm.files["/f"].logical_size, Some(12 * MIB));
     }
 }

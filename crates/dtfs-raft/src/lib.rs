@@ -424,6 +424,13 @@ pub enum ClientRequest {
         /// to `log_id.index` (CO-3-1 pattern) in the apply.
         #[serde(default)]
         now_ms: u64,
+        /// #121 — a leased commit grows `logical_size` only to the extent of
+        /// THIS request's rows, so a stale tail row kept by a non-aligned
+        /// truncate cannot undo it. Proposers set it only once every manager
+        /// is >= `REQUEST_EXTENT_MIN_VERSION` (older appliers drop the field
+        /// and use the whole file's rows); `false` = that legacy rule.
+        #[serde(default)]
+        extent_from_request: bool,
     },
 
     /// Bug O — remove every (node_id, chunk_hash) entry the data node

@@ -3063,11 +3063,15 @@ impl ManagerService for MetadataService {
             }));
         }
 
+        // #121 — mixed-version gate: old appliers ignore the flag.
+        let extent_from_request =
+            dtfs_raft::state_machine::cluster_understands_request_extent(&*self.sm_data.read().await);
         let resp = self
             .raft_write(ClientRequest::UpdateChunkLocations { now_ms: stamp_now_ms(),
                 path: req.path.clone(),
                 chunks,
                 lease_id: req.lease_id.clone(),
+                extent_from_request,
             })
             .await?;
 

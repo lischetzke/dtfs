@@ -358,6 +358,8 @@ impl TaskScheduler {
                 chunks,
                 // Bug P — system-driven, so no client lease applies.
                 lease_id: String::new(),
+                // Lease-less: apply never grows the extent either way.
+                extent_from_request: false,
             };
             // Checked: a lease/lock conflict or Error response is NOT a
             // registration.

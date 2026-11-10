@@ -155,7 +155,7 @@ fn all_requests() -> Vec<ClientRequest> {
     vec![
         CreateFile { path: s("/a"), volume_id: s("default"), chunk_size: 1024, now_ms: 0 },
         DeleteFile { path: s("/a"), now_ms: 5 },
-        UpdateChunkLocations { path: s("/a"), chunks: vec![chunk(0)], lease_id: s("l1"), now_ms: 5 },
+        UpdateChunkLocations { path: s("/a"), chunks: vec![chunk(0)], lease_id: s("l1"), now_ms: 5, extent_from_request: false },
         RemoveCorruptChunkReplicas { node_id: s("7"), chunk_hashes: vec![s("ab")], disk_id: 1, now_ms: 5 },
         RegisterNode { node_id: 7, info: node_info(), now_ms: 5 },
         DeregisterNode { node_id: 7, now_ms: 5 },
@@ -268,6 +268,18 @@ fn remove_dead_node_replica_v2_entry_carries_chunk_hash() {
         _ => None,
     });
     assert_eq!(hash, Some(Some(chunk(0).chunk_hash)));
+}
+
+/// #121 — a v1 `UpdateChunkLocations` (no `extent_from_request`) keeps the
+/// legacy whole-file extent rule.
+#[test]
+fn update_chunk_locations_v1_defaults_extent_from_request_false() {
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V1).unwrap();
+    let flag = reqs.iter().find_map(|r| match r {
+        ClientRequest::UpdateChunkLocations { extent_from_request, .. } => Some(*extent_from_request),
+        _ => None,
+    });
+    assert_eq!(flag, Some(false));
 }
 
 fn testdata(name: &str) -> std::path::PathBuf {

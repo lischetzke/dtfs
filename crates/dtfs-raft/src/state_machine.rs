@@ -1291,7 +1291,7 @@ pub(crate) fn apply_request(
             ClientResponse::Success
         }
 
-        ClientRequest::UpdateChunkLocations { path, chunks, lease_id, now_ms: req_now_ms } => {
+        ClientRequest::UpdateChunkLocations { path, chunks, lease_id, now_ms: req_now_ms, extent_from_request } => {
             let eff_now_ms = if *req_now_ms == 0 { log_id.index } else { *req_now_ms };
             // Bug P — when the writer carries a lease_id, the manager
             // verifies it matches the currently-held lease. Pre-fix a
@@ -1383,8 +1383,10 @@ pub(crate) fn apply_request(
                 // of thin air for a file that has none set yet (None stays
                 // None; a chunk-only file reports its chunk extent via
                 // `FileMetadata::reported_size`).
-                let extent = file
-                    .chunks
+                // #121 — gated: only this request's rows, so a stale tail row
+                // left by a non-aligned truncate cannot grow the file back.
+                let rows = if *extent_from_request { chunks.as_slice() } else { file.chunks.as_slice() };
+                let extent = rows
                     .iter()
                     .map(|c| c.chunk_index * file.chunk_size + c.size_bytes)
                     .max();
@@ -2642,6 +2644,24 @@ pub fn cluster_understands_named_remove(sm: &StateMachineData) -> bool {
             sm.nodes.get(id).is_some_and(|n| {
                 n.role == dtfs_common::types::NodeRole::Manager
                     && dtfs_common::version::release_at_least(&n.version, NAMED_REMOVE_MIN_VERSION)
+            })
+        })
+}
+
+/// First release whose apply honours `UpdateChunkLocations.extent_from_request`.
+pub const REQUEST_EXTENT_MIN_VERSION: (u64, u64, u64) = (0, 1, 15);
+
+/// #121 — may a proposer set `extent_from_request`? Same membership rule as
+/// [`cluster_understands_named_remove`], at [`REQUEST_EXTENT_MIN_VERSION`]:
+/// an older applier would grow `logical_size` from all rows while new ones
+/// use the request's rows only, diverging the state.
+pub fn cluster_understands_request_extent(sm: &StateMachineData) -> bool {
+    let mut members = sm.last_membership.nodes().peekable();
+    members.peek().is_some()
+        && members.all(|(id, _)| {
+            sm.nodes.get(id).is_some_and(|n| {
+                n.role == dtfs_common::types::NodeRole::Manager
+                    && dtfs_common::version::release_at_least(&n.version, REQUEST_EXTENT_MIN_VERSION)
             })
         })
 }

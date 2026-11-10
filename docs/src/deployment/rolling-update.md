@@ -229,6 +229,12 @@ manager: never join one below v0.1.14 (for example from an inventory pinned to
 an old tag), since it replays the named entries after the leader's snapshot
 hash-blind.
 
+**Same rule at v0.1.15 for the commit extent.** From v0.1.15 a leased chunk
+commit sets `UpdateChunkLocations.extent_from_request` (grow the file size only
+to the committed rows, so a non-aligned truncate is not undone), under the
+same gate with v0.1.15 as the minimum. Once it was proposed, do not roll a
+manager back below v0.1.15 and never join one below it.
+
 Per node:
 
 1. If maintenance mode is warranted (data node, longer than 30 s), enable it.
