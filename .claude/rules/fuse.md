@@ -387,6 +387,8 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   (`global_write_wait`): batches end without `path_guard`, so this never
   deadlocks and a sole writer always progresses. Sync mode starts no batch
   and never waits on it. The ladder log carries `write_buffer_bytes`.
+  A budget below one file's dirty cap (0 included) only warns at startup
+  (`write_budget_too_small`, async_commit on), never refuses.
 
 ## Errors
 

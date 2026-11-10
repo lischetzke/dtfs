@@ -271,6 +271,7 @@ async fn main() -> Result<()> {
     // CF-5 — snapshot the memory config before fuse_config is moved.
     let memory_cfg = fuse_config.memory.clone();
     let write_cfg = fuse_config.write.clone();
+    let readahead_cache_mb = fuse_config.readahead.cache_mb;
     let client_location = fuse_config.location.clone();
     // Bug U — keep a handle to the client (cheap Arc clone) so we can
     // release this PID's leases on the way out, after DtfsFilesystem has
@@ -340,6 +341,15 @@ async fn main() -> Result<()> {
             write_cfg.async_commit_secs,
             fs.dirty_cap(),
         );
+        if filesystem::write_budget_too_small(fs.write_budget(), fs.dirty_cap()) {
+            tracing::warn!(
+                hard_cap_mb = memory_cfg.hard_cap_mb,
+                readahead_cache_mb,
+                write_budget_bytes = ?fs.write_budget(),
+                dirty_cap_bytes = fs.dirty_cap(),
+                "global write budget (memory.hard_cap_mb - readahead.cache_mb - hard_cap_mb / 4) is below one file's dirty cap: async writes wait on every background batch; raise memory.hard_cap_mb or lower readahead.cache_mb"
+            );
+        }
         let commit_fs = fs.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));

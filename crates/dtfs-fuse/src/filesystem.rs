@@ -4349,6 +4349,12 @@ fn dirty_cap_exceeded(dirty: usize, incoming: usize, cap: usize) -> bool {
     dirty.saturating_add(incoming) >= cap
 }
 
+/// Startup warn (async_commit): a global budget below one file's dirty cap
+/// (0 included) makes writes wait on any batch long before the per-file cap.
+pub(crate) fn write_budget_too_small(budget: Option<usize>, dirty_cap: usize) -> bool {
+    budget.is_some_and(|b| b < dirty_cap)
+}
+
 /// Global write-buffer budget (all files, buffered + in flight) from
 /// `[memory]`: `hard_cap_mb - readahead.cache_mb - hard_cap_mb / 4` (the
 /// quarter is the margin for put buffers, metadata and the process itself).
@@ -7295,6 +7301,17 @@ mod async_commit_fs_tests {
         assert!(global_write_wait(100, 29, 64, Some(128), 1));
         assert!(!global_write_wait(100, 29, 64, Some(128), 0), "nothing in flight: never waits");
         assert!(!global_write_wait(usize::MAX, 1, 64, None, 1), "no budget");
+    }
+
+    /// Review FUSE-5: a budget below one file's dirty cap (0 included) is
+    /// flagged for the startup warn; exactly the cap or no cap is not.
+    #[test]
+    fn write_budget_below_one_dirty_cap_is_flagged() {
+        let cap = 128 << 20;
+        assert!(write_budget_too_small(Some(0), cap), "zero budget");
+        assert!(write_budget_too_small(Some(cap - 1), cap), "boundary: one byte short");
+        assert!(!write_budget_too_small(Some(cap), cap));
+        assert!(!write_budget_too_small(None, cap), "no [memory] cap: no budget");
     }
 
     /// Review FUSE-2: a 64 MiB hole-fill step counts as one chunk against the
