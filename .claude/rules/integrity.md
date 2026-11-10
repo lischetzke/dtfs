@@ -78,6 +78,9 @@ text there.
    issues no delete and no Raft write.
 9. Rename is one Raft command; chunk_id bindings unchanged.
 10. Reads fall back replica by replica; fail only after all candidates.
+    On one node, GetChunk/ReplicateChunk try every local copy; there only a
+    confirmed digest mismatch quarantines (disk-keyed report, no node-wide
+    IntegrityFault), a read error skips the copy.
 
 ## Replica classes (Bug AV)
 

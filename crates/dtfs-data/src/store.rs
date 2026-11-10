@@ -663,9 +663,10 @@ impl ChunkStore {
     }
 
     /// #148 — the copy to stream to a replica target. With more than one
-    /// local copy, a copy that does not hash to its id is quarantined and
-    /// the next one tried; the last copy is returned unchecked (the target
-    /// verifies what it receives), so a single copy costs no extra read.
+    /// local copy, a copy that does not verify is skipped (quarantined only
+    /// on a confirmed digest mismatch, not on a read error) and the next one
+    /// tried; the last copy is returned unchecked (the target verifies what
+    /// it receives), so a single copy costs no extra read.
     pub async fn replication_source(&self, chunk_id: &ChunkId) -> Option<(PathBuf, u64)> {
         let mut copies = self.chunk_copies(chunk_id).await;
         while copies.len() > 1 {
@@ -673,8 +674,8 @@ impl ChunkStore {
             if matches!(hash_chunk_file_incrementally(dat, *size).await, Ok(d) if d == chunk_id.0) {
                 break;
             }
-            tracing::warn!(chunk_id = %chunk_id, disk = %mount.display(), "replication source copy does not hash to its id; trying next disk");
-            self.confirm_and_quarantine(mount, &chunk_id.as_hex()).await;
+            tracing::warn!(chunk_id = %chunk_id, disk = %mount.display(), "replication source copy does not verify; trying next disk");
+            self.confirm_and_quarantine(mount, &chunk_id.as_hex(), false).await;
             copies.remove(0);
         }
         copies.into_iter().next().map(|(_, dat, size)| (dat, size))
@@ -920,7 +921,7 @@ impl ChunkStore {
     async fn quarantine_confirmed(&self, disk_path: &Path, ids: &mut Vec<String>, done: &mut usize) {
         let mut i = *done;
         while i < ids.len() {
-            if self.confirm_and_quarantine(disk_path, &ids[i]).await {
+            if self.confirm_and_quarantine(disk_path, &ids[i], true).await {
                 i += 1;
             } else {
                 ids.remove(i);
@@ -930,9 +931,12 @@ impl ChunkStore {
     }
 
     /// Under the chunk lock, re-hash the `.dat` against the chunk id; if it is
-    /// still bad (mismatch or unreadable), quarantine by RENAME and queue the
-    /// corruption report. Returns false when the chunk is gone or healthy.
-    pub(crate) async fn confirm_and_quarantine(&self, disk_path: &Path, chunk_hex: &str) -> bool {
+    /// still bad, quarantine by RENAME and queue the corruption report.
+    /// Returns false when the chunk is gone or healthy. "Bad" is a digest
+    /// mismatch, plus an unreadable `.dat` when `unreadable_is_corrupt`
+    /// (scrub, rule 7); the read/replicate paths pass false so an I/O error
+    /// (EIO, EMFILE, ENOMEM, ...) never quarantines a copy.
+    pub(crate) async fn confirm_and_quarantine(&self, disk_path: &Path, chunk_hex: &str, unreadable_is_corrupt: bool) -> bool {
         let Ok(id) = ChunkId::from_hex(chunk_hex) else { return true };
         let _guard = self.chunk_locks[Self::chunk_lock_index(&id)].lock().await;
         let dat = chunk_data_path(disk_path, &id);
@@ -940,7 +944,10 @@ impl ChunkStore {
         match fs::metadata(&dat).await {
             Err(e) if stat_error_means_gone(e.kind()) => return false,
             Err(e) => {
-                tracing::warn!(chunk = %chunk_hex, error = %e, "scrub: stat failed on re-check; treating as corrupt");
+                tracing::warn!(chunk = %chunk_hex, error = %e, unreadable_is_corrupt, "stat failed on re-check");
+                if !unreadable_is_corrupt {
+                    return false;
+                }
             }
             Ok(md) => match hash_chunk_file_incrementally(&dat, md.len()).await {
                 Ok(d) if d == id.0 => {
@@ -948,6 +955,10 @@ impl ChunkStore {
                     return false;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+                Err(e) if !unreadable_is_corrupt => {
+                    tracing::warn!(chunk = %chunk_hex, disk = %disk_path.display(), error = %e, "read error on re-check; not quarantined");
+                    return false;
+                }
                 _ => {}
             },
         }
@@ -2565,7 +2576,7 @@ mod tests {
         let id = ChunkId::from_bytes(checksum::compute(data));
         store.put_chunk(&id, data, &vol, DiskTier::Hot).await.unwrap();
         // Healthy chunk: the re-check under the lock declines to quarantine.
-        assert!(!store.confirm_and_quarantine(&disk, &id.as_hex()).await);
+        assert!(!store.confirm_and_quarantine(&disk, &id.as_hex(), true).await);
         assert!(chunk_data_path(&disk, &id).exists());
         assert!(store.drain_pending_corruption().is_empty());
         // Corrupt it: the scrub pass itself quarantines (rename) and enqueues.
@@ -3739,6 +3750,43 @@ mod tests {
         assert!(!cold_dat.exists(), "bad copy moved away");
         assert!(cold.path().join(".dtfs/quarantine").join(format!("{}.dat.bad", chunk_id.as_hex())).exists());
         assert_eq!(store.drain_pending_corruption(), vec![(chunk_id.as_hex(), Some(0))]);
+    }
+
+    /// 1c — an unreadable first copy (EISDIR) is skipped but NOT quarantined:
+    /// only a confirmed digest mismatch quarantines on the replicate path.
+    #[tokio::test]
+    async fn replication_source_unreadable_first_copy_is_skipped_not_quarantined() {
+        let (store, cold, warm) = make_two_disk_store().await;
+        let data = b"issue-148-unreadable";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        let volume_id = VolumeId::new("default".to_string());
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Cold).await.unwrap();
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Warm).await.unwrap();
+        let cold_dat = chunk_data_path(cold.path(), &chunk_id);
+        std::fs::remove_file(&cold_dat).unwrap();
+        std::fs::create_dir(&cold_dat).unwrap();
+        assert_eq!(store.replication_source(&chunk_id).await.unwrap().0, chunk_data_path(warm.path(), &chunk_id));
+        assert!(cold_dat.exists(), "unreadable copy must not be quarantined");
+        assert!(store.drain_pending_corruption().is_empty());
+    }
+
+    /// Scrub keeps its rule 7: an unreadable `.dat` IS quarantined there.
+    #[tokio::test]
+    async fn scrub_confirm_quarantines_unreadable_dat() {
+        let (store, _tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+        let data = b"scrub-unreadable";
+        let id = ChunkId::from_bytes(checksum::compute(data));
+        store.put_chunk(&id, data, &VolumeId::new("default".to_string()), DiskTier::Hot).await.unwrap();
+        let dat = chunk_data_path(&disk, &id);
+        std::fs::remove_file(&dat).unwrap();
+        std::fs::create_dir(&dat).unwrap();
+        let mut ids = vec![id.as_hex()];
+        let mut done = 0;
+        store.quarantine_confirmed(&disk, &mut ids, &mut done).await;
+        assert_eq!(done, 1);
+        assert!(!dat.exists());
+        assert_eq!(store.drain_pending_corruption(), vec![(id.as_hex(), store.disk_id_for_path(&disk))]);
     }
 
     /// #148 negative — a single copy is returned unchecked (no extra read,

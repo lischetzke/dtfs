@@ -41,7 +41,7 @@ After quarantine:
 
 ### quarantine_on_fault
 
-With `quarantine_on_fault = true` (default) a single integrity fault (quick or deep mismatch, a verify-on-read mismatch, or a chunk missing from disk that the state machine lists) puts the whole node into the `Quarantined` health state until an operator clears it with `POST /api/v1/nodes/{id}/unquarantine` (or `auto_unquarantine_secs` elapses, if set; default 0 means manual only). With `false`, faults are recorded and repaired but the node keeps serving. Disabling `verify_on_read` needs an explicit acknowledgement and is the only mode in which a read can return corrupt bytes.
+With `quarantine_on_fault = true` (default) a single integrity fault (quick or deep mismatch, or a chunk missing from disk that the state machine lists) puts the whole node into the `Quarantined` health state until an operator clears it with `POST /api/v1/nodes/{id}/unquarantine` (or `auto_unquarantine_secs` elapses, if set; default 0 means manual only). With `false`, faults are recorded and repaired but the node keeps serving. A verify-on-read mismatch does not quarantine the node: the bad copy is quarantined and reported for its disk only, so a good copy on another disk of the same node keeps its replica row. Only a `.dat` with no readable `.meta` on any disk that fails to verify on every local copy records a node-wide fault. Disabling `verify_on_read` needs an explicit acknowledgement and is the only mode in which a read can return corrupt bytes.
 
 ## Configuration
 
