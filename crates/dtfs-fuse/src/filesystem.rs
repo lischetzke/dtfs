@@ -811,6 +811,8 @@ pub struct DtfsFilesystem {
     bg_doom: DashMap<String, Vec<(u64, u64)>>,
     /// Woken whenever a background upload ends (`wait_bg_uploads`).
     bg_done: tokio::sync::Notify,
+    /// Paths with a `spawn_stale_commit` task running.
+    stale_commits: DashMap<String, ()>,
     /// Global write-buffer budget (`write_budget_bytes`, `bg_backpressure`).
     write_budget: Option<usize>,
     /// Test hook run by write_inner right after it read the handle: models a
@@ -909,6 +911,7 @@ impl DtfsFilesystem {
             bg_uploads: DashMap::new(),
             bg_doom: DashMap::new(),
             bg_done: tokio::sync::Notify::new(),
+            stale_commits: DashMap::new(),
             write_budget,
             #[cfg(test)]
             write_race_hook: std::sync::Mutex::new(None),
@@ -2575,9 +2578,15 @@ impl DtfsFilesystem {
     /// byte is `async_commit_secs` old at `now`. Skips detached paths and
     /// paths without a writable handle. A failure keeps the bytes (restored,
     /// age kept, retried next tick) and arms each writer's sticky error.
-    pub async fn commit_aged(&self, now: Instant) {
+    /// Skipped busy paths do not count toward the limit; one busy for 2 x
+    /// `async_commit_secs` gets a task that waits for it (`spawn_stale_commit`).
+    pub async fn commit_aged(self: &Arc<Self>, now: Instant) {
         let max_age = Duration::from_secs(self.config.write.async_commit_secs);
-        for path in self.write_buffer.aged_paths(now, max_age, AGED_COMMITS_PER_TICK) {
+        let mut committed = 0;
+        for (oldest, path) in self.write_buffer.aged_paths(now, max_age) {
+            if committed == AGED_COMMITS_PER_TICK {
+                break;
+            }
             if is_detached_path(&path) {
                 continue;
             }
@@ -2585,13 +2594,23 @@ impl DtfsFilesystem {
             // Skip a busy path (guard held, e.g. a write under backpressure)
             // or one with batches in flight (commit_all would wait for them):
             // waiting stalled every other path's age commit. Next tick retries.
+            let stale = now.saturating_duration_since(oldest) >= 2 * max_age;
             let lock = self.path_locks.entry(path.clone()).or_default().clone();
-            let Ok(g) = lock.try_lock_owned() else { continue };
+            let Ok(g) = lock.try_lock_owned() else {
+                if stale {
+                    self.spawn_stale_commit(path);
+                }
+                continue;
+            };
             let guard = Some(g);
             if self.bg_batches(&path) > 0 {
                 self.drop_path_guard(&path, guard);
+                if stale {
+                    self.spawn_stale_commit(path);
+                }
                 continue;
             }
+            committed += 1;
             // Re-check under the lock: release or rename may have won.
             let still_open = self.open_files.get(&fh).map(|f| f.path == path) == Some(true);
             if still_open {
@@ -2600,6 +2619,26 @@ impl DtfsFilesystem {
             }
             self.drop_path_guard(&path, guard);
         }
+    }
+
+    /// Age commit of a path the tick keeps finding busy (one knfsd stream
+    /// always has a batch in flight): a task waits for its `path_guard`
+    /// (no new batch starts meanwhile) and runs `commit_all`, which waits
+    /// for the batches in flight. At most one per path (`stale_commits`).
+    fn spawn_stale_commit(self: &Arc<Self>, path: String) {
+        if self.stale_commits.insert(path.clone(), ()).is_some() {
+            return;
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            let guard = this.path_guard(&path).await;
+            if let Some(fh) = this.writable_fh(&path) {
+                let result = this.commit_all(fh).await;
+                this.record_aged_commit(&path, result);
+            }
+            this.stale_commits.remove(&path);
+            this.drop_path_guard(&path, guard);
+        });
     }
 
     /// Timer commit result for `path`: a failure is logged and arms every
@@ -6483,7 +6522,7 @@ mod async_commit_fs_tests {
     /// timer for every other path: the tick skips them, the next retries.
     #[tokio::test]
     async fn timer_skips_a_busy_path_and_commits_the_others() {
-        let fs = fs(true);
+        let fs = Arc::new(fs(true));
         let armed = |fs: &DtfsFilesystem, fh: u64| fs.open_files.get(&fh).unwrap().write_error.is_some();
         let (a, b, c) = (open(&fs, "/a", OpenFlags::ReadWrite), open(&fs, "/b", OpenFlags::ReadWrite), open(&fs, "/c", OpenFlags::ReadWrite));
         for p in ["/a", "/c", "/b"] {
@@ -6501,9 +6540,63 @@ mod async_commit_fs_tests {
         assert!(armed(&fs, a) && armed(&fs, c), "next tick retries them");
     }
 
+    /// Review FUSE-1 (B): skipped busy paths do not use up the per-tick
+    /// limit, so an idle aged path behind 8 busy older ones is committed.
+    #[tokio::test]
+    async fn timer_reaches_an_idle_path_behind_eight_busy_ones() {
+        let fs = Arc::new(fs(true));
+        let mut busy = Vec::new();
+        for i in 0..AGED_COMMITS_PER_TICK {
+            let p = format!("/busy{i}");
+            open(&fs, &p, OpenFlags::ReadWrite);
+            fs.write_buffer.write(&p, 0, &[7; 100]);
+            busy.push((p.clone(), fs.path_guard(&p).await));
+        }
+        let idle = open(&fs, "/idle", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/idle", 0, &[7; 100]);
+        fs.commit_aged(Instant::now() + AGE).await;
+        assert!(fs.open_files.get(&idle).unwrap().write_error.is_some(), "idle aged path never reached");
+        for (p, g) in busy {
+            fs.drop_path_guard(&p, g);
+        }
+    }
+
+    /// Review FUSE-1 (A): a path that is always busy (a batch in flight, one
+    /// knfsd stream) is committed once its oldest byte is 2 x
+    /// `async_commit_secs` old: the tick spawns one task that waits for the
+    /// path instead of skipping it forever. Below that bound it is skipped.
+    #[tokio::test]
+    async fn timer_commits_a_continuously_busy_path_past_twice_the_age() {
+        let fs = Arc::new(fs(true));
+        let fh = open(&fs, "/s", OpenFlags::ReadWrite);
+        let armed = || fs.open_files.get(&fh).unwrap().write_error.is_some();
+        fs.write_buffer.write("/s", 0, &[7; 100]);
+        fs.bg_uploads.insert("/s".to_string(), vec![(99, vec![5], 1)]);
+        fs.commit_aged(Instant::now() + 2 * AGE - Duration::from_secs(1)).await;
+        fs.bg_uploads.remove("/s");
+        fs.bg_done.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!armed(), "boundary: below 2 x age a busy path is only skipped");
+        fs.bg_uploads.insert("/s".to_string(), vec![(99, vec![5], 1)]);
+        let tick = tokio::time::timeout(Duration::from_secs(2), fs.commit_aged(Instant::now() + 2 * AGE)).await;
+        tick.expect("the tick itself must not wait for the busy path");
+        assert!(!armed(), "the batch is still in flight");
+        fs.commit_aged(Instant::now() + 2 * AGE).await;
+        assert_eq!(fs.stale_commits.len(), 1, "one task per path, not one per tick");
+        fs.bg_uploads.remove("/s");
+        fs.bg_done.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !armed() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stale busy path never committed");
+    }
+
     #[tokio::test]
     async fn timer_commits_after_the_age_and_failure_is_reported_once() {
-        let fs = fs(true);
+        let fs = Arc::new(fs(true));
         let fh = open(&fs, "/f", OpenFlags::ReadWrite);
         fs.write_buffer.write("/f", 0, &[7; 100]);
         fs.commit_aged(Instant::now() + AGE - Duration::from_secs(1)).await;
@@ -6520,7 +6613,7 @@ mod async_commit_fs_tests {
 
     #[tokio::test]
     async fn timer_never_commits_detached_or_reader_only_paths() {
-        let fs = fs(true);
+        let fs = Arc::new(fs(true));
         let det = detached_handle_path("/d", "/d", 1).unwrap();
         let dfh = open(&fs, &det, OpenFlags::ReadWrite);
         fs.write_buffer.write(&det, 0, b"old-writer");

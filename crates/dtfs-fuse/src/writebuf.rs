@@ -594,9 +594,10 @@ impl WriteBuffer {
         segments
     }
 
-    /// `write.async_commit` age trigger: up to `limit` paths whose oldest
-    /// buffered byte is at least `max_age` old at `now`, oldest first.
-    pub fn aged_paths(&self, now: Instant, max_age: Duration, limit: usize) -> Vec<String> {
+    /// `write.async_commit` age trigger: every path whose oldest buffered
+    /// byte is at least `max_age` old at `now`, with that byte's time,
+    /// oldest first (the caller applies its per-tick limit to commits).
+    pub fn aged_paths(&self, now: Instant, max_age: Duration) -> Vec<(Instant, String)> {
         let mut aged: Vec<(Instant, String)> = self
             .buffers
             .iter()
@@ -606,7 +607,7 @@ impl WriteBuffer {
             })
             .collect();
         aged.sort();
-        aged.into_iter().take(limit).map(|(_, p)| p).collect()
+        aged
     }
 
     /// Dirty-cap (`dirty_cap()`) release valve: if `dirty + incoming >= cap`, drain
@@ -1962,13 +1963,11 @@ mod async_commit_tests {
         let t0 = Instant::now();
         wb.write("/a", 0, b"abc");
         wb.write("/b", 0, &[1u8; CS]);
-        assert!(wb.aged_paths(t0 + AGE - Duration::from_secs(1), AGE, 8).is_empty());
-        let mut aged = wb.aged_paths(Instant::now() + AGE, AGE, 8);
-        aged.sort();
-        assert_eq!(aged, vec!["/a".to_string(), "/b".to_string()]);
-        assert_eq!(wb.aged_paths(Instant::now() + AGE, AGE, 1).len(), 1, "limit per tick");
+        assert!(wb.aged_paths(t0 + AGE - Duration::from_secs(1), AGE).is_empty());
+        let paths = |v: Vec<(Instant, String)>| v.into_iter().map(|(_, p)| p).collect::<Vec<_>>();
+        assert_eq!(paths(wb.aged_paths(Instant::now() + AGE, AGE)), vec!["/a".to_string(), "/b".to_string()], "oldest first");
         let _ = wb.flush_all("/b");
-        assert_eq!(wb.aged_paths(Instant::now() + AGE, AGE, 8), vec!["/a".to_string()]);
+        assert_eq!(paths(wb.aged_paths(Instant::now() + AGE, AGE)), vec!["/a".to_string()]);
     }
 
     #[test]
@@ -1980,10 +1979,10 @@ mod async_commit_tests {
         segs[0].since = Some(t0);
         while Instant::now() <= t0 {}
         wb.restore_segments("/a", &segs);
-        assert_eq!(wb.aged_paths(t0 + AGE, AGE, 8), vec!["/a".to_string()]);
+        assert_eq!(wb.aged_paths(t0 + AGE, AGE), vec![(t0, "/a".to_string())]);
         // A fresh write after t0 is not aged at t0 + AGE.
         wb.write("/c", 0, b"x");
-        assert!(!wb.aged_paths(t0 + AGE, AGE, 8).contains(&"/c".to_string()));
+        assert!(!wb.aged_paths(t0 + AGE, AGE).iter().any(|(_, p)| p == "/c"));
     }
 
     #[test]
@@ -2550,7 +2549,7 @@ mod async_commit_tests {
             if !self.async_on {
                 return;
             }
-            for p in self.wb.aged_paths(Instant::now() + self.clock, AGE, 8) {
+            for (_, p) in self.wb.aged_paths(Instant::now() + self.clock, AGE) {
                 assert_eq!(p, P);
                 let segs = self.wb.flush_all(P);
                 if !self.commit(segs) {

@@ -224,12 +224,16 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   nothing (Ok, no buffer drop, no ghost unlink) and flush only reports the
   pending error. flush sets `close_seen` under the guard, so of two racing
   closes the later commits; the last writer's flush/release commits. A 1 s timer (`commit_aged`, at most
-  `AGED_COMMITS_PER_TICK` paths) commits a path whose oldest buffered byte
+  `AGED_COMMITS_PER_TICK` commits; it walks every aged path oldest first
+  and skipped ones do not count) commits a path whose oldest buffered byte
   (`ChunkBuf.since`, kept across `restore_segments`) is `async_commit_secs`
   old, through `commit_all` with a writable non-detached fh. It never waits:
   a path whose `path_guard` is held (`try_lock_owned`) or that has batches
   in flight is skipped until a later tick (one busy file stalled every
-  other file's age commit). The cap drain
+  other file's age commit). A path still busy at 2 x `async_commit_secs`
+  (one knfsd stream always has a batch in flight) gets one task
+  (`spawn_stale_commit`, `stale_commits`) that awaits its `path_guard` and
+  runs `commit_all`. The cap drain
   then also drains partial chunks outside `keep`. Neither the timer nor
   FUSE_FLUSH (sent without the inode lock: another fd's close commit ran
   beside a write, which then zero-seeded over its in-flight bytes, R3-1)
