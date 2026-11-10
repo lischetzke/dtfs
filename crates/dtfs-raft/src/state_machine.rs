@@ -565,6 +565,10 @@ pub struct StateMachineStore {
     /// Directory used to persist snapshots (so membership + FSM survive restart).
     /// `None` means in-memory only (tests).
     snapshot_dir: Option<PathBuf>,
+    /// RAFT-3 — serializes snapshot writers (openraft spawns the build, so
+    /// it runs alongside an install): held across persist + publish, since
+    /// both share `snapshot.bin.tmp`.
+    persist_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The current snapshot. With a snapshot dir the payload is not kept
@@ -599,6 +603,7 @@ impl StateMachineStore {
             data: Arc::new(RwLock::new(StateMachineData::default())),
             snapshot: Arc::new(RwLock::new(None)),
             snapshot_dir: None,
+            persist_lock: Default::default(),
         }
     }
 
@@ -613,6 +618,7 @@ impl StateMachineStore {
             data: Arc::new(RwLock::new(StateMachineData::default())),
             snapshot: Arc::new(RwLock::new(None)),
             snapshot_dir: Some(dir.clone()),
+            persist_lock: Default::default(),
         };
 
         // Bug BP-2 — clean any stray `.tmp` from an interrupted write so a
@@ -771,6 +777,7 @@ pub struct DtfsSnapshotBuilder {
     data: StateMachineData,
     snapshot_dir: Option<PathBuf>,
     last_snapshot: Arc<RwLock<Option<StoredSnapshot>>>,
+    persist_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
@@ -799,6 +806,17 @@ impl RaftSnapshotBuilder<TypeConfig> for DtfsSnapshotBuilder {
                 Some(StoredSnapshot { meta: meta.clone(), data: Some(data_bytes.clone()) });
             return Ok(openraft::storage::Snapshot { meta, snapshot: Cursor::new(data_bytes) });
         };
+
+        let _persist = self.persist_lock.lock().await;
+        // RAFT-3 — an install (or newer build) published while this one ran:
+        // keep it, and hand openraft that newer snapshot.
+        let published = self.last_snapshot.read().await.as_ref().map(|s| s.meta.last_log_id.clone());
+        if let Some(published) = published.filter(|p| *p >= meta.last_log_id) {
+            info!(snapshot_id = %meta.snapshot_id, ?published,
+                "built snapshot is not newer than the published one; not persisting it");
+            let (meta, data_bytes) = read_persisted_snapshot(&dir.join("snapshot.bin"))?;
+            return Ok(openraft::storage::Snapshot { meta, snapshot: Cursor::new(data_bytes) });
+        }
 
         // Persist to disk FIRST so a manager restart can reload membership +
         // state (F-024). A failure must surface: openraft purges the log
@@ -883,6 +901,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             data,
             snapshot_dir: self.snapshot_dir.clone(),
             last_snapshot: self.snapshot.clone(),
+            persist_lock: self.persist_lock.clone(),
         }
     }
 
@@ -899,6 +918,8 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
         let snap_data: StateMachineSnapshot = serde_json::from_slice(&raw)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
+        // RAFT-3 — one snapshot writer at a time, through the publish below.
+        let _persist = self.persist_lock.lock().await;
         // Persist before touching any in-memory state (F-024): on failure the
         // old state stays intact and openraft sees the error.
         if let Some(dir) = &self.snapshot_dir {

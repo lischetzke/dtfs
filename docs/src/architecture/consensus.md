@@ -227,7 +227,10 @@ A snapshot is the serialized `StateMachineData` (JSON) wrapped in a `Cursor<Vec<
   2. Stream the JSON straight into the bincode envelope on disk (temp file,
     |  fsync, rename; same bytes as before). A failure here is
     |  returned to Raft as a fatal storage error: the snapshot is NOT
-    |  published and the log is NOT purged
+    |  published and the log is NOT purged. Build and install share one
+    |  writer lock (held through step 3); a build whose last_log_id is not
+    |  past the published snapshot's (an install won the race) is dropped
+    |  and the newer snapshot.bin is returned instead
     v
   3. Publish the meta only (StoredSnapshot); get_current_snapshot reads the
     |  payload back from snapshot.bin on demand (in-memory stores keep it)

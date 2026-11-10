@@ -301,6 +301,75 @@ mod snapshot_persistence_tests {
         assert!(!path.exists(), "corrupt snapshot.bin removed");
     }
 
+    /// A built snapshot at `index` (from a throwaway store): (meta, payload).
+    async fn snapshot_at(index: u64) -> (crate::SnapshotMeta, Vec<u8>) {
+        use openraft::vote::RaftLeaderId;
+        let src_dir = tmp_dir();
+        let mut src = StateMachineStore::open_at(src_dir.path()).expect("open src");
+        {
+            let mut data = src.data.write().await;
+            populate_sample_state(&mut data);
+            let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+            data.last_applied_log = Some(openraft::LogId::new(leader, index));
+        }
+        let snap = src.get_snapshot_builder().await.build_snapshot().await.expect("build");
+        (snap.meta, snap.snapshot.into_inner())
+    }
+
+    fn on_disk_index(dir: &Path) -> u64 {
+        read_persisted_snapshot(&dir.join("snapshot.bin")).expect("valid snapshot.bin").0
+            .last_log_id.expect("log id").index
+    }
+
+    /// RAFT-3 — a build frozen at 100 that finishes after an install of 200
+    /// neither overwrites snapshot.bin nor republishes the older meta.
+    #[tokio::test]
+    async fn stale_build_does_not_overwrite_newer_installed_snapshot() {
+        let dir = tmp_dir();
+        let mut sm = StateMachineStore::open_at(dir.path()).expect("open");
+        populate_sample_state(&mut *sm.data.write().await);
+        let mut builder = sm.get_snapshot_builder().await;
+        let (meta200, bytes200) = snapshot_at(200).await;
+        sm.install_snapshot(&meta200, Cursor::new(bytes200)).await.expect("install");
+
+        let built = builder.build_snapshot().await.expect("build");
+        assert_eq!(built.meta.last_log_id.as_ref().map(|l| l.index), Some(200));
+        assert_eq!(on_disk_index(dir.path()), 200);
+        let cur = sm.get_current_snapshot().await.unwrap().expect("current");
+        assert_eq!(cur.meta, meta200);
+
+        // Boundary: a build one index past the published one is persisted.
+        {
+            let mut data = sm.data.write().await;
+            let lid = data.last_applied_log.clone().unwrap();
+            data.last_applied_log = Some(openraft::LogId::new(lid.leader_id, 201));
+        }
+        let built = sm.get_snapshot_builder().await.build_snapshot().await.expect("build 201");
+        assert_eq!(built.meta.last_log_id.as_ref().map(|l| l.index), Some(201));
+        assert_eq!(on_disk_index(dir.path()), 201);
+    }
+
+    /// RAFT-3 — a build and an install persisting at the same time (separate
+    /// threads, one shared snapshot.bin.tmp) both succeed and leave a valid
+    /// snapshot.bin holding the newest state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_build_and_install_leave_newest_valid_snapshot() {
+        let (meta200, bytes200) = snapshot_at(200).await;
+        for _ in 0..30 {
+            let dir = tmp_dir();
+            let mut sm = StateMachineStore::open_at(dir.path()).expect("open");
+            populate_sample_state(&mut *sm.data.write().await);
+            let mut builder = sm.get_snapshot_builder().await;
+            let build = tokio::spawn(async move { builder.build_snapshot().await.map(|s| s.meta) });
+            sm.install_snapshot(&meta200, Cursor::new(bytes200.clone())).await.expect("install");
+            build.await.unwrap().expect("build");
+            assert_eq!(on_disk_index(dir.path()), 200);
+            let cur = sm.get_current_snapshot().await.unwrap().expect("current");
+            assert_eq!(cur.meta, meta200);
+            assert!(!dir.path().join("snapshot.bin.tmp").exists(), "no stray tmp");
+        }
+    }
+
     #[tokio::test]
     async fn install_snapshot_persist_failure_is_err_and_state_unchanged() {
         let src_dir = tmp_dir();
