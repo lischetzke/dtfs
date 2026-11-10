@@ -99,6 +99,9 @@ text there.
   (`precache.rs`, driven by `TieringEngine::run_precache`) are cache replicas
   made via `schedule_replications`; pre-cache never removes them, only the
   idle demote does (skipping protected ones; `flush_cache` overrides).
+- `register_replica_location` adds the new row to every file that references
+  the hash, so a copy can count as mandatory in another volume that shares the
+  chunk (pre-existing for all cache promotions).
 - Write ack floor counts only distinct (node_id, disk_id) replicas on RF>0
   tiers; allocation fills it across maintained tiers; the only lowering is
   the capacity clamp (healthy maintained nodes, same eligibility rule as the

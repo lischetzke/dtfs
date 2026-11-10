@@ -70,6 +70,15 @@ impl TaskScheduler {
         active_pairs_of(&self.load_migration_state().await)
     }
 
+    pub(crate) async fn replication_task_view(&self) -> ReplicationTaskView {
+        let state = self.load_migration_state().await;
+        ReplicationTaskView {
+            live_pairs: active_pairs_of(&state),
+            blocking_pairs: blocking_pairs_of(&state),
+            live_count: live_task_count(&state),
+        }
+    }
+
     /// Check the cluster state for under-replicated chunks and schedule
     /// re-replication tasks for them.
     pub(super) async fn check_under_replicated(&self, migration_state: &mut MigrationState) {
@@ -710,6 +719,29 @@ pub(crate) fn active_pairs_of(
         .filter(|t| !matches!(t.status, MigrationStatus::Done | MigrationStatus::Failed))
         .map(|t| (t.chunk_id.clone(), t.target_node))
         .collect()
+}
+
+/// `(chunk_id, target_node)` of every task whose pair `plan_replication_batch` would
+/// answer `AlreadyScheduled` (status != Done): in-flight plus Failed within retention.
+pub(crate) fn blocking_pairs_of(
+    state: &MigrationState,
+) -> std::collections::HashSet<(String, u64)> {
+    state
+        .tasks
+        .values()
+        .filter(|t| task_blocks_requeue(t.status))
+        .map(|t| (t.chunk_id.clone(), t.target_node))
+        .collect()
+}
+
+/// One migration-state load, three views (pre-cache tick).
+pub(crate) struct ReplicationTaskView {
+    /// In-flight pairs (not Done/Failed).
+    pub live_pairs: std::collections::HashSet<(String, u64)>,
+    /// Pairs the dedup refuses (not Done): a superset of `live_pairs`.
+    pub blocking_pairs: std::collections::HashSet<(String, u64)>,
+    /// All in-flight tasks of every class.
+    pub live_count: usize,
 }
 
 /// Iterate `m` starting at index `seed % len` and wrapping, visiting every

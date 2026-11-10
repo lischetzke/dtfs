@@ -994,6 +994,8 @@ fn seeded_precache_status() -> crate::precache::PrecacheStatus {
     crate::precache::PrecacheStatus {
         is_leader: true,
         inflight_tasks: 7,
+        live_tasks: 31,
+        yielded_live_tasks: true,
         dcs: vec![crate::precache::DcStatus {
             dc: "toro".into(),
             tier: dtfs_common::types::DiskTier::Warm,
@@ -1032,6 +1034,7 @@ async fn metrics_include_precache_gauges_for_seeded_status() {
     for want in [
         "dtfs_precache_is_leader 1",
         "dtfs_precache_inflight_tasks 7",
+        "dtfs_precache_live_tasks 31",
         "dtfs_precache_desired_bytes{dc=\"toro\"} 42",
         "dtfs_precache_cached_bytes{dc=\"toro\"} 10",
         "dtfs_precache_series_active{dc=\"toro\"} 0",

@@ -816,11 +816,15 @@ pub(super) fn precache_metrics(p: &crate::precache::PrecacheStatus) -> String {
         "# HELP dtfs_precache_is_leader 1 when this manager runs the pre-cache loop as leader.\n\
          # TYPE dtfs_precache_is_leader gauge\n\
          dtfs_precache_is_leader {}\n\
-         # HELP dtfs_precache_inflight_tasks Live pre-cache copy tasks.\n\
+         # HELP dtfs_precache_inflight_tasks Live copy tasks scheduled by pre-cache itself (not repair or migration).\n\
          # TYPE dtfs_precache_inflight_tasks gauge\n\
-         dtfs_precache_inflight_tasks {}\n",
+         dtfs_precache_inflight_tasks {}\n\
+         # HELP dtfs_precache_live_tasks Live scheduler tasks of every class; pre-cache yields at its ceiling.\n\
+         # TYPE dtfs_precache_live_tasks gauge\n\
+         dtfs_precache_live_tasks {}\n",
         u8::from(p.is_leader),
-        p.inflight_tasks
+        p.inflight_tasks,
+        p.live_tasks
     );
     type Val = fn(&crate::precache::DcStatus, &crate::precache::PrecacheStatus) -> u64;
     let rows: [(&str, &str, Val); 4] = [

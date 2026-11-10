@@ -3255,6 +3255,45 @@ mod batch_schedule_tests {
         assert!(!pairs.contains(&("c-c".to_string(), 2)));
     }
 
+    /// Failed tasks are not in flight but still make the dedup answer AlreadyScheduled,
+    /// so a caller skipping pairs it cannot schedule must skip them too.
+    #[test]
+    fn blocking_pairs_include_failed_and_match_the_dedup() {
+        let mut st = MigrationState::default();
+        for (id, s) in [
+            ("a", MigrationStatus::Pending),
+            ("c", MigrationStatus::Done),
+            ("d", MigrationStatus::Failed),
+        ] {
+            let t = task(id, s);
+            st.tasks.insert(t.task_id.clone(), t);
+        }
+        let pairs = blocking_pairs_of(&st);
+        assert!(pairs.contains(&("c-a".to_string(), 2)));
+        assert!(pairs.contains(&("c-d".to_string(), 2)), "Failed pair blocks a re-queue");
+        assert!(!pairs.contains(&("c-c".to_string(), 2)), "Done pair does not");
+        let reqs = [("c-d", 1u64, 2u64, DiskTier::Warm), ("c-c", 1, 2, DiskTier::Warm)];
+        let out = plan_replication_batch(&mut st, &reqs, usize::MAX, MAX_LIVE_TASKS, 9);
+        assert_eq!(out, vec![ScheduleOutcome::AlreadyScheduled, ScheduleOutcome::New]);
+    }
+
+    /// Pre-cache passes the room left under its yield ceiling as `max_new`, so the
+    /// surplus comes back Deferred (debug) instead of Refused (one warn per chunk).
+    #[test]
+    fn precache_surplus_is_deferred_not_refused() {
+        let live = crate::precache::PRECACHE_YIELD_LIVE_TASKS - 1;
+        let mut st = MigrationState::default();
+        for i in 0..live {
+            let t = task(&format!("p{i}"), MigrationStatus::Pending);
+            st.tasks.insert(t.task_id.clone(), t);
+        }
+        let reqs = [("n1", 1u64, 2u64, DiskTier::Warm), ("n2", 1, 2, DiskTier::Warm), ("n3", 1, 2, DiskTier::Warm)];
+        let max_new = crate::precache::precache_max_new(live_task_count(&st));
+        let out = plan_replication_batch(&mut st, &reqs, max_new, crate::precache::PRECACHE_YIELD_LIVE_TASKS, 3);
+        assert_eq!(out, vec![ScheduleOutcome::New, ScheduleOutcome::Deferred, ScheduleOutcome::Deferred]);
+        assert_eq!(crate::precache::precache_max_new(crate::precache::PRECACHE_YIELD_LIVE_TASKS + 5), 0);
+    }
+
     /// Only NEW tasks are reported as scheduled (dedup/refusal are not).
     #[test]
     fn new_task_count_counts_only_new() {

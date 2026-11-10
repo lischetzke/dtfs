@@ -177,33 +177,38 @@ impl TieringEngine {
             let sm = self.state_data.read().await;
             plan_precache(&sm, &snap, now_ms, self.scheduler.placement_cfg())
         };
-        let active = self.scheduler.active_replication_pairs().await;
+        let view = self.scheduler.replication_task_view().await;
         plan.status.is_leader = true;
         plan.status.rate_mbps = rate_mbps;
-        plan.status.inflight_tasks = active.len() as u64;
+        plan.status.live_tasks = view.live_count as u64;
 
-        let mut protected = std::mem::take(&mut plan.protected);
+        let protected = std::mem::take(&mut plan.protected);
+        let prev_scheduled = self.precache.lock().scheduled.clone();
         let mut scheduled: std::collections::HashSet<(String, u64)> = Default::default();
         let mut batch = LastBatch::default();
         // Copies with a live task stay protected even when nothing new is scheduled.
         for c in &plan.copies {
             let pair = (c.chunk_id.clone(), c.target_node);
-            if active.contains(&pair) {
+            if view.live_pairs.contains(&pair) {
                 batch.already += 1;
-                protected.insert(pair.clone());
                 scheduled.insert(pair);
             }
         }
-        if should_yield(active.len()) {
-            plan.status.yielded_to_repair = true;
+        // The yield decision looks at every live task (repair, migration, ...); the
+        // in-flight metric at pre-cache's own pairs only.
+        if should_yield(view.live_count) {
+            plan.status.yielded_live_tasks = true;
         } else {
+            let min_cap = plan.copies.iter().map(|c| c.bytes).max().unwrap_or(0);
             let tokens = {
                 let mut st = self.precache.lock();
-                st.tokens = refill_tokens(st.tokens, st.tokens_at_ms, now_ms, rate_mbps, PRECACHE_BURST_SECS);
+                st.tokens = refill_tokens(st.tokens, st.tokens_at_ms, now_ms, rate_mbps, PRECACHE_BURST_SECS, min_cap);
                 st.tokens_at_ms = now_ms;
                 st.tokens
             };
-            let picked = pick_within_budget(&plan.copies, &active, tokens);
+            // Skip every pair the scheduler dedup would answer AlreadyScheduled (Failed within
+            // retention too), or they are charged to the budget and block the copies behind them.
+            let picked = pick_within_budget(&plan.copies, &view.blocking_pairs, tokens);
             let reqs: Vec<(&str, u64, u64, DiskTier)> = picked
                 .iter()
                 .map(|c| (c.chunk_id.as_str(), c.source_node, c.target_node, c.tier))
@@ -212,7 +217,7 @@ impl TieringEngine {
                 Vec::new()
             } else {
                 self.scheduler
-                    .schedule_replications(&reqs, reqs.len(), PRECACHE_YIELD_LIVE_TASKS)
+                    .schedule_replications(&reqs, precache_max_new(view.live_count), PRECACHE_YIELD_LIVE_TASKS)
                     .await
             };
             for (c, o) in picked.iter().zip(&outcomes) {
@@ -221,12 +226,10 @@ impl TieringEngine {
                     ScheduleOutcome::New => {
                         batch.new += 1;
                         batch.bytes += c.bytes;
-                        protected.insert(pair.clone());
                         scheduled.insert(pair);
                     }
                     ScheduleOutcome::AlreadyScheduled => {
                         batch.already += 1;
-                        protected.insert(pair.clone());
                         scheduled.insert(pair);
                     }
                     ScheduleOutcome::Deferred | ScheduleOutcome::Refused => batch.deferred += 1,
@@ -246,6 +249,7 @@ impl TieringEngine {
                 );
             }
         }
+        plan.status.inflight_tasks = own_inflight(&prev_scheduled, &view.live_pairs) + batch.new;
         plan.status.last_batch = batch.clone();
 
         let mut st = self.precache.lock();
@@ -656,7 +660,10 @@ impl TieringEngine {
 
         // Pre-cached copies the planner wants kept are not idle-demoted. Only this
         // path is filtered; operator flush_cache still removes protected copies.
-        let kept = crate::precache::retain_unprotected(&mut plan.demotions, &self.precache.lock().protected);
+        let kept = {
+            let st = self.precache.lock();
+            crate::precache::retain_unprotected(&mut plan.demotions, &st.protected, &st.scheduled)
+        };
         if kept > 0 {
             debug!(kept, "idle demote skipped pre-cache protected copies");
         }
@@ -3975,7 +3982,7 @@ mod precache_wiring_tests {
         );
         let reads = HashMap::from([("toro".to_string(), 1u32)]);
         engine.report_access("c1", "/tv/a.mkv", 1, 1, reads, DiskTier::Cold, 1).await;
-        engine.precache.lock().protected.insert(("c1".into(), 2));
+        engine.precache.lock().protected.insert(("c1".into(), 2, 0));
         engine.precache_tick().await;
         let st = engine.precache.lock();
         assert!(st.protected.is_empty());

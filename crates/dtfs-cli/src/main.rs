@@ -2005,11 +2005,12 @@ fn render_precache_group(out: &mut String, title: &str, groups: &Value) {
 /// Pure table rendering of `GET /api/v1/tiering/precache`; tolerates missing fields.
 fn render_precache_status(v: &Value) -> String {
     let mut out = format!(
-        "Leader: {}  rate: {} Mbps  yielded to repair: {}  in-flight tasks: {}
+        "Leader: {}  rate: {} Mbps  yielded (live tasks): {}  live tasks: {}  pre-cache tasks: {}
 ",
         v["is_leader"].as_bool().unwrap_or(false),
         v["rate_mbps"].as_u64().unwrap_or(0),
-        v["yielded_to_repair"].as_bool().unwrap_or(false),
+        v["yielded_live_tasks"].as_bool().unwrap_or(false),
+        v["live_tasks"].as_u64().unwrap_or(0),
         v["inflight_tasks"].as_u64().unwrap_or(0),
     );
     let b = &v["last_batch"];
@@ -2045,6 +2046,22 @@ fn render_precache_status(v: &Value) -> String {
     }
     render_precache_group(&mut out, "Series", &v["series"]);
     render_precache_group(&mut out, "Cursors", &v["cursors"]);
+    if v["pins"].as_array().is_some_and(|p| !p.is_empty()) {
+        out.push_str(&format!("
+{:<32} {:<10} {:>12} {:>12}  {}
+", "PIN", "DC", "BYTES", "CACHED", "FLAGS"));
+    }
+    for p in v["pins"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "{:<32} {:<10} {:>12} {:>12}  {}
+",
+            p["prefix"].as_str().unwrap_or("?"),
+            p["dc"].as_str().unwrap_or("?"),
+            format_bytes(p["bytes"].as_u64().unwrap_or(0)),
+            format_bytes(p["cached_bytes"].as_u64().unwrap_or(0)),
+            if p["truncated"].as_bool() == Some(true) { "truncated" } else { "" },
+        ));
+    }
     for s in v["skipped_volumes"].as_array().into_iter().flatten() {
         out.push_str(&format!(
             "
@@ -3038,9 +3055,26 @@ mod precache_status_tests {
     }
 
     #[test]
+    fn render_precache_status_shows_pins_and_task_counts() {
+        let v = serde_json::json!({
+            "is_leader": true, "live_tasks": 31, "yielded_live_tasks": true, "inflight_tasks": 2,
+            "pins": [
+                {"volume": "media", "prefix": "/tv/Bluey", "dc": "toro", "bytes": 2048, "cached_bytes": 1024, "truncated": true},
+                {"volume": "media", "prefix": "/tv/Other", "dc": "nrb", "bytes": 0, "cached_bytes": 0, "truncated": false},
+            ],
+        });
+        let out = render_precache_status(&v);
+        for want in ["yielded (live tasks): true", "live tasks: 31", "pre-cache tasks: 2", "PIN", "/tv/Bluey", "toro", "truncated", "/tv/Other"] {
+            assert!(out.contains(want), "missing {want} in {out}");
+        }
+        assert_eq!(out.matches("truncated").count(), 1, "only the truncated pin is flagged: {out}");
+    }
+
+    #[test]
     fn render_precache_status_empty_object_does_not_panic() {
         let out = render_precache_status(&serde_json::json!({}));
         assert!(out.contains("Leader: false"), "{out}");
         assert!(!out.contains("Series"), "{out}");
+        assert!(!out.contains("PIN"), "no pin header without pins: {out}");
     }
 }

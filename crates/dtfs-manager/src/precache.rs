@@ -3,7 +3,7 @@
 
 use crate::scheduler::{path_matches_prefix, survivor_replica_tier};
 use crate::tiering::{
-    anchor_violated_after_copy, node_selection_view, select_promotion_target, tier_rank,
+    node_selection_view, select_promotion_target, tier_rank,
 };
 use dtfs_common::config::PlacementConfig;
 use dtfs_common::types::{DiskStatus, DiskTier, PrecacheMode, VolumeConfig};
@@ -236,6 +236,11 @@ pub(crate) const MAX_DIR_ENTRIES: usize = 10_000;
 pub(crate) const PRECACHE_RESERVE_PCT: u64 = 10;
 /// Eligible files listed per pin per pass.
 pub(crate) const MAX_PIN_FILES: usize = 5000;
+/// Chunk entries one pass may walk under the SM read lock, cursors and pins together.
+/// 200k entries (about 12 TiB of 64 MiB chunks on one replica) is tens of ms of pure
+/// CPU (no I/O), so Raft apply never waits long on the lock; a typical library of a
+/// few TiB fits, a pin larger than that is flagged `truncated` instead of walked.
+pub(crate) const MAX_PLAN_CHUNK_VISITS: usize = 200_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SeriesEntry {
@@ -334,7 +339,11 @@ pub(crate) struct PrecacheStatus {
     pub is_leader: bool,
     pub updated_at_ms: u64,
     pub rate_mbps: u64,
-    pub yielded_to_repair: bool,
+    /// Pre-cache scheduled nothing this pass because `live_tasks` (any class) reached the ceiling.
+    pub yielded_live_tasks: bool,
+    /// All live scheduler tasks of every class (what the yield decision looks at).
+    pub live_tasks: u64,
+    /// Pre-cache's own live copy tasks.
     pub inflight_tasks: u64,
     pub last_batch: LastBatch,
     pub dcs: Vec<DcStatus>,
@@ -348,8 +357,8 @@ pub(crate) struct PrecacheStatus {
 pub(crate) struct PrecachePlan {
     /// Sorted by rank.
     pub copies: Vec<PrecacheCopy>,
-    /// (chunk_id, node_id) cache copies the idle demote must leave alone.
-    pub protected: HashSet<(String, u64)>,
+    /// (chunk_id, node_id, disk_id) existing cache copies the idle demote must leave alone.
+    pub protected: HashSet<(String, u64, u32)>,
     pub series_lru: BTreeMap<(String, String, String), SeriesEntry>,
     pub status: PrecacheStatus,
 }
@@ -494,9 +503,14 @@ struct Ctx<'a> {
     seen: HashSet<(String, String)>,
     stopped: HashSet<String>,
     copies: Vec<PrecacheCopy>,
-    protected: HashSet<(String, u64)>,
+    protected: HashSet<(String, u64, u32)>,
     dcs: BTreeMap<String, DcStatus>,
+    /// Chunk entries walked so far this pass (see `MAX_PLAN_CHUNK_VISITS`).
+    visits: usize,
 }
+
+/// `pos` of pinned files (ranked after every cursor copy).
+const PIN_POS: u32 = u32::MAX;
 
 impl Ctx<'_> {
     fn room(&mut self, nid: u64, tier: DiskTier) -> u64 {
@@ -568,6 +582,18 @@ fn ensure_dc(ctx: &mut Ctx, elig: &[DiskTier], dc: &str) {
     );
 }
 
+/// True when the volume has no anchor or a live replica sits in the anchor DC (and
+/// on its `required_tier` when set): the `anchor_satisfied_by` rule of api/cluster.rs.
+fn anchor_satisfied(live: &[(u64, u32, String, DiskTier)], vol: &VolumeConfig) -> bool {
+    let Some(a) = vol.effective_anchor() else { return true };
+    if a.datacenter.is_empty() {
+        return true;
+    }
+    live.iter().any(|(_, _, dc, tier)| {
+        dc.eq_ignore_ascii_case(&a.datacenter) && a.required_tier.map_or(true, |t| *tier == t)
+    })
+}
+
 fn plan_file(
     ctx: &mut Ctx,
     vol: &VolumeConfig,
@@ -579,6 +605,7 @@ fn plan_file(
     pos: u32,
     rank: u32,
 ) -> FileStatus {
+    ctx.visits = ctx.visits.saturating_add(fm.chunks.len());
     let mut by_idx: BTreeMap<u64, Vec<&dtfs_raft::ChunkLocationEntry>> = BTreeMap::new();
     for e in &fm.chunks {
         by_idx.entry(e.chunk_index).or_default().push(e);
@@ -595,43 +622,47 @@ fn plan_file(
         cached_bytes: 0,
         head: matches!(take, Take::Head(_)),
     };
-    let anchor_dc = vol.effective_anchor().map(|a| a.datacenter).unwrap_or_default();
     for idx in wanted {
+        // A pin past its DC's room gains nothing from the rest of the file (cursors keep
+        // walking: their cached chunks still need protection).
+        if pos == PIN_POS && ctx.stopped.contains(dc) {
+            break;
+        }
         let entries = &by_idx[&idx];
         let (chunk_id, bytes) = (entries[0].chunk_hash.clone(), entries[0].size_bytes);
         fs.desired_bytes += bytes;
         ctx.dcs.get_mut(dc).expect("dc status").desired_bytes += bytes;
 
         let sm = ctx.sm;
-        let mut live: Vec<(u64, String, DiskTier)> = Vec::new();
+        let mut live: Vec<(u64, u32, String, DiskTier)> = Vec::new();
         let mut holders: HashSet<u64> = HashSet::new();
         for e in entries.iter() {
             let Ok(nid) = e.node_id.parse::<u64>() else { continue };
             holders.insert(nid);
             let info = sm.nodes.get(&nid);
             if let (Some(info), Some(tier)) = (info, survivor_replica_tier(info, e.disk_id)) {
-                live.push((nid, info.location.datacenter.clone(), tier));
+                live.push((nid, e.disk_id, info.location.datacenter.clone(), tier));
             }
         }
         if live.is_empty() {
             continue;
         }
-        // Anchor-pending (no live replica in the anchor DC): the anchor-lag copy comes first.
-        let dcs: Vec<String> = live.iter().map(|(_, d, _)| d.clone()).collect();
-        if anchor_violated_after_copy(&dcs, &anchor_dc, None, None, true) {
+        // Anchor-pending (no live replica satisfying the anchor's DC and required tier,
+        // same test as `anchor_satisfied_by`): the anchor-lag copy comes first.
+        if !anchor_satisfied(&live, vol) {
             continue;
         }
         // Already cached in this DC: protect it, plan nothing.
-        let cached: Vec<u64> = live
+        let cached: Vec<(u64, u32)> = live
             .iter()
-            .filter(|(_, d, t)| d.eq_ignore_ascii_case(dc) && elig.contains(t))
-            .map(|(n, _, _)| *n)
+            .filter(|(_, _, d, t)| d.eq_ignore_ascii_case(dc) && elig.contains(t))
+            .map(|(n, disk, _, _)| (*n, *disk))
             .collect();
         if !cached.is_empty() {
             fs.cached_bytes += bytes;
             ctx.dcs.get_mut(dc).expect("dc status").cached_bytes += bytes;
-            for n in cached {
-                ctx.protected.insert((chunk_id.clone(), n));
+            for (n, disk) in cached {
+                ctx.protected.insert((chunk_id.clone(), n, disk));
             }
             continue;
         }
@@ -686,8 +717,8 @@ fn plan_file(
         left.1 -= bytes;
         let source = live
             .iter()
-            .min_by_key(|(n, _, t)| (tier_rank(*t), *n))
-            .map(|(n, _, _)| *n)
+            .min_by_key(|(n, _, _, t)| (tier_rank(*t), *n))
+            .map(|(n, _, _, _)| *n)
             .expect("live non-empty");
         ctx.copies.push(PrecacheCopy {
             chunk_id,
@@ -711,6 +742,16 @@ pub(crate) fn plan_precache(
     snap: &PrecacheSnapshot,
     now_ms: u64,
     placement: &PlacementConfig,
+) -> PrecachePlan {
+    plan_precache_budget(sm, snap, now_ms, placement, MAX_PLAN_CHUNK_VISITS)
+}
+
+fn plan_precache_budget(
+    sm: &StateMachineData,
+    snap: &PrecacheSnapshot,
+    now_ms: u64,
+    placement: &PlacementConfig,
+    budget: usize,
 ) -> PrecachePlan {
     let mut plan = PrecachePlan::default();
     plan.status.updated_at_ms = now_ms;
@@ -847,6 +888,7 @@ pub(crate) fn plan_precache(
         copies: Vec::new(),
         protected: HashSet::new(),
         dcs: BTreeMap::new(),
+        visits: 0,
     };
     let mut rank_run: (String, String, u32) = (String::new(), String::new(), 0);
     for g in groups {
@@ -901,6 +943,21 @@ pub(crate) fn plan_precache(
         for pin in &vol.precache.pins {
             let dc = pin.datacenter.to_lowercase();
             ensure_dc(&mut ctx, &elig, &dc);
+            let mut ps = PinStatus {
+                volume: (*vid).to_string(),
+                prefix: pin.prefix.clone(),
+                dc: dc.clone(),
+                bytes: 0,
+                cached_bytes: 0,
+                truncated: false,
+            };
+            // Budget gone: do not even list the pin.
+            if ctx.visits >= budget {
+                ps.truncated = true;
+                plan.status.pins.push(ps);
+                pin_ord += 1;
+                continue;
+            }
             let base = pin.prefix.trim_end_matches('/');
             let mut listed: Vec<(&String, &FileMetadata)> = sm
                 .files
@@ -913,18 +970,15 @@ pub(crate) fn plan_precache(
                 })
                 .take(MAX_PIN_FILES + 1)
                 .collect();
-            let truncated = listed.len() > MAX_PIN_FILES;
+            ps.truncated = listed.len() > MAX_PIN_FILES;
             listed.truncate(MAX_PIN_FILES);
-            let mut ps = PinStatus {
-                volume: (*vid).to_string(),
-                prefix: pin.prefix.clone(),
-                dc: dc.clone(),
-                bytes: 0,
-                cached_bytes: 0,
-                truncated,
-            };
             for (path, fm) in listed {
-                let fs = plan_file(&mut ctx, vol, &elig, &dc, path, fm, Take::Whole, u32::MAX, pin_ord);
+                // Budget spent or the DC is out of room: the rest of the pin is not walked.
+                if ctx.visits >= budget || ctx.stopped.contains(&dc) {
+                    ps.truncated = true;
+                    break;
+                }
+                let fs = plan_file(&mut ctx, vol, &elig, &dc, path, fm, Take::Whole, PIN_POS, pin_ord);
                 ps.bytes += fs.desired_bytes;
                 ps.cached_bytes += fs.cached_bytes;
             }
@@ -973,9 +1027,10 @@ pub(crate) struct PrecacheState {
     /// (file, dc) reads fed by `TieringEngine::report_access`; kept across leader changes.
     pub activity: HashMap<(String, String), FileActivity>,
     pub series_lru: BTreeMap<(String, String, String), SeriesEntry>,
-    /// (chunk_id, node_id) cache copies the idle demote must leave alone.
-    pub protected: HashSet<(String, u64)>,
-    /// (chunk_id, target node) pairs this loop has a live task for.
+    /// (chunk_id, node_id, disk_id) existing cache copies the idle demote must leave alone.
+    pub protected: HashSet<(String, u64, u32)>,
+    /// (chunk_id, target node) pairs this loop has a live task for (also protected from
+    /// idle demote: the target holds no copy yet, so any disk of it is covered).
     pub scheduled: HashSet<(String, u64)>,
     /// Token balance in bytes and when it was last refilled.
     pub tokens: u64,
@@ -997,12 +1052,20 @@ impl PrecacheState {
 }
 
 /// Add `rate_mbps` worth of bytes for the elapsed time, capped at `burst_secs` of rate.
-pub(crate) fn refill_tokens(tokens: u64, last_ms: u64, now_ms: u64, rate_mbps: u64, burst_secs: u64) -> u64 {
+pub(crate) fn refill_tokens(
+    tokens: u64,
+    last_ms: u64,
+    now_ms: u64,
+    rate_mbps: u64,
+    burst_secs: u64,
+    min_cap: u64,
+) -> u64 {
     if now_ms < last_ms {
         return tokens;
     }
     let per_sec = u128::from(rate_mbps) * 125_000;
-    let cap = per_sec * u128::from(burst_secs);
+    // A chunk larger than the burst must still fit, or it would never schedule.
+    let cap = (per_sec * u128::from(burst_secs)).max(u128::from(min_cap));
     let add = per_sec * u128::from(now_ms - last_ms) / 1000;
     (u128::from(tokens) + add).min(cap) as u64
 }
@@ -1033,14 +1096,29 @@ pub(crate) fn should_yield(live_tasks: usize) -> bool {
     live_tasks >= PRECACHE_YIELD_LIVE_TASKS
 }
 
+/// New tasks pre-cache may add this pass: the room left under its yield ceiling.
+pub(crate) fn precache_max_new(live_tasks: usize) -> usize {
+    PRECACHE_YIELD_LIVE_TASKS.saturating_sub(live_tasks)
+}
+
 /// Drop idle demotions of protected copies; returns how many were dropped.
 pub(crate) fn retain_unprotected(
     demotions: &mut Vec<crate::tiering::TickDemotion>,
-    protected: &HashSet<(String, u64)>,
+    protected: &HashSet<(String, u64, u32)>,
+    scheduled: &HashSet<(String, u64)>,
 ) -> usize {
     let before = demotions.len();
-    demotions.retain(|d| !protected.contains(&(d.chunk_id.clone(), d.node_id)));
+    demotions.retain(|d| {
+        !protected.contains(&(d.chunk_id.clone(), d.node_id, d.disk_id))
+            && !scheduled.contains(&(d.chunk_id.clone(), d.node_id))
+    });
     before - demotions.len()
+}
+
+/// Pre-cache's own tasks still live: pairs it scheduled earlier that the scheduler still
+/// holds in flight (the yield decision looks at ALL live tasks, the metric only at these).
+pub(crate) fn own_inflight(prev_scheduled: &HashSet<(String, u64)>, live: &HashSet<(String, u64)>) -> u64 {
+    prev_scheduled.iter().filter(|p| live.contains(*p)).count() as u64
 }
 
 /// Volumes newly `policy_invalid` since the last pass; `logged` becomes the current set.
@@ -1407,8 +1485,8 @@ mod planner_tests {
         assert_eq!(roots, ["/tv/B", "/tv/C"]);
         let sroots: BTreeSet<_> = p.status.series.iter().filter_map(|s| s.root.clone()).collect();
         assert_eq!(sroots, ["/tv/B".to_string(), "/tv/C".to_string()].into_iter().collect());
-        assert!(p.protected.contains(&("/tv/B/E02.mkv#0".to_string(), 2)));
-        assert!(!p.protected.contains(&("/tv/A/E02.mkv#0".to_string(), 2)), "evicted series loses protection");
+        assert!(p.protected.contains(&("/tv/B/E02.mkv#0".to_string(), 2, 0)));
+        assert!(!p.protected.contains(&("/tv/A/E02.mkv#0".to_string(), 2, 0)), "evicted series loses protection");
     }
 
     #[test]
@@ -1419,7 +1497,7 @@ mod planner_tests {
         w.file("/tv/S/E02.mkv", 75, &[1, 2]);
         let p = w.plan(&[("/tv/S/E01.mkv", "toro")]);
         assert!(p.copies.is_empty());
-        assert!(p.protected.contains(&("/tv/S/E02.mkv#0".to_string(), 2)));
+        assert!(p.protected.contains(&("/tv/S/E02.mkv#0".to_string(), 2, 0)));
         assert_eq!(p.status.series[0].cached_bytes, 300 * MIB);
     }
 
@@ -1480,7 +1558,7 @@ mod planner_tests {
         pin(&mut w, "/tv/Bluey", "toro");
         let p = w.plan(&[]);
         assert!(p.copies.is_empty());
-        assert!(p.protected.contains(&("/tv/Bluey/a.mkv#0".to_string(), 2)));
+        assert!(p.protected.contains(&("/tv/Bluey/a.mkv#0".to_string(), 2, 0)));
         assert_eq!(p.status.pins[0].cached_bytes, 300 * MIB);
     }
 
@@ -1522,7 +1600,7 @@ mod planner_tests {
         pin(&mut w, "/tv/Bluey", "toro");
         let p = w.plan(&[]);
         assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), ["/tv/Bluey/ok.mkv"]);
-        assert!(!p.protected.iter().any(|(c, _)| c.contains("pending")));
+        assert!(!p.protected.iter().any(|(c, _, _)| c.contains("pending")));
     }
 
     #[test]
@@ -1540,6 +1618,83 @@ mod planner_tests {
         let p = w.plan(&[]);
         assert!(p.status.pins[0].truncated);
         assert_eq!(per_path(&p).len(), MAX_PIN_FILES);
+    }
+
+    /// Anchor requires cold in leli; a warm leli copy does not satisfy it (`anchor_satisfied_by`).
+    #[test]
+    fn anchor_required_tier_is_honoured() {
+        let mut w = world();
+        w.sm.nodes.insert(4, node(4, "leli", DiskTier::Warm, 1 << 40, 0));
+        w.file("/tv/Bluey/warm_only.mkv", 4, &[4]);
+        w.file("/tv/Bluey/warm_and_toro.mkv", 4, &[4, 2]);
+        w.file("/tv/Bluey/cold.mkv", 4, &[1]);
+        pin(&mut w, "/tv/Bluey", "toro");
+        let p = w.plan(&[]);
+        assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), ["/tv/Bluey/cold.mkv"]);
+        assert!(!p.protected.iter().any(|(c, _, _)| c.contains("warm")), "anchor-pending: no protection");
+    }
+
+    /// 20 pinned 4-chunk files after a cursor of ~300 chunk entries, budget 350.
+    #[test]
+    fn pin_planning_stops_at_the_chunk_visit_budget() {
+        let mut w = show5();
+        for i in 0..20 {
+            w.file(&format!("/tv/Bluey/{i:02}.mkv"), 4, &[1]);
+        }
+        pin(&mut w, "/tv/Bluey", "toro");
+        let mut snap = PrecacheSnapshot::default();
+        let a = FileActivity {
+            last_read_ms: NOW,
+            chunk_ids: ["/tv/Show/Season 01/E01.mkv#20".to_string()].into_iter().collect(),
+            overflow: false,
+        };
+        snap.activity.insert(("/tv/Show/Season 01/E01.mkv".into(), "toro".into()), a);
+        let p = plan_precache_budget(&w.sm, &snap, NOW, &cfg(), 350);
+        let ps = &p.status.pins[0];
+        assert!(ps.truncated, "budget exhausted mid-pin");
+        let pinned = p.copies.iter().filter(|c| c.file_path.starts_with("/tv/Bluey")).count();
+        assert!(pinned > 0 && pinned < 80, "pin partly planned, got {pinned} chunks");
+        assert!(p.copies.iter().any(|c| c.file_path.starts_with("/tv/Show")), "cursor copies still planned");
+        assert!(p.copies[0].file_path.starts_with("/tv/Show"), "cursor copies rank first");
+        // Plenty of budget: nothing truncated.
+        let p = plan_precache_budget(&w.sm, &snap, NOW, &cfg(), 1_000_000);
+        assert!(!p.status.pins[0].truncated);
+        assert_eq!(p.copies.iter().filter(|c| c.file_path.starts_with("/tv/Bluey")).count(), 80);
+    }
+
+    /// Cursors alone use the budget up: later pins are listed as truncated and plan nothing.
+    #[test]
+    fn exhausted_budget_skips_later_pins() {
+        let mut w = world();
+        w.vol().precache.mode = PrecacheMode::Off;
+        w.file("/a/x.mkv", 4, &[1]);
+        w.file("/b/y.mkv", 4, &[1]);
+        pin(&mut w, "/a", "toro");
+        pin(&mut w, "/b", "toro");
+        let p = plan_precache_budget(&w.sm, &PrecacheSnapshot::default(), NOW, &cfg(), 4);
+        assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), ["/a/x.mkv"]);
+        assert_eq!(p.status.pins.len(), 2);
+        assert!(!p.status.pins[0].truncated && p.status.pins[1].truncated);
+    }
+
+    /// A pin stops once the DC's room is gone instead of walking every remaining file.
+    #[test]
+    fn pin_stops_when_dc_room_is_exhausted() {
+        let mut w = world();
+        w.vol().precache.mode = PrecacheMode::Off;
+        // room: 1000 - 100 reserve = 900 MiB -> 225 chunks; 20 files x 75 chunks = 1500.
+        w.set_disk(2, 1000 * MIB, 0);
+        for i in 0..20 {
+            w.file(&format!("/big/{i:02}.mkv"), 75, &[1]);
+        }
+        pin(&mut w, "/big", "toro");
+        let budget = 20 * 75;
+        let p = plan_precache_budget(&w.sm, &PrecacheSnapshot::default(), NOW, &cfg(), budget);
+        assert!(p.status.dcs[0].capacity_limited);
+        assert_eq!(p.copies.len(), 225);
+        // Files after the one that hit the limit are not walked: desired stops near the room.
+        assert!(p.status.pins[0].bytes <= 225 * CHUNK + 75 * CHUNK, "walked {} bytes", p.status.pins[0].bytes);
+        assert!(p.status.pins[0].truncated);
     }
 
     #[test]
@@ -1878,12 +2033,16 @@ mod engine_tests {
     }
 
     fn demotion(chunk: &str, node: u64) -> TickDemotion {
+        demotion_on(chunk, node, 0)
+    }
+
+    fn demotion_on(chunk: &str, node: u64, disk: u32) -> TickDemotion {
         TickDemotion {
             chunk_id: chunk.into(),
             chunk_index: 0,
             file_path: "/f".into(),
             node_id: node,
-            disk_id: 0,
+            disk_id: disk,
             tier: DiskTier::Warm,
             reason: "idle",
             cooldown_until_ms_at_snapshot: 0,
@@ -1893,9 +2052,47 @@ mod engine_tests {
 
     #[test]
     fn refill_tokens_rate_cap_and_clock_skew() {
-        assert_eq!(refill_tokens(0, 0, 30_000, 10, 120), 37_500_000);
-        assert_eq!(refill_tokens(0, 0, 10_000_000_000, 10, 120), 150_000_000);
-        assert_eq!(refill_tokens(5, 10_000, 9_000, 10, 120), 5, "now < last leaves tokens unchanged");
+        assert_eq!(refill_tokens(0, 0, 30_000, 10, 120, 0), 37_500_000);
+        assert_eq!(refill_tokens(0, 0, 10_000_000_000, 10, 120, 0), 150_000_000);
+        assert_eq!(refill_tokens(5, 10_000, 9_000, 10, 120, 0), 5, "now < last leaves tokens unchanged");
+    }
+
+    /// 4 Mbps x 120 s = 60 MB < one 64 MiB chunk: the bucket must still be able to hold it.
+    #[test]
+    fn bucket_cap_never_below_one_chunk() {
+        let chunk = 64 * 1024 * 1024;
+        let full = refill_tokens(0, 0, 10_000_000_000, 4, 120, chunk);
+        assert_eq!(full, chunk);
+        let copies = vec![copy("big", 2, chunk)];
+        assert_eq!(pick_within_budget(&copies, &HashSet::new(), full).len(), 1);
+        // A bigger rate cap still wins over the chunk floor.
+        assert_eq!(refill_tokens(0, 0, 10_000_000_000, 10, 120, chunk), 150_000_000);
+    }
+
+    #[test]
+    fn own_inflight_counts_only_precache_pairs() {
+        let live = HashSet::from([("a".to_string(), 2u64), ("repair".to_string(), 3)]);
+        let mine = HashSet::from([("a".to_string(), 2u64), ("done".to_string(), 2)]);
+        assert_eq!(own_inflight(&mine, &live), 1);
+        assert_eq!(own_inflight(&HashSet::new(), &live), 0);
+    }
+
+    /// Failed pairs are in the skip set: not charged to the budget, later copies still picked.
+    #[test]
+    fn pick_skips_blocking_pairs_without_charge() {
+        let mb = 1_000_000;
+        let copies = vec![copy("failed", 2, 50 * mb), copy("ok", 2, 10 * mb)];
+        let blocking = HashSet::from([("failed".to_string(), 2u64)]);
+        let ids: Vec<_> = pick_within_budget(&copies, &blocking, 20 * mb).iter().map(|c| c.chunk_id.clone()).collect();
+        assert_eq!(ids, vec!["ok"]);
+    }
+
+    #[test]
+    fn precache_max_new_is_room_under_the_ceiling() {
+        assert_eq!(precache_max_new(0), PRECACHE_YIELD_LIVE_TASKS);
+        assert_eq!(precache_max_new(PRECACHE_YIELD_LIVE_TASKS - 1), 1);
+        assert_eq!(precache_max_new(PRECACHE_YIELD_LIVE_TASKS), 0);
+        assert_eq!(precache_max_new(PRECACHE_YIELD_LIVE_TASKS + 9), 0);
     }
 
     #[test]
@@ -1921,11 +2118,30 @@ mod engine_tests {
     #[test]
     fn retain_unprotected_removes_exactly_protected_pairs() {
         let mut d = vec![demotion("a", 2), demotion("a", 3), demotion("b", 2)];
-        let protected = HashSet::from([("a".to_string(), 2u64)]);
-        assert_eq!(retain_unprotected(&mut d, &protected), 1);
+        let protected = HashSet::from([("a".to_string(), 2u64, 0u32)]);
+        let none = HashSet::new();
+        assert_eq!(retain_unprotected(&mut d, &protected, &none), 1);
         assert_eq!(d.len(), 2);
         assert!(d.iter().all(|x| (x.chunk_id.as_str(), x.node_id) != ("a", 2)));
-        assert_eq!(retain_unprotected(&mut d, &HashSet::new()), 0);
+        assert_eq!(retain_unprotected(&mut d, &HashSet::new(), &none), 0);
+    }
+
+    /// Protecting one cache disk's copy leaves a second copy on another disk of the node demotable.
+    #[test]
+    fn retain_unprotected_is_keyed_by_disk() {
+        let mut d = vec![demotion_on("a", 2, 0), demotion_on("a", 2, 1)];
+        let protected = HashSet::from([("a".to_string(), 2u64, 0u32)]);
+        assert_eq!(retain_unprotected(&mut d, &protected, &HashSet::new()), 1);
+        assert_eq!((d[0].node_id, d[0].disk_id), (2, 1));
+    }
+
+    /// A pair with a live copy task protects every disk of the target (it holds no copy yet).
+    #[test]
+    fn retain_unprotected_keeps_scheduled_target_on_any_disk() {
+        let mut d = vec![demotion_on("a", 2, 0), demotion_on("a", 2, 7), demotion_on("b", 2, 0)];
+        let scheduled = HashSet::from([("a".to_string(), 2u64)]);
+        assert_eq!(retain_unprotected(&mut d, &HashSet::new(), &scheduled), 2);
+        assert_eq!(d.len(), 1);
     }
 
     #[test]
@@ -1933,7 +2149,7 @@ mod engine_tests {
         let mut st = PrecacheState::default();
         let reads = HashMap::from([("toro".to_string(), 1u32)]);
         note_read(&mut st.activity, "/tv/a.mkv", "c1", &reads, 5);
-        st.protected.insert(("c1".into(), 2));
+        st.protected.insert(("c1".into(), 2, 0));
         st.scheduled.insert(("c1".into(), 2));
         st.series_lru.insert(
             ("v".into(), "toro".into(), "/tv".into()),
