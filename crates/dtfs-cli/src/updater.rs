@@ -336,6 +336,14 @@ fn run_update(
         eprintln!("verified {bin} (sha256 {}…)", &got[..12]);
     }
 
+    if confirm_before_probe(minisign_key.is_some(), yes)
+        && !confirm(
+            "No minisign key: the downloaded binaries are only TLS-authenticated and will be              run with --version to probe them. Continue? [y/N] ",
+        )?
+    {
+        bail!("aborted before running unverified binaries; nothing installed");
+    }
+
     // Skip binaries already at the staged version (#153).
     let mut todo: Vec<(&str, &PathBuf)> = Vec::new();
     for (bin, src) in bins.iter().zip(&staged) {
@@ -434,6 +442,12 @@ enum Plan {
 
 /// Decide from the `--version` outputs of the staged and the installed
 /// binary. Same version token: nothing to do unless `force`.
+/// Without a signature key the staged binaries are unauthenticated beyond TLS:
+/// ask before the `--version` probe executes them (#153/#154).
+fn confirm_before_probe(has_key: bool, yes: bool) -> bool {
+    !has_key && !yes
+}
+
 fn plan_install(staged: &str, installed: &str, tag: Option<&str>, force: bool) -> Result<Plan> {
     let s = version_token(staged)
         .with_context(|| format!("cannot read the version of the staged binary ({staged:?})"))?;
@@ -772,6 +786,14 @@ fn confirm(prompt: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_prompt_only_without_key_and_without_yes() {
+        assert!(confirm_before_probe(false, false));
+        assert!(!confirm_before_probe(false, true));
+        assert!(!confirm_before_probe(true, false));
+        assert!(!confirm_before_probe(true, true));
+    }
 
     #[test]
     fn target_binaries_map() {
