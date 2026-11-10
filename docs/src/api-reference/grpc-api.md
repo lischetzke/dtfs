@@ -9,8 +9,6 @@ All inter-component traffic uses gRPC with Protocol Buffers. Definitions: `proto
 | `dtfs.manager.ManagerService` | `manager.proto` | manager | `[grpc].listen_addr` (9401) | in use |
 | `dtfs.manager.RaftTransport` | not a proto service | manager | same port as ManagerService | in use, see [Raft transport](#raft-transport) |
 | `dtfs.data.DataService` | `data.proto` | data node | `[grpc].listen_addr` (9500) | in use |
-| `dtfs.cluster.ClusterJoin` | `cluster.proto` | none | n/a | defined and compiled, **no server implements it**. Nodes join via `ManagerService.RegisterNode` ([Cluster Join](../security/cluster-join.md)). |
-| `dtfs.admin.AdminService` | `admin.proto` | none | n/a | defined and compiled, **no server implements it**. Admin operations use the [REST API](./rest-api.md). |
 
 `common.proto` holds shared messages (`Location`, `DiskInfo`, `NodeInfo`). With `[tls]` enabled all connections use mutual TLS ([TLS](../security/tls.md)). Message size caps come from `[grpc].max_message_size_mb` (servers) and `[client].max_message_size_mb` (FUSE).
 
@@ -141,13 +139,7 @@ Notes:
 - A checksum mismatch on read returns `DATA_LOSS`; the FUSE client fails over to another replica.
 - `ReplicateChunk` pushes the chunk to `target_address`, which receives it as a `PutChunk`; the call timeout scales with the chunk size.
 
-## ClusterJoin (`cluster.proto`)
-
-Defined, not served. `JoinRequest` (`secret_hmac`, `nonce`, `node_info`), `JoinResponse` (`accepted`, `challenge`, `cluster_ca_cert`, `managers`, `rejection_reason`), `JoinCompletionRequest` (`node_id`, `challenge_response`), `JoinCompletionResponse` (`success`, `config_version`, `config_json`). Nodes join via `ManagerService.RegisterNode` ([Cluster Join](../security/cluster-join.md)).
-
-## AdminService (`admin.proto`)
-
-Defined, not served: `TriggerScrub`, `GetScrubResults`, `SetMaintenanceMode`, `GetAuditLog`. Use [`POST /api/v1/scrub`](./rest-api.md#scrub), the maintenance endpoint and `GET /api/v1/audit`.
+Nodes join via `ManagerService.RegisterNode` ([Cluster Join](../security/cluster-join.md)). Admin operations (scrub, maintenance, audit log) use the [REST API](./rest-api.md); there is no admin gRPC service.
 
 ## Common types (`common.proto`)
 

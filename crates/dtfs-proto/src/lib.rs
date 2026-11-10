@@ -8,10 +8,4 @@ pub mod dtfs {
     pub mod manager {
         tonic::include_proto!("dtfs.manager");
     }
-    pub mod cluster {
-        tonic::include_proto!("dtfs.cluster");
-    }
-    pub mod admin {
-        tonic::include_proto!("dtfs.admin");
-    }
 }

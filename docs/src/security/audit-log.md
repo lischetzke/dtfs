@@ -113,14 +113,6 @@ Query parameters:
 > entries, newest-first, regardless of `replicate_via_raft` (CF-4a — the
 > default local ring and the replicated log now agree).
 
-### Via gRPC
-
-The `AdminService.GetAuditLog` RPC provides programmatic access:
-
-```
-GetAuditLog(since_timestamp, limit, action_filter) -> [AuditLogEntry]
-```
-
 ## JSON Export for SIEM Integration
 
 The audit log can be exported as a JSON array for ingestion into Security Information and Event Management (SIEM) systems such as Splunk, Elastic SIEM, or similar platforms.

@@ -5,8 +5,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("{}/common.proto", proto_dir),
         format!("{}/data.proto", proto_dir),
         format!("{}/manager.proto", proto_dir),
-        format!("{}/cluster.proto", proto_dir),
-        format!("{}/admin.proto", proto_dir),
     ];
 
     // Re-run when any of the .proto files change. Without this Cargo never
