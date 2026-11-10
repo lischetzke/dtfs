@@ -826,6 +826,12 @@ pub enum ClientRequest {
         /// RAFT-4 — see `UpdateChunkLocations.now_ms`.
         #[serde(default)]
         now_ms: u64,
+        /// Hash of the row the proposer planned to drop. When `Some`, only
+        /// a row with this `chunk_hash` matches, so a file renamed over
+        /// `path` between plan and apply keeps its rows (the remove is
+        /// refused). `None` (old proposers / log entries) matches any hash.
+        #[serde(default)]
+        chunk_hash: Option<String>,
     },
 
     /// Bug AV — set or extend cache cooldown for one or more

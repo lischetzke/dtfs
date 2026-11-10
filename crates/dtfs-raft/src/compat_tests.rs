@@ -195,6 +195,7 @@ fn all_requests() -> Vec<ClientRequest> {
         RemoveChunkLocation {
             path: s("/a"), chunk_index: 0, node_id: s("7"), disk_id: 1,
             enforce_anchor: Some(AnchorPolicy { datacenter: s("LELI"), required_tier: None }), now_ms: 5,
+            chunk_hash: None,
         },
         SetChunkCooldown { path: s("/a"), chunk_indexes: vec![0, 1], expires_at_ms: 9 },
     ]
@@ -424,6 +425,42 @@ fn sweep_expired_leases_v2_entry_prunes_locks() {
     };
     assert_eq!((*now_ms, *sweep_posix_locks), (5_000, true));
     assert!(!sweep_keeps_expired_lock(&reqs[0]));
+}
+
+/// Audit #7 — a v1 `RemoveChunkLocation` (no `chunk_hash`) decodes to
+/// `None`, the hash-blind match old proposers relied on.
+#[test]
+fn remove_chunk_location_v1_entry_defaults_chunk_hash_none() {
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V1).unwrap();
+    let hash = reqs.iter().find_map(|r| match r {
+        ClientRequest::RemoveChunkLocation { chunk_hash, .. } => Some(chunk_hash.clone()),
+        _ => None,
+    });
+    assert_eq!(hash, Some(None));
+}
+
+/// Audit #7 — the v2 entry carries the planned hash; applied to a row with
+/// another hash at the same (path, index, node, disk) it removes nothing.
+#[test]
+fn remove_chunk_location_v2_entry_carries_chunk_hash() {
+    use crate::state_machine::{apply_request, StateMachineData};
+    use openraft::vote::RaftLeaderId;
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V2).unwrap();
+    let remove = reqs
+        .iter()
+        .find(|r| matches!(r, ClientRequest::RemoveChunkLocation { .. }))
+        .expect("v2 fixture has RemoveChunkLocation");
+    let ClientRequest::RemoveChunkLocation { chunk_hash, .. } = remove else { unreachable!() };
+    assert_eq!(chunk_hash.as_deref(), Some(chunk(0).chunk_hash.as_str()));
+
+    let mut sm = StateMachineData::default();
+    let mut f = full_snapshot().files["/media/a.mkv"].clone();
+    f.path = "/a".into();
+    f.chunks = vec![ChunkLocationEntry { chunk_hash: "other".into(), ..chunk(0) }];
+    sm.files.insert("/a".into(), f);
+    let lid = openraft::LogId::new(openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0), 1);
+    apply_request(&mut sm, &lid, remove);
+    assert_eq!(sm.files["/a"].chunks.len(), 1, "a different hash must not be removed");
 }
 
 #[test]

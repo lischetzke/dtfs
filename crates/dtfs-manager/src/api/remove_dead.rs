@@ -14,6 +14,8 @@ pub(crate) struct DeadRow {
     pub path: String,
     pub chunk_index: u64,
     pub disk_id: u32,
+    /// The row's hash, so a file renamed over `path` after the plan is spared.
+    pub chunk_hash: String,
     /// The file's volume anchor, threaded into `RemoveChunkLocation`.
     pub anchor: Option<AnchorPolicy>,
 }
@@ -75,6 +77,7 @@ pub(crate) fn plan_remove_dead(
                 path: path.clone(),
                 chunk_index: c.chunk_index,
                 disk_id: c.disk_id,
+                chunk_hash: c.chunk_hash.clone(),
                 anchor: anchor.clone(),
             };
             let other_live = f.chunks.iter().any(|o| {
@@ -84,7 +87,7 @@ pub(crate) fn plan_remove_dead(
             });
             if !other_live {
                 plan.data_loss.push(row);
-            } else if remove_chunk_location_check(sm, path, c.chunk_index, &nid_str, c.disk_id, anchor.as_ref())
+            } else if remove_chunk_location_check(sm, path, c.chunk_index, &nid_str, c.disk_id, Some(&c.chunk_hash), anchor.as_ref())
                 .is_ok()
             {
                 plan.removable.push(row);
@@ -186,6 +189,7 @@ pub(super) async fn remove_dead_node_endpoint(
             disk_id: r.disk_id,
             enforce_anchor: r.anchor.clone(),
             now_ms: crate::metadata::stamp_now_ms(),
+            chunk_hash: Some(r.chunk_hash.clone()),
         };
         match propose(&state, req).await {
             Ok(()) => removed += 1,

@@ -690,6 +690,7 @@ impl TieringEngine {
                     // CO-1-1 — drop only this (node, disk) warm cache entry.
                     disk_id: d.disk_id,
                     enforce_anchor: d.enforce_anchor.clone(),
+                    chunk_hash: Some(d.chunk_id.clone()),
                 },
                 node_addr,
                 chunk_id: d.chunk_id.clone(),

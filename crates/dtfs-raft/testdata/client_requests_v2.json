@@ -4,5 +4,16 @@
       "now_ms": 5000,
       "sweep_posix_locks": true
     }
+  },
+  {
+    "RemoveChunkLocation": {
+      "path": "/a",
+      "chunk_index": 0,
+      "node_id": "7",
+      "disk_id": 1,
+      "enforce_anchor": null,
+      "now_ms": 5000,
+      "chunk_hash": "0000000000000000000000000000000000000000000000000000000000000001"
+    }
   }
 ]

@@ -140,6 +140,7 @@ impl TaskScheduler {
                     // CO-1-1 — drop only this (node, disk) SM entry.
                     disk_id: action.disk_id,
                     enforce_anchor: action.anchor.clone(),
+                    chunk_hash: Some(action.chunk_id.clone()),
                 },
                 node_addr,
                 chunk_id: action.chunk_id.clone(),

@@ -1563,7 +1563,7 @@ mod posix_path_regression {
         // With the anchor node healthy, dropping the warm copy is fine.
         let mut healthy = sm.clone();
         let resp = apply_request(&mut healthy, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
@@ -1576,7 +1576,7 @@ mod posix_path_regression {
         // same removal must be refused instead of counting on it.
         sm.nodes.get_mut(&10).unwrap().health = HealthStatus::Down;
         let resp = apply_request(&mut sm, &mk_log_id(2),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
@@ -1597,7 +1597,7 @@ mod posix_path_regression {
         bad_disk.nodes.get_mut(&10).unwrap().disks[0].status =
             dtfs_common::types::DiskStatus::Failed;
         let resp = apply_request(&mut bad_disk, &mk_log_id(3),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
@@ -1627,7 +1627,7 @@ mod posix_path_regression {
         // Removing the live (toro) row would leave zero live replicas.
         let mut sm_try_live = sm.clone();
         let resp = apply_request(&mut sm_try_live, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
@@ -1645,7 +1645,7 @@ mod posix_path_regression {
         // Removing the Down (leli) row is fine — it wasn't live anyway.
         let mut sm_try_dead = sm.clone();
         let resp = apply_request(&mut sm_try_dead, &mk_log_id(2),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "10".into(),
@@ -1786,11 +1786,67 @@ mod posix_path_regression {
         ]);
         sm.nodes.get_mut(&10).unwrap().health = HealthStatus::Down;
         let policy = AnchorPolicy { datacenter: "leli".into(), required_tier: None };
-        let err = remove_chunk_location_check(&sm, "/x", 0, "10", 0, Some(&policy)).unwrap_err();
+        let err = remove_chunk_location_check(&sm, "/x", 0, "10", 0, None, Some(&policy)).unwrap_err();
         assert!(err.contains("would strand anchor"), "{err}");
         // Without a policy the dead row may go; absent rows are a no-op.
-        assert_eq!(remove_chunk_location_check(&sm, "/x", 0, "10", 0, None), Ok(true));
-        assert_eq!(remove_chunk_location_check(&sm, "/x", 5, "10", 0, None), Ok(false));
+        assert_eq!(remove_chunk_location_check(&sm, "/x", 0, "10", 0, None, None), Ok(true));
+        assert_eq!(remove_chunk_location_check(&sm, "/x", 5, "10", 0, None, None), Ok(false));
+        // Audit #7 — a matching hash is allowed, another hash at the row is refused.
+        assert_eq!(remove_chunk_location_check(&sm, "/x", 0, "10", 0, Some("h"), None), Ok(true));
+        let err = remove_chunk_location_check(&sm, "/x", 0, "10", 0, Some("h2"), None).unwrap_err();
+        assert!(err.contains("holds another chunk_hash"), "{err}");
+        // An absent row stays a no-op even with a hash.
+        assert_eq!(remove_chunk_location_check(&sm, "/x", 5, "10", 0, Some("h2"), None), Ok(false));
+    }
+
+    /// Audit #7 — a file renamed over P between plan and apply: the remove
+    /// names the planned (old) hash, so the NEW file's row at the same
+    /// (index, node, disk) stays and the apply is refused (so the caller
+    /// skips the byte delete via `client_response_ok`). Without
+    /// the hash (legacy proposer) the row is dropped as before.
+    #[test]
+    fn remove_chunk_location_with_hash_spares_file_renamed_over_path() {
+        use dtfs_common::types::DiskTier;
+        let mut sm = sm_with_chunk("/p", 0, "old", &[
+            (10, "leli", DiskTier::Cold),
+            (11, "toro", DiskTier::Warm),
+        ]);
+        // Plan read /p with hash "old"; then a new file is renamed over /p.
+        let mut newer = sm.files["/p"].clone();
+        newer.path = "/tmp".into();
+        for c in &mut newer.chunks {
+            c.chunk_hash = "new".into();
+        }
+        sm.files.insert("/tmp".into(), newer);
+        let r = apply_request(&mut sm, &mk_log_id(3), &ClientRequest::RenameFile {
+            from: "/tmp".into(), to: "/p".into(), now_ms: 0,
+        });
+        assert!(matches!(r, ClientResponse::Success), "{r:?}");
+        let before = sm.files["/p"].chunks.clone();
+        assert!(before.iter().all(|c| c.chunk_hash == "new"));
+
+        let remove = |hash: Option<&str>| ClientRequest::RemoveChunkLocation {
+            path: "/p".into(), chunk_index: 0, node_id: "11".into(), disk_id: 0,
+            enforce_anchor: None, now_ms: 0, chunk_hash: hash.map(Into::into),
+        };
+        let r = apply_request(&mut sm, &mk_log_id(4), &remove(Some("old")));
+        let ClientResponse::Error { message } = &r else { panic!("expected refusal, got {r:?}") };
+        assert!(message.contains("holds another chunk_hash"), "{message}");
+        assert_eq!(sm.files["/p"].chunks, before, "stale-hash remove must not touch the new file");
+
+        // Positive: the matching hash drops exactly that row.
+        let r = apply_request(&mut sm, &mk_log_id(5), &remove(Some("new")));
+        assert!(matches!(r, ClientResponse::Success), "{r:?}");
+        assert_eq!(sm.files["/p"].chunks.len(), before.len() - 1);
+        assert!(!sm.files["/p"].chunks.iter().any(|c| c.node_id == "11"));
+
+        // Legacy (no hash) keeps the hash-blind match.
+        let mut sm2 = sm_with_chunk("/p", 0, "new", &[
+            (10, "leli", DiskTier::Cold),
+            (11, "toro", DiskTier::Warm),
+        ]);
+        apply_request(&mut sm2, &mk_log_id(6), &remove(None));
+        assert!(!sm2.files["/p"].chunks.iter().any(|c| c.node_id == "11"));
     }
 
     /// AV-1-3 test 1 — happy path: drop one entry, others survive.
@@ -1802,7 +1858,7 @@ mod posix_path_regression {
             (11, "dc-b", DiskTier::Warm),
         ]);
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
@@ -1820,7 +1876,7 @@ mod posix_path_regression {
     fn bug_av_remove_chunk_location_unknown_file_is_noop() {
         let mut sm = StateMachineData::default();
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/nope".into(),
                 chunk_index: 0,
                 node_id: "10".into(),
@@ -1837,7 +1893,7 @@ mod posix_path_regression {
         use dtfs_common::types::DiskTier;
         let mut sm = sm_with_chunk("/x", 0, "h", &[(10, "dc-a", DiskTier::Cold)]);
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "99".into(),  // not present
@@ -1860,7 +1916,7 @@ mod posix_path_regression {
         ]);
         // Attempt to drop the only leli-resident replica — last anchor copy.
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "10".into(),
@@ -1902,7 +1958,7 @@ mod posix_path_regression {
             (11, "leli", DiskTier::Warm),
         ]);
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(), // warm
@@ -1919,7 +1975,7 @@ mod posix_path_regression {
             (11, "leli", DiskTier::Warm),
         ]);
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "10".into(),  // cold
@@ -1953,7 +2009,7 @@ mod posix_path_regression {
             }
         }
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(), // drop warm; cold survivor anchors
@@ -2067,7 +2123,7 @@ mod posix_path_regression {
             (11, "leli", DiskTier::Warm),  // dropping this
         ]);
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "11".into(),
@@ -3174,7 +3230,7 @@ mod audit_co_tests {
         // Drop the WARM disk-1 replica; the cold disk-0 anchor must survive.
         let mut sm = sm_with_colocated_disks();
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "10".into(),
@@ -3201,7 +3257,7 @@ mod audit_co_tests {
         // co-located entries on node 10 are dropped.
         let mut sm = sm_with_colocated_disks();
         let resp = apply_request(&mut sm, &mk_log_id(1),
-            &ClientRequest::RemoveChunkLocation { now_ms: 0,
+            &ClientRequest::RemoveChunkLocation { now_ms: 0, chunk_hash: None,
                 path: "/x".into(),
                 chunk_index: 0,
                 node_id: "10".into(),
@@ -3841,7 +3897,7 @@ mod raft_audit_fix_tests {
         sm.files.get_mut("/f").unwrap().chunks = vec![row(0, "h", "1", 0), row(0, "h", "2", 0)];
         apply_request(&mut sm, &lid(3), &ClientRequest::RemoveChunkLocation {
             path: "/f".into(), chunk_index: 0, node_id: "2".into(), disk_id: 0,
-            enforce_anchor: None, now_ms: 0,
+            enforce_anchor: None, now_ms: 0, chunk_hash: None,
         });
         assert_eq!(sm.files["/f"].chunks.len(), 1);
         // Stale scheduler write built from the pre-removal read of node 1 only.
@@ -3899,13 +3955,24 @@ mod raft_audit_fix_tests {
                     }
                     2 => {
                         if let Some(r) = pre.first() {
+                            // Audit #7 — a named hash (possibly stale) only ever
+                            // drops rows carrying that hash.
+                            let hash = match rnd(3) {
+                                0 => None,
+                                _ => Some(format!("h{}", rnd(2))),
+                            };
                             apply_request(&mut sm, &lid(idx), &ClientRequest::RemoveChunkLocation {
                                 path: "/f".into(), chunk_index: r.chunk_index,
                                 node_id: r.node_id.clone(), disk_id: r.disk_id,
-                                enforce_anchor: None, now_ms: 0,
+                                enforce_anchor: None, now_ms: 0, chunk_hash: hash.clone(),
                             });
                             let post = &sm.files["/f"].chunks;
                             assert!(post.len() <= pre.len(), "seed {seed}");
+                            if let Some(h) = &hash {
+                                for e in pre.iter().filter(|e| &e.chunk_hash != h) {
+                                    assert!(post.contains(e), "seed {seed}: remove naming {h} dropped {e:?}");
+                                }
+                            }
                         }
                     }
                     _ => {

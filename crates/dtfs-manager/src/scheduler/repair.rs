@@ -358,8 +358,13 @@ impl TaskScheduler {
                     if let Some((node, disk_id)) =
                         plan_excess_spill_removal(&reps, &mandatory, anchor.as_ref(), cache_allow)
                     {
-                        let chunk_hash =
-                            entries.first().map(|e| e.chunk_hash.clone()).unwrap_or_default();
+                        // The removed row's own hash (named in the remove).
+                        let node_str = node.to_string();
+                        let chunk_hash = entries
+                            .iter()
+                            .find(|e| e.node_id == node_str && e.disk_id == disk_id)
+                            .map(|e| e.chunk_hash.clone())
+                            .unwrap_or_default();
                         out.push((path.clone(), idx, node, disk_id, anchor.clone(), chunk_hash));
                         if out.len() >= MAX_REMOVALS_PER_TICK {
                             break 'outer;
@@ -379,6 +384,7 @@ impl TaskScheduler {
                 // CO-1-1 — target the exact (node, disk) spill replica.
                 disk_id,
                 enforce_anchor: enforce,
+                chunk_hash: Some(chunk_hash.clone()),
             };
             match self.raft.client_write(req).await {
                 // A committed entry can still apply to ClientResponse::Error
@@ -434,7 +440,7 @@ impl TaskScheduler {
         // Re-derive the rows to drop from the CURRENT state: the caller's
         // snapshot predates this node's ListChunks reply. ONE pass over the
         // namespace (not one per missing hash).
-        let targets: Vec<(String, u64, u32, Option<dtfs_common::types::AnchorPolicy>)> = {
+        let targets: Vec<(String, u64, u32, Option<dtfs_common::types::AnchorPolicy>, String)> = {
             let sm = self.state_data.read().await;
             let mut out = Vec::new();
             for (path, fm) in &sm.files {
@@ -461,7 +467,7 @@ impl TaskScheduler {
                                 .unwrap_or(false)
                     });
                     if live_elsewhere {
-                        out.push((path.clone(), c.chunk_index, c.disk_id, anchor.clone()));
+                        out.push((path.clone(), c.chunk_index, c.disk_id, anchor.clone(), c.chunk_hash.clone()));
                     } else {
                         unreconcilable += 1;
                     }
@@ -470,7 +476,7 @@ impl TaskScheduler {
             out
         };
 
-        for (path, chunk_index, disk_id, anchor) in targets {
+        for (path, chunk_index, disk_id, anchor, chunk_hash) in targets {
             let req = ClientRequest::RemoveChunkLocation { now_ms: now_millis(),
                 path: path.clone(),
                 chunk_index,
@@ -478,6 +484,7 @@ impl TaskScheduler {
                 // CO-1-1 — target the exact (node, disk) row we found stale.
                 disk_id,
                 enforce_anchor: anchor,
+                chunk_hash: Some(chunk_hash),
             };
             match self.raft.client_write(req).await {
                 // Apply refused (e.g. would strand the anchor): the stale row
