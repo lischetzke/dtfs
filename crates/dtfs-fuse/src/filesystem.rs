@@ -228,6 +228,12 @@ pub(crate) fn comm_matches(comm: &str, untracked: &[String]) -> bool {
     !comm.is_empty() && untracked.iter().any(|p| p == comm)
 }
 
+/// Thread-group id from the text of `/proc/<tid>/status` (the FUSE request pid
+/// is the calling thread id, whose `comm` is the thread name, not the process name).
+pub(crate) fn tgid_from_status(status: &str) -> Option<u32> {
+    status.lines().find_map(|l| l.strip_prefix("Tgid:"))?.trim().parse().ok()
+}
+
 /// CR2-8-3 (FUSE-11) — decide whether a read looks like a viewer
 /// (playback) rather than a scanner (stat + header read) for the disk
 /// cache's atime hint.
@@ -1152,18 +1158,25 @@ impl DtfsFilesystem {
         Ok(entries)
     }
 
-    /// Mark `fh` untracked when the opening process (`/proc/<pid>/comm`) is
-    /// in `untracked_read_processes`. Unreadable comm (process gone, no
-    /// /proc) leaves the fh tracked.
+    /// Mark `fh` untracked when the opening process is in `untracked_read_processes`.
+    /// The request pid is the calling thread id: both the thread's `comm` and the
+    /// process's (`Tgid` from `/proc/<pid>/status`) are matched. Unreadable /proc
+    /// entries (process gone, no /proc) leave the fh tracked.
     pub fn mark_untracked_by_pid(&self, fh: u64, pid: u32) {
         let list = &self.config.client.untracked_read_processes;
         if list.is_empty() {
             return;
         }
-        let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) else {
+        let comm_of = |p: u32| std::fs::read_to_string(format!("/proc/{p}/comm")).ok();
+        let proc_comm = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|s| tgid_from_status(&s))
+            .filter(|t| *t != pid)
+            .and_then(comm_of);
+        let Some(comm) = [comm_of(pid), proc_comm].into_iter().flatten().find(|c| comm_matches(c, list)) else {
             return;
         };
-        if comm_matches(&comm, list) {
+        {
             if let Some(mut f) = self.open_files.get_mut(&fh) {
                 f.untracked = true;
             }
@@ -6939,6 +6952,15 @@ mod untracked_read_process_tests {
         assert!(!comm_matches("Plex Media", &l), "partial name");
         assert!(!comm_matches("\n", &[String::new()]), "empty comm never matches");
         assert!(!comm_matches("Plex Media Scan", &[]));
+    }
+
+    #[test]
+    fn tgid_from_status_parses_the_tgid_line() {
+        let s = "Name:\tPlex Scan Thr\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t4242\nNgid:\t0\nPid:\t4250\n";
+        assert_eq!(tgid_from_status(s), Some(4242));
+        assert_eq!(tgid_from_status("Name:\tx\nPid:\t7\n"), None, "no Tgid line");
+        assert_eq!(tgid_from_status("Tgid:\tabc\n"), None, "non-numeric");
+        assert_eq!(tgid_from_status("NotTgid:\t5\n"), None, "prefix must be exact");
     }
 
     #[test]
