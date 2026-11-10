@@ -55,20 +55,10 @@ async fn main() -> anyhow::Result<()> {
 
     let config: dtfs_common::config::ManagerConfig =
         dtfs_common::config::load_config(std::path::Path::new(&args.config))?;
-    // LIS-20 / Sec R3 — fail-closed empty shared_secret (no silent admit).
-    config
-        .cluster
-        .validate_shared_secret()
-        .map_err(|e| anyhow::anyhow!(e))?;
-    // CR-6-1 (CMN-1, CMN-8) — reject an unusable memory ladder or
-    // placement headroom pct at startup instead of flapping/misplacing
-    // at runtime.
-    config.memory.validate().map_err(|e| anyhow::anyhow!(e))?;
-    config.placement.validate().map_err(|e| anyhow::anyhow!(e))?;
-    // CR2-8-1 (CMN-3) — reject an unusable message-size cap at startup.
-    config.grpc.validate().map_err(|e| anyhow::anyhow!(e))?;
-    // A zero interval would panic the spawned tiering/monitor task.
-    config.validate_intervals().map_err(|e| anyhow::anyhow!(e))?;
+    // LIS-20 empty shared_secret, CR-6-1 memory ladder / placement pct,
+    // CR2-8-1 message-size cap, zero intervals: one set, shared with the
+    // config API (issue #129).
+    config.validate_all().map_err(|e| anyhow::anyhow!(e))?;
 
     tracing::info!(
         "Manager {} at {} ({})",

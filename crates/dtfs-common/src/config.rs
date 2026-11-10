@@ -818,6 +818,16 @@ impl ManagerConfig {
         self.scrub.validate()?;
         self.raft.validate_timings()
     }
+
+    /// Every startup check, in startup order. Issue #129: the config API runs
+    /// the same set, so it can never persist a config the manager refuses.
+    pub fn validate_all(&self) -> Result<(), String> {
+        self.cluster.validate_shared_secret()?;
+        self.memory.validate()?;
+        self.placement.validate()?;
+        self.grpc.validate()?;
+        self.validate_intervals()
+    }
 }
 
 impl FuseConfig {

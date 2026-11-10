@@ -350,6 +350,26 @@ mod co_4_3_config_override_validation_tests {
         );
     }
 
+    /// Issue #129 — an override that type-checks but fails a startup
+    /// validator is rejected (a 400 before any write), so it can never be
+    /// saved into a manager.toml the daemon refuses to start from.
+    #[test]
+    fn issue_129_override_failing_startup_validation_is_rejected() {
+        let base = base_config();
+        for (over, want) in [
+            (r#"{"monitoring":{"heartbeat_interval_secs":0}}"#, "[monitoring] heartbeat_interval_secs must be > 0"),
+            (r#"{"cluster":{"shared_secret":""}}"#, "cluster.shared_secret is empty"),
+            (r#"{"defaults":{"chunk_size_mb":0}}"#, "[defaults] chunk_size_mb = 0 is invalid"),
+            (r#"{"grpc":{"max_message_size_mb":0}}"#, "max_message_size_mb"),
+        ] {
+            let err = merge_and_validate_override(&base, over).expect_err(over);
+            assert!(err.contains(want), "{over}: got {err}");
+        }
+        // Boundary: the smallest valid values pass.
+        merge_and_validate_override(&base, r#"{"monitoring":{"heartbeat_interval_secs":1},"defaults":{"chunk_size_mb":1}}"#)
+            .expect("smallest valid values accepted");
+    }
+
     // CO-4-3 — malformed JSON is rejected up front.
     #[test]
     fn invalid_json_is_rejected() {

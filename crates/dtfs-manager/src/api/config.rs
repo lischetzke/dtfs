@@ -707,8 +707,10 @@ pub(super) fn merge_and_validate_override(
     let mut merged = serde_json::to_value(base)
         .map_err(|e| format!("could not serialise base config: {e}"))?;
     json_deep_merge(&mut merged, &over);
-    serde_json::from_value::<dtfs_common::config::ManagerConfig>(merged)
-        .map_err(|e| format!("config override does not type-check as ManagerConfig: {e}"))
+    let cfg = serde_json::from_value::<dtfs_common::config::ManagerConfig>(merged)
+        .map_err(|e| format!("config override does not type-check as ManagerConfig: {e}"))?;
+    cfg.validate_all().map_err(|e| format!("config override fails startup validation: {e}"))?;
+    Ok(cfg)
 }
 
 /// BUG-CM — the effective manager config: the node's startup `state.config`

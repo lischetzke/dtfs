@@ -352,7 +352,7 @@ See [Cluster-wide Configuration Override](../configuration/cluster-config.md) fo
 
 Body `{"config_json": "<JSON string>", "write_to_disk": false, "acknowledge_cluster_wide": false}`. The incoming JSON is deep-merged onto the stored override (omitted keys keep their stored value; an empty `config_json` resets it). Response `{"version", "status": "stored", "note", "write_to_disk": <bool actually written>}`: the override is stored cluster-wide in Raft and takes effect after each daemon restarts.
 
-- `400`: invalid JSON, node-scoped key in the override, merged config does not type-check, or `write_to_disk` without `acknowledge_cluster_wide`. Body carries `"preserved_current": true`.
+- `400`: invalid JSON, node-scoped key in the override, merged config does not type-check or fails a startup check (empty `shared_secret`, memory ladder, placement pct, message size, zero interval, chunk size), or `write_to_disk` without `acknowledge_cluster_wide`. Body carries `"preserved_current": true`.
 - `409`: another update advanced the version first (re-read, retry).
 - `write_to_disk` rewrites `/etc/dtfs/manager.toml` on this manager only (atomic, mode 0600). A failed disk write returns `500` with `{"error", "version", "raft_stored": true, "write_to_disk": false}` and audits result `partial`: the Raft write has already happened, the file was not changed.
 
