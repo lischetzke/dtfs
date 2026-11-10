@@ -649,6 +649,37 @@ impl ChunkStore {
         None
     }
 
+    /// #148 — every copy of `chunk_id` on this node in `[[disks]]` order:
+    /// `(disk mount, .dat path, size)`.
+    pub async fn chunk_copies(&self, chunk_id: &ChunkId) -> Vec<(PathBuf, PathBuf, u64)> {
+        let mut out = Vec::new();
+        for disk in self.disk_manager.all_disks() {
+            let dat_path = chunk_data_path(&disk.mount_path, chunk_id);
+            if let Ok(md) = fs::metadata(&dat_path).await {
+                out.push((disk.mount_path.clone(), dat_path, md.len()));
+            }
+        }
+        out
+    }
+
+    /// #148 — the copy to stream to a replica target. With more than one
+    /// local copy, a copy that does not hash to its id is quarantined and
+    /// the next one tried; the last copy is returned unchecked (the target
+    /// verifies what it receives), so a single copy costs no extra read.
+    pub async fn replication_source(&self, chunk_id: &ChunkId) -> Option<(PathBuf, u64)> {
+        let mut copies = self.chunk_copies(chunk_id).await;
+        while copies.len() > 1 {
+            let (mount, dat, size) = &copies[0];
+            if matches!(hash_chunk_file_incrementally(dat, *size).await, Ok(d) if d == chunk_id.0) {
+                break;
+            }
+            tracing::warn!(chunk_id = %chunk_id, disk = %mount.display(), "replication source copy does not hash to its id; trying next disk");
+            self.confirm_and_quarantine(mount, &chunk_id.as_hex()).await;
+            copies.remove(0);
+        }
+        copies.into_iter().next().map(|(_, dat, size)| (dat, size))
+    }
+
     /// Delete a chunk from disk. **Errors** with `ChunkNotFound` when
     /// the chunk is absent — call `delete_chunk_idempotent` instead
     /// if you want a silent no-op on absent.
@@ -901,7 +932,7 @@ impl ChunkStore {
     /// Under the chunk lock, re-hash the `.dat` against the chunk id; if it is
     /// still bad (mismatch or unreadable), quarantine by RENAME and queue the
     /// corruption report. Returns false when the chunk is gone or healthy.
-    async fn confirm_and_quarantine(&self, disk_path: &Path, chunk_hex: &str) -> bool {
+    pub(crate) async fn confirm_and_quarantine(&self, disk_path: &Path, chunk_hex: &str) -> bool {
         let Ok(id) = ChunkId::from_hex(chunk_hex) else { return true };
         let _guard = self.chunk_locks[Self::chunk_lock_index(&id)].lock().await;
         let dat = chunk_data_path(disk_path, &id);
@@ -3684,6 +3715,43 @@ mod tests {
         ];
         let dm = DiskManager::new(&disk_configs).unwrap();
         (ChunkStore::new(dm), cold, warm)
+    }
+
+    /// #148 — the first-listed copy is rotten, the second good: replication
+    /// streams the good one and quarantines (and reports) the bad one.
+    #[tokio::test]
+    async fn replication_source_skips_and_quarantines_bad_first_copy() {
+        let (store, cold, warm) = make_two_disk_store().await;
+        let data = b"issue-148-two-copies";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        let volume_id = VolumeId::new("default".to_string());
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Cold).await.unwrap();
+        store.put_chunk(&chunk_id, data, &volume_id, DiskTier::Warm).await.unwrap();
+        let cold_dat = chunk_data_path(cold.path(), &chunk_id);
+        std::fs::write(&cold_dat, b"issue-148-two-copieX").unwrap();
+
+        let (src, size) = store.replication_source(&chunk_id).await.unwrap();
+        assert_eq!(src, chunk_data_path(warm.path(), &chunk_id));
+        assert_eq!(size, data.len() as u64);
+        assert!(!cold_dat.exists(), "bad copy moved away");
+        assert!(cold.path().join(".dtfs/quarantine").join(format!("{}.dat.bad", chunk_id.as_hex())).exists());
+        assert_eq!(store.drain_pending_corruption(), vec![(chunk_id.as_hex(), Some(0))]);
+    }
+
+    /// #148 negative — a single copy is returned unchecked (no extra read,
+    /// no quarantine): the target verifies it.
+    #[tokio::test]
+    async fn replication_source_single_bad_copy_is_streamed_unchecked() {
+        let (store, cold, _warm) = make_two_disk_store().await;
+        let data = b"issue-148-one-copy";
+        let chunk_id = ChunkId::from_bytes(checksum::compute(data));
+        store.put_chunk(&chunk_id, data, &VolumeId::new("default".to_string()), DiskTier::Cold).await.unwrap();
+        let cold_dat = chunk_data_path(cold.path(), &chunk_id);
+        std::fs::write(&cold_dat, b"issue-148-one-copX").unwrap();
+        assert_eq!(store.replication_source(&chunk_id).await.unwrap().0, cold_dat);
+        assert!(cold_dat.exists());
+        assert!(store.drain_pending_corruption().is_empty());
+        assert!(store.replication_source(&ChunkId::from_bytes([7u8; 32])).await.is_none());
     }
 
     /// CO-1-1 — the same chunk lives on the cold anchor (disk 0) AND the

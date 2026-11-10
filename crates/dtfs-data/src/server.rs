@@ -755,84 +755,92 @@ impl DataService for DataServiceImpl {
         // local disk cache) are what absorb repeat reads; they report
         // back via the RecordCacheHit RPC.
         self.metrics.record_cache_miss();
-        let (dat_path, total_size) = self
-            .store
-            .chunk_file_path(&chunk_id)
-            .await
-            .ok_or_else(|| Status::not_found(format!("chunk not found: {}", req.chunk_id)))?;
-
-        // Bug BC-8 — verify_on_read. When the cluster integrity knob is
-        // enabled (default true), BLAKE3-hash the on-disk chunk against
-        // the stored ChunkMeta.checksum BEFORE any bytes leave this
-        // process. We hash the file incrementally (one piece in RAM at a
-        // time, never the whole chunk), and on a mismatch return DATA_LOSS
-        // so the FUSE client retries the next replica (P0-2 fallback). On
-        // a match we then stream the file a second pass from disk; reading
-        // the file twice keeps memory bounded and is acceptable per U2.
-        //
-        // Disabling this flag is gated by an explicit-acknowledgement
-        // boundary at the manager API (BC-8 ack guard). Once disabled,
-        // this code path skips the hash and streams the raw bytes —
-        // operator-acknowledged risk, CLAUDE.md flags the false branch as
-        // the only mode where reads can deliver corrupt bytes.
-        if verify_on_read {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
-            let expected = match self.store.get_chunk_meta(&chunk_id).await {
-                // Compare against the content address (chunk id), not the
-                // sidecar: a damaged-but-parseable .meta must not make good
-                // bytes look corrupt and self-quarantine the node.
-                Ok(_) => chunk_id.0,
-                // § A.3.3 (6): a missing/unreadable .meta next to a .dat that
-                // hashes to its id is repaired and served, not a fault.
-                Err(_) if self.store.repair_meta_for_read(&chunk_id, &dat_path, total_size).await => {
-                    tracing::warn!(chunk_id = %req.chunk_id, "verify_on_read: .meta missing or unreadable; .dat matches its id, .meta rebuilt");
-                    self.metrics.record_read(total_size);
-                    return Ok(Response::new(stream_file(dat_path, total_size)));
-                }
-                Err(_) => {
-                    return Err(self.meta_absent_status(&chunk_id, &req.chunk_id, total_size, now_ms).await);
-                }
-            };
-            let actual = hash_file_incrementally(&dat_path, total_size)
-                .await
-                .map_err(|e| Status::internal(format!("verify_on_read hash: {e}")))?;
-            if actual != expected {
-                let actual_hex = hex::encode(actual);
-                tracing::error!(
-                    chunk_id = %req.chunk_id,
-                    actual = %actual_hex,
-                    "Bug BC-8: read.integrity_fault — BLAKE3 mismatch \
-                     against stored meta. Refusing to serve."
-                );
-                // Bug BF-3 — record the fault so heartbeat ships it +
-                // mgr auto-quarantines this node (BF-6). The exact
-                // expected + actual hashes go to the operator's
-                // integrity feed (BC-12e).
-                self.integrity_faults.record(
-                    crate::integrity::IntegrityFault {
-                        chunk_id:      req.chunk_id.clone(),
-                        observed_at_ms: now_ms,
-                        detector:      "verify_on_read".into(),
-                        expected_len:  0,
-                        actual_len:    total_size,
-                        expected_hash: hex::encode(expected),
-                        actual_hash:   actual_hex,
+        // #148 — every copy on this node, in [[disks]] order: a copy that
+        // fails verification is quarantined and the next disk's copy tried.
+        let mut err = Status::not_found(format!("chunk not found: {}", req.chunk_id));
+        for (disk_mount, dat_path, total_size) in self.store.chunk_copies(&chunk_id).await {
+            // Bug BC-8 — verify_on_read. When the cluster integrity knob is
+            // enabled (default true), BLAKE3-hash the on-disk chunk against
+            // the stored ChunkMeta.checksum BEFORE any bytes leave this
+            // process. We hash the file incrementally (one piece in RAM at a
+            // time, never the whole chunk), and on a mismatch return DATA_LOSS
+            // so the FUSE client retries the next replica (P0-2 fallback). On
+            // a match we then stream the file a second pass from disk; reading
+            // the file twice keeps memory bounded and is acceptable per U2.
+            //
+            // Disabling this flag is gated by an explicit-acknowledgement
+            // boundary at the manager API (BC-8 ack guard). Once disabled,
+            // this code path skips the hash and streams the raw bytes —
+            // operator-acknowledged risk, CLAUDE.md flags the false branch as
+            // the only mode where reads can deliver corrupt bytes.
+            if verify_on_read {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let expected = match self.store.get_chunk_meta(&chunk_id).await {
+                    // Compare against the content address (chunk id), not the
+                    // sidecar: a damaged-but-parseable .meta must not make good
+                    // bytes look corrupt and self-quarantine the node.
+                    Ok(_) => chunk_id.0,
+                    // § A.3.3 (6): a missing/unreadable .meta next to a .dat that
+                    // hashes to its id is repaired and served, not a fault.
+                    Err(_) if self.store.repair_meta_for_read(&chunk_id, &dat_path, total_size).await => {
+                        tracing::warn!(chunk_id = %req.chunk_id, "verify_on_read: .meta missing or unreadable; .dat matches its id, .meta rebuilt");
+                        self.metrics.record_read(total_size);
+                        return Ok(Response::new(stream_file(dat_path, total_size)));
                     }
-                );
-                return Err(Status::data_loss(format!(
-                    "verify_on_read mismatch on chunk {}", req.chunk_id
-                )));
+                    Err(_) => {
+                        return Err(self.meta_absent_status(&chunk_id, &req.chunk_id, total_size, now_ms).await);
+                    }
+                };
+                let actual = match hash_file_incrementally(&dat_path, total_size).await {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!(chunk_id = %req.chunk_id, disk = %disk_mount.display(), error = %e, "verify_on_read: copy unreadable; quarantining, trying next disk");
+                        self.store.confirm_and_quarantine(&disk_mount, &chunk_id.as_hex()).await;
+                        err = Status::internal(format!("verify_on_read hash: {e}"));
+                        continue;
+                    }
+                };
+                if actual != expected {
+                    let actual_hex = hex::encode(actual);
+                    tracing::error!(
+                        chunk_id = %req.chunk_id,
+                        actual = %actual_hex,
+                        "Bug BC-8: read.integrity_fault — BLAKE3 mismatch \
+                         against stored meta. Refusing to serve."
+                    );
+                    // Bug BF-3 — record the fault so heartbeat ships it +
+                    // mgr auto-quarantines this node (BF-6). The exact
+                    // expected + actual hashes go to the operator's
+                    // integrity feed (BC-12e).
+                    self.integrity_faults.record(
+                        crate::integrity::IntegrityFault {
+                            chunk_id:      req.chunk_id.clone(),
+                            observed_at_ms: now_ms,
+                            detector:      "verify_on_read".into(),
+                            expected_len:  0,
+                            actual_len:    total_size,
+                            expected_hash: hex::encode(expected),
+                            actual_hash:   actual_hex,
+                        }
+                    );
+                    self.store.confirm_and_quarantine(&disk_mount, &chunk_id.as_hex()).await;
+                    err = Status::data_loss(format!(
+                        "verify_on_read mismatch on chunk {}", req.chunk_id
+                    ));
+                    continue;
+                }
             }
+
+            // Bug AL — record the read for the manager-side I/O Throughput
+            // rolling-rate.
+            self.metrics.record_read(total_size);
+
+            return Ok(Response::new(stream_file(dat_path, total_size)));
         }
-
-        // Bug AL — record the read for the manager-side I/O Throughput
-        // rolling-rate.
-        self.metrics.record_read(total_size);
-
-        Ok(Response::new(stream_file(dat_path, total_size)))
+        Err(err)
     }
 
     async fn delete_chunk(
@@ -1174,15 +1182,19 @@ max_io_percent = 10
         disk_path: &std::path::Path,
         verify_on_read: bool,
     ) -> DataServiceImpl {
-        std::fs::create_dir_all(disk_path.join(".dtfs")).unwrap();
-        std::fs::create_dir_all(disk_path.join(".dtfs").join("wal")).unwrap();
-        std::fs::create_dir_all(disk_path.join("chunks")).unwrap();
-        std::fs::create_dir_all(disk_path.join("tmp")).unwrap();
+        make_service_disks(&[disk_path], verify_on_read).await
+    }
 
-        let disk_configs = vec![dtfs_common::config::DiskConfig {
-            path: disk_path.to_path_buf(),
-            tier: DiskTier::Hot,
-        }];
+    /// Hot-tier disks in `[[disks]]` order (disk_id = position).
+    async fn make_service_disks(
+        disk_paths: &[&std::path::Path],
+        verify_on_read: bool,
+    ) -> DataServiceImpl {
+        let disk_path = disk_paths[0];
+        let disk_configs: Vec<_> = disk_paths
+            .iter()
+            .map(|p| dtfs_common::config::DiskConfig { path: p.to_path_buf(), tier: DiskTier::Hot })
+            .collect();
         let dm = DiskManager::new(&disk_configs).unwrap();
         let store = Arc::new(ChunkStore::new(dm));
         let config = test_config(disk_path);
@@ -1409,6 +1421,57 @@ max_io_percent = 10
             tonic::Code::DataLoss,
             "verify_on_read mismatch must map to DATA_LOSS"
         );
+    }
+
+    /// Two-disk service holding the same chunk on both disks, the disk-0
+    /// copy corrupted. Returns (svc, chunk, data, bad .dat path, tmp dirs).
+    async fn two_copies_first_bad() -> (DataServiceImpl, ChunkId, Vec<u8>, std::path::PathBuf, [tempfile::TempDir; 2]) {
+        let (a, b) = (tempfile::TempDir::new().unwrap(), tempfile::TempDir::new().unwrap());
+        let svc = make_service_disks(&[a.path(), b.path()], true).await;
+        let data = vec![3u8; GET_PIECE_SIZE + 5];
+        let chunk_id = ChunkId::from_bytes(checksum::compute(&data));
+        svc.store
+            .put_chunk(&chunk_id, &data, &VolumeId::new("default".to_string()), DiskTier::Hot)
+            .await
+            .unwrap();
+        // Mirror the committed .dat + .meta onto the other disk.
+        let (dat, _) = svc.store.chunk_file_path(&chunk_id).await.unwrap();
+        let (src, dst) = if dat.starts_with(a.path()) { (a.path(), b.path()) } else { (b.path(), a.path()) };
+        let rel = dat.strip_prefix(src).unwrap();
+        std::fs::create_dir_all(dst.join(rel).parent().unwrap()).unwrap();
+        std::fs::copy(&dat, dst.join(rel)).unwrap();
+        std::fs::copy(dat.with_extension("meta"), dst.join(rel).with_extension("meta")).unwrap();
+        let bad = a.path().join(rel);
+        let mut corrupt = std::fs::read(&bad).unwrap();
+        corrupt[0] ^= 0xFF;
+        std::fs::write(&bad, &corrupt).unwrap();
+        (svc, chunk_id, data, bad, [a, b])
+    }
+
+    // #148 — a rotten copy on disk 0 must not hide the good copy on disk 1:
+    // the bad one is quarantined + reported, the fault recorded, the good
+    // bytes served.
+    #[tokio::test]
+    async fn getchunk_bad_first_copy_fails_over_to_good_copy() {
+        let (svc, chunk_id, data, bad, dirs) = two_copies_first_bad().await;
+        let got = collect_stream(&svc, &chunk_id.as_hex()).await.expect("good copy must serve");
+        assert_eq!(got, data);
+        assert!(!bad.exists(), "bad copy quarantined by rename");
+        assert!(dirs[0].path().join(".dtfs/quarantine").join(format!("{}.dat.bad", chunk_id.as_hex())).exists());
+        assert_eq!(svc.store.drain_pending_corruption(), vec![(chunk_id.as_hex(), Some(0))]);
+        assert_eq!(svc.integrity_faults.pending_len(), 1, "the rotten copy is still a recorded fault");
+    }
+
+    // #148 negative — both copies bad: DATA_LOSS, both quarantined.
+    #[tokio::test]
+    async fn getchunk_all_copies_bad_is_data_loss() {
+        let (svc, chunk_id, _data, bad, dirs) = two_copies_first_bad().await;
+        let good = dirs[1].path().join(bad.strip_prefix(dirs[0].path()).unwrap());
+        std::fs::write(&good, b"rot").unwrap();
+        let err = collect_stream(&svc, &chunk_id.as_hex()).await.expect_err("no good copy");
+        assert_eq!(err.code(), tonic::Code::DataLoss);
+        assert!(svc.store.chunk_file_path(&chunk_id).await.is_none(), "both quarantined");
+        assert_eq!(svc.store.drain_pending_corruption().len(), 2);
     }
 
     // U2 — with verify_on_read disabled the streaming MISS path still

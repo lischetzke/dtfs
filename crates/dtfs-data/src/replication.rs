@@ -93,7 +93,7 @@ impl ReplicationManager {
         // "Chunk not found" wording the manager's Bug AF fast-fail matches.
         let (dat_path, total) = self
             .store
-            .chunk_file_path(chunk_id)
+            .replication_source(chunk_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("Chunk not found: {}", chunk_id.as_hex()))?;
 
