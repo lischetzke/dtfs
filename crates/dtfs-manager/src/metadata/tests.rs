@@ -2316,4 +2316,16 @@ mod issue_144_read_report_buffer_tests {
         assert!(b.take_if_due(before).is_empty());
         assert_eq!(b.take_if_due(t0 + READ_REPORT_FLUSH)[&1]["c"]["dc1"], 2, "still buffered");
     }
+
+    /// A lone report (no later heartbeat adds anything) is released by a
+    /// bare timer poll: what `spawn_read_report_flusher` relies on.
+    #[test]
+    fn lone_report_released_by_poll_without_new_add() {
+        let mut b = ReadReportBuffer::default();
+        let t0 = std::time::Instant::now();
+        b.add(1, &[("c".into(), reads("dc1", 1))], t0);
+        let tick = READ_REPORT_FLUSH / 3;
+        assert!(b.take_if_due(t0 + tick * 2).is_empty());
+        assert_eq!(b.take_if_due(t0 + tick * 3)[&1]["c"]["dc1"], 1);
+    }
 }

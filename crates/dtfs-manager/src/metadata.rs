@@ -116,6 +116,57 @@ impl ReadReportBuffer {
     }
 }
 
+type ReadReportBatch = std::collections::BTreeMap<u64, std::collections::HashMap<String, std::collections::HashMap<String, u32>>>;
+
+/// Resolve a flushed batch of read reports and feed the tiering engine.
+async fn feed_read_reports(
+    sm_data: &tokio::sync::RwLock<StateMachineData>,
+    tiering: &crate::tiering::TieringEngine,
+    due: &ReadReportBatch,
+) {
+    for (node_id, entries) in due {
+        let wanted: std::collections::HashSet<String> = entries.keys().cloned().collect();
+        let index = {
+            let sm = sm_data.read().await;
+            build_chunk_read_context_index(&sm.files, &sm.nodes, &wanted, *node_id)
+        };
+        for (chunk_id, reads_by_dc) in entries {
+            let total: u32 = reads_by_dc.values().sum();
+            match index.get(chunk_id) {
+                // Unknown chunk (already deleted/GC'd) — skip
+                // rather than feed the engine a synthetic
+                // profile for content that no longer exists.
+                None => {
+                    tracing::debug!(chunk_id, node_id, "CR-3-3: unknown chunk in ReportChunkReads, skipping");
+                    continue;
+                }
+                // R2/MGR-1 — the replica's tier could not be
+                // resolved as LIVE (unknown disk, or the node/
+                // disk is Down/Failed/Removed). NEVER fall back
+                // to a fake tier here — that is exactly the
+                // fabricated-Hot-tier bug this task fixed.
+                Some((_, None)) => {
+                    tracing::debug!(chunk_id, node_id, "CR-3-3/R2: replica tier not live, skipping report_access");
+                    continue;
+                }
+                Some((file_path, Some(tier))) => {
+                    tiering
+                        .report_access(
+                            chunk_id,
+                            file_path,
+                            total,
+                            total,
+                            reads_by_dc.clone(),
+                            *tier,
+                            *node_id,
+                        )
+                        .await;
+                }
+            }
+        }
+    }
+}
+
 impl MetadataService {
     pub fn new(
         config: ManagerConfig,
@@ -137,6 +188,23 @@ impl MetadataService {
             tls,
             read_reports: Default::default(),
         }
+    }
+
+    /// Heartbeats only add reports; with no further read report a buffered
+    /// batch would sit unflushed, so a timer flushes it once due.
+    pub(crate) fn spawn_read_report_flusher(&self) {
+        let Some(tiering) = self.tiering.clone() else { return };
+        let (buf, sm) = (self.read_reports.clone(), self.sm_data.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(READ_REPORT_FLUSH / 3);
+            loop {
+                tick.tick().await;
+                let due = buf.lock().take_if_due(std::time::Instant::now());
+                if !due.is_empty() {
+                    feed_read_reports(&sm, &tiering, &due).await;
+                }
+            }
+        });
     }
 
     /// Bug BX-10 — inject the audit log so capacity spills record a
@@ -2491,47 +2559,7 @@ impl ManagerService for MetadataService {
                     buf.add(*node_id, entries, now);
                     buf.take_if_due(now)
                 };
-                for (node_id, entries) in &due {
-                let wanted: std::collections::HashSet<String> = entries.keys().cloned().collect();
-                let index = {
-                    let sm = self.sm_data.read().await;
-                    build_chunk_read_context_index(&sm.files, &sm.nodes, &wanted, *node_id)
-                };
-                for (chunk_id, reads_by_dc) in entries {
-                    let total: u32 = reads_by_dc.values().sum();
-                    match index.get(chunk_id) {
-                        // Unknown chunk (already deleted/GC'd) — skip
-                        // rather than feed the engine a synthetic
-                        // profile for content that no longer exists.
-                        None => {
-                            tracing::debug!(chunk_id, node_id, "CR-3-3: unknown chunk in ReportChunkReads, skipping");
-                            continue;
-                        }
-                        // R2/MGR-1 — the replica's tier could not be
-                        // resolved as LIVE (unknown disk, or the node/
-                        // disk is Down/Failed/Removed). NEVER fall back
-                        // to a fake tier here — that is exactly the
-                        // fabricated-Hot-tier bug this task fixed.
-                        Some((_, None)) => {
-                            tracing::debug!(chunk_id, node_id, "CR-3-3/R2: replica tier not live, skipping report_access");
-                            continue;
-                        }
-                        Some((file_path, Some(tier))) => {
-                            tiering
-                                .report_access(
-                                    chunk_id,
-                                    file_path,
-                                    total,
-                                    total,
-                                    reads_by_dc.clone(),
-                                    *tier,
-                                    *node_id,
-                                )
-                                .await;
-                        }
-                    }
-                }
-                } // for each due node
+                feed_read_reports(&self.sm_data, tiering, &due).await;
             }
             let response_json = serde_json::to_vec(&ClientResponse::Success)
                 .map_err(|e| Status::internal(format!("serialize ClientResponse: {e}")))?;

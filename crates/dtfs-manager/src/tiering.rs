@@ -144,8 +144,11 @@ impl TieringEngine {
 
     /// Pre-cache loop: every `PRECACHE_TICK_SECS`, leader only. Spawned from main.rs.
     pub async fn run_precache(&self) {
-        let mut interval =
-            tokio::time::interval(Duration::from_secs(crate::precache::PRECACHE_TICK_SECS));
+        let phase = Duration::from_secs(crate::precache::PRECACHE_PHASE_SECS);
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + phase,
+            Duration::from_secs(crate::precache::PRECACHE_TICK_SECS),
+        );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;

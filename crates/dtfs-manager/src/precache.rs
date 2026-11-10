@@ -17,8 +17,10 @@ use std::ops::Bound;
 pub(crate) const MAX_ACTIVITY_CHUNKS: usize = 64;
 /// (file, dc) keys kept in the activity map; the stalest 10% go at the cap.
 pub(crate) const MAX_ACTIVITY_KEYS: usize = 1024;
-/// FUSE readahead / header probes touch chunks 0..8; only later reads count as playing.
-pub(crate) const PLAY_SKIP_HEAD_CHUNKS: u64 = 9;
+/// FUSE readahead (default 8 prefetch chunks; measured on the dev cluster: a
+/// one-chunk `dd` reaches chunk index 9) and header probes touch the first
+/// chunks; only later reads count as playing.
+pub(crate) const PLAY_SKIP_HEAD_CHUNKS: u64 = 12;
 /// Tail probes (index containers) touch the last chunks.
 pub(crate) const PLAY_SKIP_TAIL_CHUNKS: u64 = 2;
 
@@ -1016,6 +1018,9 @@ fn plan_precache_budget(
 
 /// Seconds between pre-cache passes.
 pub(crate) const PRECACHE_TICK_SECS: u64 = 30;
+/// Start offset of the pre-cache loop. The scheduler ticks every 30 s too and
+/// holds the migration lock per tick; started in phase, every pass was Deferred.
+pub(crate) const PRECACHE_PHASE_SECS: u64 = 15;
 /// Scheduler live tasks (any class) at or above which pre-cache schedules nothing.
 pub(crate) const PRECACHE_YIELD_LIVE_TASKS: usize = 24;
 /// Token-bucket depth in seconds of `precache_max_mbps`.
@@ -1133,6 +1138,12 @@ pub(crate) fn newly_invalid<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn precache_loop_is_out_of_phase_with_scheduler_tick() {
+        assert_eq!(super::PRECACHE_TICK_SECS % 30, 0, "tick must equal the scheduler tick for the offset to matter");
+        assert!(super::PRECACHE_PHASE_SECS > 0 && super::PRECACHE_PHASE_SECS < super::PRECACHE_TICK_SECS);
+    }
+
     use super::*;
 
     fn sorted(mut v: Vec<&str>, f: fn(&str, &str) -> Ordering) -> Vec<&str> {
@@ -1242,12 +1253,12 @@ mod tests {
     #[test]
     fn is_played_cases() {
         let s = |v: &[u64]| v.iter().copied().collect::<BTreeSet<u64>>();
-        assert!(!is_played(20, &s(&[0, 1, 2, 3, 4, 5, 6, 7, 8]), false));
+        assert!(!is_played(20, &s(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]), false));
         assert!(!is_played(20, &s(&[0, 19]), false));
-        assert!(is_played(20, &s(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 10]), false));
+        assert!(is_played(20, &s(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 12]), false));
         assert!(!is_played(20, &s(&[18]), false));
         assert!(is_played(20, &s(&[]), true));
-        assert!(!is_played(11, &s(&[9]), false));
+        assert!(!is_played(14, &s(&[12]), false));
     }
 
     #[test]
