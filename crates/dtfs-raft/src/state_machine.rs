@@ -2665,7 +2665,8 @@ pub fn remove_chunk_location_check(
                     && (legacy_node_wide || c.disk_id == disk_id)
             }) {
                 return Err(format!(
-                    "RemoveChunkLocation refused: {path}#{chunk_index} on node {node_id} disk {disk_id}                      holds another chunk_hash than the planned {h}"
+                    "RemoveChunkLocation refused: {path}#{chunk_index} on node {node_id} disk {disk_id} \
+                     holds another chunk_hash than the planned {h}"
                 ));
             }
         }

@@ -1821,7 +1821,10 @@ mod posix_path_regression {
         // Audit #7 — a matching hash is allowed, another hash at the row is refused.
         assert_eq!(remove_chunk_location_check(&sm, "/x", 0, "10", 0, Some("h"), None), Ok(true));
         let err = remove_chunk_location_check(&sm, "/x", 0, "10", 0, Some("h2"), None).unwrap_err();
-        assert!(err.contains("holds another chunk_hash"), "{err}");
+        assert_eq!(
+            err,
+            "RemoveChunkLocation refused: /x#0 on node 10 disk 0 holds another chunk_hash than the planned h2"
+        );
         // An absent row stays a no-op even with a hash.
         assert_eq!(remove_chunk_location_check(&sm, "/x", 5, "10", 0, Some("h2"), None), Ok(false));
     }
