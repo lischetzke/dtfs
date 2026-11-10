@@ -40,6 +40,9 @@ Usage: scripts/dev-cluster.sh <command>
   big-file <GiB>    large-file check through FUSE (write, read back, in-DTFS
                     copy; MB/s per phase, peak RSS). Needs free disk of about
                     size x replicas x 2
+  precache-check    pre-cache runtime check (volume media, Plex policy, toro FUSE
+                    client, series E01 played): PASS/FAIL per criterion. Needs a
+                    cluster built with DTFS_DEV_VERSION=v0.1.16 (else 409)
   down              remove all dtfs-dev-* containers, network and volumes
 
 Topology: mgr01/02/03 (leli/toro/nrb), data01 leli cold, data02 toro warm,
@@ -48,6 +51,8 @@ ports 29402 (mgr01), 29412 (mgr02), 29422 (mgr03). No TLS; fixed dev secret.
 Env: DTFS_DEV_TARGET_VOLUME (cargo target volume, default dtfs-target).
 DTFS_DEV_ASYNC_COMMIT=<secs> writes [write] async_commit = true with that
 async_commit_secs into the client configs (written by up; up --no-build to switch).
+DTFS_DEV_VERSION=<tag> stamps DTFS_VERSION into the build (v0.1.16 opens the
+pre-caching version gate; unset = v0.0.0-dev).
 DTFS_DEV_RUST_LOG (default info) sets RUST_LOG for the FUSE/NFS client containers.
 No systemd, journald or sshd in the containers: MCP host_* tools and Ansible
 do not apply.
@@ -58,7 +63,7 @@ drun() { docker run --rm "$@"; }
 
 build() {
   log "building release binaries (target volume $TARGET_VOL)"
-  drun -v "$HOST_ROOT:/build" -v "$TARGET_VOL:/target" -v dtfs-registry:/usr/local/cargo/registry \
+  drun -e DTFS_VERSION="${DTFS_DEV_VERSION:-}" -v "$HOST_ROOT:/build" -v "$TARGET_VOL:/target" -v dtfs-registry:/usr/local/cargo/registry \
     -w /build "$IMG" cargo build --release -p dtfs-manager -p dtfs-data -p dtfs-fuse -p dtfs-cli 2>&1 | tail -5
   [ "${PIPESTATUS[0]}" = 0 ] || die "build failed"
 }
@@ -103,6 +108,7 @@ mode = "disabled"
 [defaults]
 anchor_datacenter = "leli"
 [tiering]
+precache_max_mbps = 200
 [monitoring]
 EOF
 }
@@ -133,15 +139,16 @@ tier = "$(data_tier $n)"
 EOF
 }
 
-fuse_cfg() { # fuse_cfg <host> <allow_other>
+fuse_cfg() { # fuse_cfg <host> <allow_other> [dc] [volume_id]
   cat <<EOF
 [client]
 manager_addr = "mgr01:9401"
 manager_addrs = ["mgr02:9401", "mgr03:9401"]
 shared_secret = "$SECRET"
+$([ -n "${4:-}" ] && echo "volume_id = \"$4\"")
 [location]
 region = "dev"
-datacenter = "leli"
+datacenter = "${3:-leli}"
 rack = "r1"
 host = "$1"
 [mount]
@@ -162,6 +169,7 @@ write_configs() {
   for n in $DATAS; do data_cfg $n | put_cfg $n.toml; done
   fuse_cfg fuse01_cln false | put_cfg fuse.toml
   fuse_cfg nfs01_cln true | put_cfg nfs.toml
+  fuse_cfg fuse02_cln false toro media | put_cfg fuse-toro.toml
 }
 
 ensure_net() {
@@ -376,6 +384,105 @@ cmd_big_file() {
   docker exec dtfs-dev-fuse bash -c "$BIG_STEPS" _ "$g"
 }
 
+PRECACHE_PY='
+import json, os, subprocess, sys, time, urllib.request, urllib.error
+M = "/mnt/dtfs"; MIB = 1 << 20; rc = 0
+def ck(ok, msg):
+    global rc
+    print(("PASS: " if ok else "FAIL: ") + msg, flush=True)
+    if not ok: rc = 1
+def http(base, method, path, body=None):
+    req = urllib.request.Request(base + path, method=method, data=None if body is None else json.dumps(body).encode(),
+                                 headers={"content-type": "application/json", "X-Dtfs-Shared-Secret": os.environ["DTFS_SECRET"]})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r: return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try: return e.code, json.loads(e.read() or b"{}")
+        except ValueError: return e.code, {}
+leader = None
+for m in ("mgr01", "mgr02", "mgr03"):
+    base = "http://%s:9402" % m
+    try:
+        if http(base, "GET", "/api/v1/tiering/precache")[0] == 200: leader = base; break
+    except OSError: pass
+if not leader: print("FAIL: no leader answered /api/v1/tiering/precache"); sys.exit(1)
+print("leader", leader)
+def post(path, body):
+    st, r = http(leader, "POST", path, body)
+    if st == 409 and "v0.1.16" in json.dumps(r): print("FAIL: %s -> 409 %s (rebuild with DTFS_DEV_VERSION=v0.1.16)" % (path, r)); sys.exit(1)
+    if st != 200: print("FAIL: %s -> %s %s" % (path, st, r)); sys.exit(1)
+    return r
+if sys.argv[1] == "write":
+  if http(leader, "GET", "/api/v1/volumes/media")[0] != 200:
+      post("/api/v1/volumes", {"name": "media", "chunk_size_mb": 4, "anchor_datacenter": "leli"})
+  post("/api/v1/volumes/media/set-mandatory", {"hot_replicas": 0, "warm_replicas": 0, "cold_replicas": 1})
+  post("/api/v1/volumes/media/set-anchor", {"datacenter": "leli", "required_tier": "cold"})
+  post("/api/v1/volumes/media/set-cache", {"warm_min": 1, "warm_max": 1, "per_dc": True, "promote_window_secs": 600})
+  post("/api/v1/volumes/media/set-precache", {"mode": "plex", "series_max_gb": 1, "max_series": 1, "next_files": 1})
+  ck(http(leader, "GET", "/api/v1/volumes/media")[1].get("precache", {}).get("mode") == "plex", "volume media precache.mode == plex")
+def mk(path, mib):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        for _ in range(mib // 4): f.write(os.urandom(4 * MIB))
+def tree():
+    for d in ("Show", "Other"): os.makedirs("%s/tv/%s" % (M, d), exist_ok=True); open("%s/tv/%s/.plexmatch" % (M, d), "w").write("title: %s\n" % d)
+    for i in range(1, 6): mk("%s/tv/Show/Season 01/E%02d.mkv" % (M, i), 300)
+    for i in (1, 2): mk("%s/tv/Other/Season 01/E%02d.mkv" % (M, i), 100)
+    for n in "ABC": mk("%s/movies/%s.mkv" % (M, n), 64)
+if sys.argv[1] == "write": tree(); sys.exit(0)
+def play(path, skip, count=5):
+    subprocess.run(["dd", "if=" + M + path, "of=/dev/null", "bs=4M", "skip=%d" % skip, "count=%d" % count], check=True, stderr=subprocess.DEVNULL)
+def status(): return http(leader, "GET", "/api/v1/tiering/precache")[1]
+hosts = {n["node_id"]: n["hostname"] for n in http(leader, "GET", "/api/v1/nodes")[1] if n.get("role", "").lower() == "data"}
+def rows(path):
+    st, r = http(leader, "GET", "/api/v1/files/inspect?path=" + urllib.request.quote(path))
+    if st != 200: return None
+    return [{hosts.get(x["node_id"], x["node_id"]) for x in c["replicas"]} for c in r["chunks"]]
+def frac(path, host):
+    r = rows(path)
+    return (sum(host in c for c in r), len(r)) if r else (0, 0)
+show = "/tv/Show/Season 01/E%02d.mkv"
+play(show % 1, 20)
+print("played E01", flush=True)
+end = time.time() + 480; ok = False
+while time.time() < end:
+    f2, f3 = frac(show % 2, "data02"), frac(show % 3, "data02")
+    st = status(); print("  %s E02 %d/%d E03 %d/%d inflight %s series %s cursors %s" % ((time.strftime("%H:%M:%S"),) + f2 + f3 + (st.get("inflight_tasks"), [g.get("root") for g in st.get("series", [])], [g.get("cursor") for g in st.get("cursors", [])])), flush=True)
+    if f2[1] and f2[0] == f2[1] and f3[1] and f3[0] == f3[1]: ok = True; break
+    time.sleep(10)
+ck(ok, "E02 and E03: every chunk has a data02 (toro warm) row (%s %s)" % (frac(show % 2, "data02"), frac(show % 3, "data02")))
+st = status(); print(json.dumps({k: st.get(k) for k in ("is_leader", "rate_mbps", "inflight_tasks", "series")})[:1500])
+ser = [g for g in st.get("series", []) if g["volume"] == "media"]
+ck(len(ser) == 1 and ser[0].get("root") == "/tv/Show", "series root is /tv/Show (%s)" % [g.get("root") for g in ser])
+ck(ser and ser[0]["cursor"] == show % 1 and show % 1 not in [f["path"] for f in ser[0]["files"]], "E01 (cursor) is not in series[0].files")
+ck(ser and {show % 2, show % 3} <= {f["path"] for f in ser[0]["files"]}, "E02 and E03 are in series[0].files")
+play("/movies/A.mkv", 0, 1)
+time.sleep(120)
+st = status()
+ck(not [g for g in st.get("series", []) + st.get("cursors", []) if "/movies" in (g.get("root") or g.get("dir") or "")], "header-only read of /movies/A.mkv: no /movies cursor")
+play("/tv/Other/Season 01/E01.mkv", 14, 5)
+end = time.time() + 240; ok = False
+while time.time() < end:
+    st = status(); roots = [g.get("root") for g in st.get("series", []) if g["volume"] == "media"]
+    if roots == ["/tv/Other"]: ok = True; break
+    time.sleep(10)
+ck(ok, "LRU: second series replaces first under max-series 1 (series roots %s)" % roots)
+paths = [show % i for i in range(1, 6)] + ["/tv/Other/Season 01/E%02d.mkv" % i for i in (1, 2)] + ["/movies/%s.mkv" % n for n in "ABC"]
+bad = [p for p in paths if not rows(p) or not all("data01" in c for c in rows(p))]
+ck(not bad, "every media file still has a data01 anchor row on every chunk (bad: %s)" % bad)
+sys.exit(rc)
+'
+
+cmd_precache_check() {
+  exists dtfs-dev-fuse-toro && docker rm -f dtfs-dev-fuse-toro >/dev/null
+  start_client fuse-toro fuse-toro.toml 0
+  docker exec -i -e DTFS_SECRET="$SECRET" dtfs-dev-fuse-toro python3 -c "$PRECACHE_PY" write || { fail "writing the Plex tree"; exit 1; }
+  # fresh client: no local cache, so the reads below reach the data nodes and are reported
+  docker rm -f dtfs-dev-fuse-toro >/dev/null
+  start_client fuse-toro fuse-toro.toml 0
+  docker exec -i -e DTFS_SECRET="$SECRET" dtfs-dev-fuse-toro python3 -c "$PRECACHE_PY" check
+}
+
 cmd_down() {
   local c; c="$(docker ps -aq --filter name=dtfs-dev-)"
   # shellcheck disable=SC2086
@@ -395,6 +502,7 @@ case "${1:-}" in
   nfs-check) cmd_nfs_check;;
   empty-files) cmd_empty_files;;
   big-file) shift; cmd_big_file "$@";;
+  precache-check) cmd_precache_check;;
   down) cmd_down;;
   -h|--help|help|"") usage;;
   *) usage >&2; exit 2;;
