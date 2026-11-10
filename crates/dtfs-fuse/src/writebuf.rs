@@ -88,6 +88,19 @@ pub(crate) fn effective_batch_chunks(configured: usize, chunk_size: usize) -> us
     by_count.min(batch_limits(configured).0 / chunk_size).max(1)
 }
 
+/// Most complete chunks one `flush()` takes: exactly the effective
+/// `flush_batch_chunks` with several batches per file in flight (pipelining,
+/// `inflight > 1`); with one, every ready chunk up to the `batch_limits`
+/// bytes, else ready chunks piled up behind the single batch until the
+/// dirty cap forced a synchronous cap drain inside write().
+pub(crate) fn batch_take_chunks(configured: usize, chunk_size: usize, inflight: usize) -> usize {
+    let n = effective_batch_chunks(configured, chunk_size);
+    if inflight > 1 {
+        return n;
+    }
+    n.max(batch_limits(configured).0.checked_div(chunk_size).unwrap_or(n))
+}
+
 /// Zero fill for a write at `offset` past the logical `end`: only the edge
 /// chunks get bytes, `[end, end of its chunk)` (old partial tail) and
 /// `[start of the write's chunk, offset)`. Chunk indices entirely inside the
@@ -130,6 +143,8 @@ pub struct WriteBuffer {
     /// several chunks. `1` (the default from `new()`) reproduces the
     /// pre-WI-01 per-chunk-flush behaviour exactly.
     flush_batch_chunks: usize,
+    /// Most complete chunks one `flush()` takes (`batch_take_chunks`).
+    batch_take: usize,
     /// Per-file dirty cap (`batch_limits(..).1`; `DIRTY_BYTES_CAP` from `new()`).
     dirty_cap: usize,
     /// Per-file write buffers, keyed by file path.
@@ -370,6 +385,7 @@ impl WriteBuffer {
         Self {
             chunk_size,
             flush_batch_chunks: 1,
+            batch_take: batch_take_chunks(1, chunk_size, 1),
             dirty_cap: DIRTY_BYTES_CAP,
             buffers: DashMap::new(),
             inflight: DashMap::new(),
@@ -398,6 +414,7 @@ impl WriteBuffer {
         Self {
             chunk_size,
             flush_batch_chunks: effective_batch_chunks(flush_batch_chunks, chunk_size),
+            batch_take: batch_take_chunks(flush_batch_chunks, chunk_size, inflight),
             dirty_cap: dirty_cap_for(flush_batch_chunks, inflight),
             buffers: DashMap::new(),
             inflight: DashMap::new(),
@@ -540,9 +557,8 @@ impl WriteBuffer {
         if ready < self.flush_batch_chunks {
             return Vec::new();
         }
-        // One batch only: `flush_batch_chunks` complete chunks are within the
-        // `batch_limits` byte limit (`effective_batch_chunks`).
-        let segments = buf.extract_complete_chunks(self.chunk_size, self.flush_batch_chunks);
+        // One batch only, within the `batch_limits` byte limit (`batch_take_chunks`).
+        let segments = buf.extract_complete_chunks(self.chunk_size, self.batch_take);
         debug!(
             path = %buf.path,
             num_segments = segments.len(),
@@ -1442,11 +1458,11 @@ mod tests {
     // Audit 8 — a batch carries at most `flush_batch_chunks` complete chunks
     // (lowest indices first), however many are ready: else one background
     // batch held the whole backlog (up to the dirty cap). flush_all still
-    // drains everything.
+    // drains everything. Only with several batches per file in flight.
     #[test]
     fn flush_takes_at_most_one_batch_lowest_indices_first() {
         let chunk = 4 * 1024 * 1024;
-        let wb = WriteBuffer::new_with_batch(chunk, 4);
+        let wb = WriteBuffer::new_with_batch_inflight(chunk, 4, 2);
         for i in (0..10u32).rev() {
             wb.write("/f", i as u64 * chunk as u64, &vec![i as u8; chunk]);
         }
@@ -1457,6 +1473,24 @@ mod tests {
         assert_eq!(idx(wb.flush_all("/f")), vec![8, 9]);
         let bytes: usize = WriteBuffer::new_with_batch(chunk, 64).flush_batch_chunks * chunk;
         assert!(bytes <= batch_limits(64).0, "a batch never exceeds the byte limit");
+    }
+
+    // Review FUSE-3 — with one batch per file (`max_inflight_batches = 1`,
+    // and sync mode) a batch takes every ready chunk up to the
+    // `batch_limits` bytes: capped at `flush_batch_chunks`, ready chunks
+    // piled up behind the single batch until the dirty cap forced a
+    // synchronous cap drain inside write().
+    #[test]
+    fn single_inflight_batch_takes_ready_chunks_up_to_the_byte_limit() {
+        let chunk = 4 * 1024 * 1024;
+        let wb = WriteBuffer::new_with_batch_inflight(chunk, 4, 1);
+        for i in 0..20u32 {
+            wb.write("/f", i as u64 * chunk as u64, &vec![i as u8; chunk]);
+        }
+        let idx = |s: Vec<ChunkSegment>| s.iter().map(|s| s.chunk_index).collect::<Vec<u32>>();
+        assert_eq!(idx(wb.flush("/f")), (0..16).collect::<Vec<u32>>(), "20 ready: up to the 64 MiB byte limit");
+        assert_eq!(idx(wb.flush("/f")), vec![16, 17, 18, 19]);
+        assert!(wb.flush("/f").is_empty());
     }
 
     // WI-01 — flush_all must still drain held-back chunks at fsync/close,
