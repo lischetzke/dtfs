@@ -1642,6 +1642,31 @@ mod tests {
         assert_eq!(clamp_ack_floor_to_capacity(1, &sm, "default", None, "/a", None), 1);
     }
 
+    /// Issue #128 — the floor_clamped audit row is written once per clamp
+    /// episode per volume, not on every commit; recovery re-arms it.
+    #[test]
+    fn issue_128_floor_clamped_audited_once_per_episode() {
+        let vid = "issue128"; // own latch key: the latch is process-global
+        let mut sm = StateMachineData::default();
+        sm.volumes.insert(vid.to_string(), vol_with_floor(vid, 2));
+        sm.nodes.insert(1, lab_node("data01", "leli", DiskTier::Cold, HealthStatus::Healthy));
+        let audit = crate::audit::AuditLog::new(100);
+        let rows = |a: &crate::audit::AuditLog| {
+            a.query(&crate::audit::AuditFilter::default())
+                .into_iter()
+                .filter(|e| e.action == "write_safety.floor_clamped")
+                .count()
+        };
+        for _ in 0..3 {
+            assert_eq!(clamp_ack_floor_to_capacity(2, &sm, vid, None, "/a", Some(&audit)), 1);
+        }
+        assert_eq!(rows(&audit), 1, "one audit row per clamp episode");
+        // Capacity recovers (floor within capacity), then clamps again: new episode.
+        assert_eq!(clamp_ack_floor_to_capacity(1, &sm, vid, None, "/a", Some(&audit)), 1);
+        assert_eq!(clamp_ack_floor_to_capacity(2, &sm, vid, None, "/a", Some(&audit)), 1);
+        assert_eq!(rows(&audit), 2);
+    }
+
     /// A replica on a cache-only tier (RF 0) does not count toward the floor.
     #[test]
     fn cache_only_replica_does_not_count_toward_floor() {

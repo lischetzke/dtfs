@@ -1287,17 +1287,18 @@ fn clamp_ack_floor_to_capacity(
              healthy maintained node capacity; clamping the ack floor to that \
              capacity so writes can commit"
         );
-    }
-    if let Some(audit) = audit {
-        audit.log(
-            "write_safety",
-            "write_safety.floor_clamped",
-            &format!(
-                "path={} volume={} configured_floor={} effective_rf={}",
-                path, volume_id, floor, rf
-            ),
-            "clamped",
-        );
+        // Issue #128 — once per episode like the warn, not per commit.
+        if let Some(audit) = audit {
+            audit.log(
+                "write_safety",
+                "write_safety.floor_clamped",
+                &format!(
+                    "path={} volume={} configured_floor={} effective_rf={}",
+                    path, volume_id, floor, rf
+                ),
+                "clamped",
+            );
+        }
     }
     rf
 }
