@@ -2636,12 +2636,13 @@ impl DtfsFilesystem {
         }
         let this = self.clone();
         tokio::spawn(async move {
+            // Clears the entry even if commit_all panics.
+            let _slot = StaleCommitSlot { fs: &this, path: path.clone() };
             let guard = this.path_guard(&path).await;
             if let Some(fh) = this.writable_fh(&path) {
                 let result = this.commit_all(fh).await;
                 this.record_aged_commit(&path, result);
             }
-            this.stale_commits.remove(&path);
             this.drop_path_guard(&path, guard);
         });
     }
@@ -4319,6 +4320,19 @@ fn doomed_batch_err(path: &str, turn: Option<(&str, u64)>, log: bool) -> anyhow:
         warn!(path, batch, "earlier batch of the path failed: not uploading/committing this one above the hole");
     }
     anyhow::anyhow!("an earlier batch of {path} failed: batch not committed (retried by the next flush)")
+}
+
+/// Removes the path's `stale_commits` entry when the stale-commit task ends,
+/// also if it panics (else the path is never stale-committed again).
+struct StaleCommitSlot<'a> {
+    fs: &'a DtfsFilesystem,
+    path: String,
+}
+
+impl Drop for StaleCommitSlot<'_> {
+    fn drop(&mut self) {
+        self.fs.stale_commits.remove(&self.path);
+    }
 }
 
 /// Clears its batch from the path's `bg_uploads` entry (the entry with the
@@ -6603,6 +6617,43 @@ mod async_commit_fs_tests {
         })
         .await
         .expect("stale busy path never committed");
+    }
+
+    /// A stale path that is busy because its `path_guard` is held (the
+    /// try_lock branch, no bg batch) also gets one task, which commits once
+    /// the guard is released and then clears its `stale_commits` entry.
+    #[tokio::test]
+    async fn timer_commits_a_path_busy_on_its_guard_past_twice_the_age() {
+        let fs = Arc::new(fs(true));
+        let fh = open(&fs, "/g", OpenFlags::ReadWrite);
+        fs.write_buffer.write("/g", 0, &[7; 100]);
+        let held = fs.path_guard("/g").await;
+        fs.commit_aged(Instant::now() + 2 * AGE).await;
+        assert_eq!(fs.stale_commits.len(), 1, "task spawned on the try_lock failure");
+        assert!(fs.open_files.get(&fh).unwrap().write_error.is_none(), "guard still held");
+        fs.drop_path_guard("/g", held);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fs.stale_commits.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("stale_commits entry never cleared");
+        assert!(fs.open_files.get(&fh).unwrap().write_error.is_some(), "commit attempted");
+    }
+
+    /// The slot clears the entry when its task panics.
+    #[tokio::test]
+    async fn stale_commit_slot_clears_the_entry_on_panic() {
+        let fs = Arc::new(fs(true));
+        fs.stale_commits.insert("/p".to_string(), ());
+        let this = fs.clone();
+        let h = tokio::spawn(async move {
+            let _slot = StaleCommitSlot { fs: &this, path: "/p".to_string() };
+            panic!("commit_all panicked");
+        });
+        assert!(h.await.unwrap_err().is_panic());
+        assert!(fs.stale_commits.is_empty());
     }
 
     #[tokio::test]
