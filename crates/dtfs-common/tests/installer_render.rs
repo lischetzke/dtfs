@@ -221,3 +221,91 @@ gate v0.1.14 ""
     assert!(out.contains("ERR: cannot read the version of the staged dtfs-cli"), "{out}");
     assert_eq!(out.matches("refused").count(), 2, "{out}");
 }
+
+/// Fake staging root with tarballs for `versions`; returns its path.
+fn fake_staging(dir: &std::path::Path, versions: &[&str]) -> PathBuf {
+    let root = dir.join("staging");
+    for v in versions {
+        let d = root.join(v);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(format!("dtfs-{v}-linux-amd64.tar.gz")), b"x").unwrap();
+    }
+    root
+}
+
+const SELECT_FNS: &[&str] = &["select_tarball_local", "select_auto"];
+
+/// #155: `auto` resolves the latest tag first and uses a local file only
+/// when it is that release.
+#[test]
+fn auto_source_prefers_the_remote_latest_over_an_old_staged_tarball() {
+    let d = tempfile::tempdir().unwrap();
+    let root = fake_staging(d.path(), &["v0.1.9", "v0.1.10"]);
+    let body = format!(
+        r#"
+info() {{ :; }}; warn() {{ echo "WARN: $*"; }}
+STAGING_ROOT='{}'; DOWNLOAD_CACHE=/nonexistent; VERSION=""; EXPECT_TAG=""; TARBALL=""
+resolve_latest_tag() {{ echo v0.1.14; }}
+download_tarball_remote() {{ echo "download:$VERSION"; TARBALL=/dl/dtfs-$VERSION-linux-amd64.tar.gz; }}
+select_auto
+echo "tarball=$TARBALL expect=$EXPECT_TAG local=$LOCAL_UNTAGGED"
+"#,
+        root.display()
+    );
+    let (out, _, _) = run_fns(SELECT_FNS, &body, d.path());
+    assert!(out.contains("download:v0.1.14"), "{out}");
+    assert!(out.contains("tarball=/dl/dtfs-v0.1.14-linux-amd64.tar.gz expect=v0.1.14 local=0"), "{out}");
+
+    // The latest release already staged: reused, no download.
+    let root = fake_staging(d.path(), &["v0.1.14"]);
+    let body = body.replace("download:$VERSION", "UNEXPECTED download");
+    let (out, _, _) = run_fns(SELECT_FNS, &body, d.path());
+    assert!(!out.contains("UNEXPECTED"), "{out}");
+    assert!(out.contains(&format!("tarball={}/v0.1.14/dtfs-v0.1.14-linux-amd64.tar.gz expect=v0.1.14", root.display())), "{out}");
+}
+
+#[test]
+fn auto_source_without_remote_takes_the_newest_local_by_version() {
+    let d = tempfile::tempdir().unwrap();
+    // Lexical order would pick v0.1.9 last and v0.1.10 first; version order picks v0.1.14.
+    let root = fake_staging(d.path(), &["v0.1.10", "v0.1.14", "v0.1.9"]);
+    let body = format!(
+        r#"
+info() {{ :; }}; warn() {{ echo "WARN: $*"; }}
+STAGING_ROOT='{}'; DOWNLOAD_CACHE=/nonexistent; VERSION=""; EXPECT_TAG=""; TARBALL=""
+resolve_latest_tag() {{ return 1; }}
+download_tarball_remote() {{ echo UNEXPECTED; }}
+select_auto
+echo "tarball=$TARBALL expect=$EXPECT_TAG local=$LOCAL_UNTAGGED"
+"#,
+        root.display()
+    );
+    let (out, _, _) = run_fns(SELECT_FNS, &body, d.path());
+    assert!(out.contains("WARN: AZ-2: cannot resolve the latest release"), "{out}");
+    assert!(out.contains(&format!("tarball={}/v0.1.14/dtfs-v0.1.14-linux-amd64.tar.gz expect= local=1", root.display())), "{out}");
+
+    // Nothing local and no remote: refused.
+    let body = body
+        .replace(&root.display().to_string(), "/nonexistent")
+        .replace("select_auto\n", "if select_auto; then echo picked; else echo none; fi\n");
+    let (out, _, _) = run_fns(SELECT_FNS, &body, d.path());
+    assert!(out.contains("ERR: AZ-2: no local source found and GitHub fallback failed"), "{out}");
+    assert!(out.contains("none") && !out.contains("picked"), "{out}");
+}
+
+/// A locally found tarball with no tag to check against must not downgrade.
+#[test]
+fn untagged_local_tarball_never_downgrades() {
+    let d = tempfile::tempdir().unwrap();
+    let body = r#"
+gate() { if release_version_gate "$1" "$2" "$3"; then echo "ok:$STAGED_VERSION"; else echo refused; fi; }
+gate "" "dtfs-cli v0.1.13 (built x)" "dtfs-cli v0.1.14 (built y)"
+gate "" "dtfs-cli v0.1.14 (built x)" "dtfs-cli v0.1.14 (built y)"
+gate "" "dtfs-cli v0.1.15 (built x)" "dtfs-cli v0.1.14 (built y)"
+gate "" "dtfs-cli v0.1.13 (built x)" ""
+"#;
+    let (out, _, _) = run_fns(&["version_token", "release_version_gate"], body, d.path());
+    assert!(out.contains("ERR: refusing to downgrade v0.1.14 to v0.1.13"), "{out}");
+    let res: Vec<&str> = out.lines().filter(|l| l.starts_with("ok:") || *l == "refused").collect();
+    assert_eq!(res, ["refused", "ok:v0.1.14", "ok:v0.1.15", "ok:v0.1.13"], "{out}");
+}

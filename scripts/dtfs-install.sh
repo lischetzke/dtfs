@@ -40,12 +40,16 @@ for a in "$@"; do
 
 AZ-2 source selection flags (in addition to the legacy positional arg):
   --source local|remote|auto   default `auto`. `local` searches
-                               $DTFS_LOCAL_BIN_DIR, ./target/release,
-                               /opt/dtfs/staging/*/release, ~/.cache/dtfs;
-                               `remote` downloads the release tarball from
-                               $DTFS_REPO_URL (GitHub releases, github.com only;
-                               `github` is accepted as an alias); `auto`
-                               tries local first, then remote.
+                               $DTFS_LOCAL_BIN_DIR, /opt/dtfs/staging/<tag>/,
+                               ~/.cache/dtfs (newest by version without
+                               --version); `remote` downloads the release
+                               tarball from $DTFS_REPO_URL (GitHub releases,
+                               github.com only; `github` is accepted as an
+                               alias); `auto` resolves the latest tag from the
+                               remote, reuses a local tarball of that tag or
+                               downloads it, and takes the newest local one
+                               only when the remote is unreachable. A local
+                               tarball no tag pinned never downgrades.
   --version <tag>              Release tag (default `latest` = newest full
                                vX.Y.Z release). With auto, a given tag skips
                                local candidates (no stale cache); with local,
@@ -192,6 +196,7 @@ fi
 # Tag the staged binaries must report (#154): an explicit --version, or the
 # tag a remote download resolved `latest` to. Empty = not known.
 EXPECT_TAG=""
+LOCAL_UNTAGGED=0
 [ -z "$VERSION" ] || [ "$VERSION" = "latest" ] || EXPECT_TAG="$VERSION"
 
 # AZ-2 — when no positional tarball was supplied, run the source-selection
@@ -199,26 +204,37 @@ EXPECT_TAG=""
 # concrete path on disk. Skipped entirely when the operator passed an
 # explicit tarball (legacy workflow stays unchanged).
 if [ -z "$TARBALL" ]; then
+    # Local tarball for $VERSION; with no version the newest by version sort
+    # (#155: never the first glob hit, which is the lexically lowest).
+    # Sets LOCAL_UNTAGGED=1 when no tag pinned the choice.
     select_tarball_local() {
-        local tag="*"
+        local tag="*" f v best="" bestv=""
+        LOCAL_UNTAGGED=0
         [ -z "$VERSION" ] || [ "$VERSION" = "latest" ] || tag="$VERSION"
         local candidates=(
             "${DTFS_LOCAL_BIN_DIR:-}/dtfs-${tag}-linux-amd64.tar.gz"
-            "./target/release/dtfs-${tag}-linux-amd64.tar.gz"
-            "/opt/dtfs/staging/"*"/dtfs-${tag}-linux-amd64.tar.gz"
+            "${STAGING_ROOT}/"*"/dtfs-${tag}-linux-amd64.tar.gz"
             "${DOWNLOAD_CACHE}/dtfs-${tag}-linux-amd64.tar.gz"
         )
         for pattern in "${candidates[@]}"; do
             [ -z "$pattern" ] && continue
             for f in $pattern; do
-                if [ -f "$f" ]; then
+                [ -f "$f" ] || continue
+                if [ "$tag" != "*" ]; then
                     info "AZ-2: local source matched $f"
                     TARBALL="$f"
                     return 0
                 fi
+                v="${f##*/dtfs-}"; v="${v%-linux-amd64.tar.gz}"
+                if [ -z "$best" ] || [ "$(printf '%s\n%s\n' "$bestv" "$v" | sort -V | tail -1)" = "$v" ]; then
+                    best="$f"; bestv="$v"
+                fi
             done
         done
-        return 1
+        [ -n "$best" ] || return 1
+        info "AZ-2: newest local source is $best"
+        TARBALL="$best"
+        LOCAL_UNTAGGED=1
     }
     # Header for the optional GitHub token (mirrors updater.rs::token_header).
     # printf is a builtin, so the token never lands in any process's argv.
@@ -243,24 +259,34 @@ if [ -z "$TARBALL" ]; then
         done
         error "AZ-2: too many redirects"; return 1
     }
-    download_tarball_remote() {
-        local tag="${VERSION:-latest}"
-        local url
-        local -a auth=()
-        mapfile -t auth < <(repo_auth_args)
+    repo_base() {
         case "${REPO%/}" in
             https://github.com/*/*) ;;
-            *) error "AZ-2: DTFS_REPO_URL must be https://github.com/<owner>/<repo> (got $REPO)"; return 1 ;;
+            *) error "AZ-2: DTFS_REPO_URL must be https://github.com/<owner>/<repo> (got $REPO)" >&2; return 1 ;;
         esac
-        local base="${REPO%/}"; base="${base%.git}"
+        local base="${REPO%/}"; echo "${base%.git}"
+    }
+    # /releases/latest redirects to /releases/tag/<tag>; resolve it so the
+    # cache name and SHA256SUMS location are pinned to one release. The token
+    # goes on curl stdin, as in fetch_hops.
+    resolve_latest_tag() {
+        local base loc tag
+        local -a auth=()
+        base="$(repo_base)" || return 1
+        [ -z "$REPO_TOKEN" ] || auth=(-H @-)
+        loc="$(curl -fsS --proto '=https' --tlsv1.2 "${auth[@]}" -o /dev/null -w '%{redirect_url}' "${base}/releases/latest" \
+            < <(repo_auth_header))" || { error "AZ-2: cannot resolve the latest release of $base" >&2; return 1; }
+        tag="${loc##*/releases/tag/}"
+        case "$tag" in ""|*/*|"$loc") error "AZ-2: no release found at ${base}/releases/latest" >&2; return 1 ;; esac
+        info "AZ-2: latest release is $tag" >&2
+        echo "$tag"
+    }
+    download_tarball_remote() {
+        local tag="${VERSION:-latest}"
+        local url base
+        base="$(repo_base)" || return 1
         if [ "$tag" = "latest" ]; then
-            # /releases/latest redirects to /releases/tag/<tag>; resolve it so the
-            # cache name and SHA256SUMS location are pinned to one release.
-            local loc
-            loc="$(curl -fsS --proto '=https' --tlsv1.2 "${auth[@]}" -o /dev/null -w '%{redirect_url}' "${base}/releases/latest")"                 || { error "AZ-2: cannot resolve the latest release of $base"; return 1; }
-            tag="${loc##*/releases/tag/}"
-            case "$tag" in ""|*/*|"$loc") error "AZ-2: no release found at ${base}/releases/latest"; return 1 ;; esac
-            info "AZ-2: latest release is $tag"
+            tag="$(resolve_latest_tag)" || return 1
         fi
         EXPECT_TAG="$tag"
         url="${base}/releases/download/${tag}/dtfs-linux-amd64.tar.gz"
@@ -277,6 +303,24 @@ if [ -z "$TARBALL" ]; then
             return 1
         fi
     }
+    # auto (#155): with no --version resolve the latest tag first and reuse a
+    # local tarball only when it is that release; the newest local tarball
+    # only when the remote cannot be reached.
+    select_auto() {
+        local latest
+        if [ -n "$VERSION" ] && [ "$VERSION" != "latest" ]; then
+            # An explicit tag must not be satisfied by whatever is cached locally.
+            download_tarball_remote && return 0
+        elif latest="$(resolve_latest_tag)"; then
+            VERSION="$latest"; EXPECT_TAG="$latest"
+            { select_tarball_local || download_tarball_remote; } && return 0
+        else
+            warn "AZ-2: cannot resolve the latest release; using the newest local tarball"
+            select_tarball_local && return 0
+        fi
+        error "AZ-2: no local source found and GitHub fallback failed"
+        return 1
+    }
     case "$SOURCE" in
         local)
             select_tarball_local || {
@@ -291,18 +335,7 @@ if [ -z "$TARBALL" ]; then
             }
             ;;
         auto)
-            # An explicit tag must not be satisfied by whatever is cached locally.
-            if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
-                select_tarball_local || true
-            fi
-            if [ -n "$TARBALL" ]; then
-                :
-            elif download_tarball_remote; then
-                :
-            else
-                error "AZ-2: no local source found and GitHub fallback failed"
-                exit 1
-            fi
+            select_auto || exit 1
             ;;
     esac
 fi
@@ -310,17 +343,6 @@ fi
 if [ -z "$TARBALL" ] || [ ! -f "$TARBALL" ]; then
     error "missing tarball; usage: $0 [<tarball> | --source local|remote|auto]"; exit 1
 fi
-
-# AZ-2 — stage the tarball into /opt/dtfs/staging/<version>/ before
-# unpacking. Atomic install via `install -m 755` (done by individual
-# binary copies below); the staging dir survives for forensics if
-# the install fails partway through.
-TARBALL_BASENAME="$(basename "$TARBALL")"
-VERSION_TAG="$(echo "$TARBALL_BASENAME" | sed -E 's/^dtfs-([^-]+).*/\1/' || echo unknown)"
-STAGING_DIR="${STAGING_ROOT}/${VERSION_TAG}"
-mkdir -p "$STAGING_DIR"
-cp -f "$TARBALL" "${STAGING_DIR}/${TARBALL_BASENAME}"
-info "AZ-2: staged at ${STAGING_DIR}/${TARBALL_BASENAME}"
 
 # Release authenticity: minisign over SHA256SUMS (what scripts/ci/sign-release.sh
 # signs), then the tarball sha256 must be listed in it. Refuses the install on
@@ -357,15 +379,22 @@ verify_minisign || exit 1
 version_token() {
     awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[vV]?[0-9]/) { print $i; exit } }' <<<"$1"
 }
-# release_version_gate WANT_TAG VERSION_OUTPUT (#154): the signature covers the
+# release_version_gate WANT_TAG VERSION_OUTPUT [INSTALLED_OUTPUT] (#154): the signature covers the
 # binaries and the binaries carry the version stamp, so this binds the signed
 # asset set to a version. Sets STAGED_VERSION. Empty WANT_TAG = no tag known.
 release_version_gate() {
-    local got
+    local got inst
     got="$(version_token "$2")"
     [ -n "$got" ] || { error "cannot read the version of the staged dtfs-cli ('$2'); refusing to install"; return 1; }
     [ -z "$1" ] || [ "${got#v}" = "${1#v}" ] \
         || { error "release asset reports $got but tag $1 was requested; refusing to install assets of another release"; return 1; }
+    # INSTALLED_OUTPUT ($3, only for an untagged local tarball): never older.
+    inst="$(version_token "${3:-}")"
+    if [ -z "$1" ] && [ -n "$inst" ] && [ "$inst" != "$got" ] \
+        && [ "$(printf '%s\n%s\n' "$inst" "$got" | sort -V | tail -1)" = "$inst" ]; then
+        error "refusing to downgrade $inst to $got from a locally found tarball; pass --version <tag> or the tarball path"
+        return 1
+    fi
     STAGED_VERSION="$got"
 }
 
@@ -514,8 +543,19 @@ for b in dtfs-manager dtfs-data dtfs-fuse dtfs-cli; do
     got="$(sha256sum "$TMP/dtfs/bin/$b" | awk '{print $1}')"
     [ -n "$want" ] && [ "$want" = "$got" ] || { error "integrity check failed for $b (manifest '${want:-none}', actual $got)"; exit 1; }
 done
-release_version_gate "$EXPECT_TAG" "$("$TMP/dtfs/bin/dtfs-cli" --version 2>/dev/null || true)" || exit 1
+# A local tarball no tag pinned must not downgrade this host (#155).
+INSTALLED_CLI=""
+[ "$LOCAL_UNTAGGED" -eq 0 ] || INSTALLED_CLI="$(/usr/local/bin/dtfs-cli --version 2>/dev/null || true)"
+release_version_gate "$EXPECT_TAG" "$("$TMP/dtfs/bin/dtfs-cli" --version 2>/dev/null || true)" "$INSTALLED_CLI" || exit 1
 info "release version $STAGED_VERSION"
+
+# AZ-2 — keep the verified tarball in /opt/dtfs/staging/<version>/, named by
+# the version its binaries report, so a later local search finds it by tag.
+STAGING_DIR="${STAGING_ROOT}/${STAGED_VERSION}"
+STAGED_TARBALL="${STAGING_DIR}/dtfs-${STAGED_VERSION}-linux-amd64.tar.gz"
+mkdir -p "$STAGING_DIR"
+[ "$TARBALL" -ef "$STAGED_TARBALL" ] || cp -f "$TARBALL" "$STAGED_TARBALL"
+info "AZ-2: staged at $STAGED_TARBALL"
 
 step "Installing binaries to /usr/local/bin"
 install -m 0755 "$TMP/dtfs/bin/dtfs-manager" /usr/local/bin/dtfs-manager

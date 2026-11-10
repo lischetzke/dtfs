@@ -30,8 +30,8 @@ template its own ([Configuration Templating](../deployment/config-templating.md)
 
 | Flag | Default | Behaviour |
 |------|---------|-----------|
-| `--source local\|remote\|auto` | `auto` | `local` searches `$DTFS_LOCAL_BIN_DIR`, `./target/release`, `/opt/dtfs/staging/*/` and `~/.cache/dtfs` for `dtfs-<version>-linux-amd64.tar.gz` (a differently named file must be passed as the positional argument). `remote` downloads from `$DTFS_REPO_URL` (default `https://github.com/lischetzke/dtfs`, GitHub releases; other hosts are refused). `auto` tries local, then remote. |
-| `--version <tag>` | `latest` | Release tag; `latest` is the newest full `vX.Y.Z`, alphas are skipped. |
+| `--source local\|remote\|auto` | `auto` | `local` searches `$DTFS_LOCAL_BIN_DIR`, `/opt/dtfs/staging/*/` and `~/.cache/dtfs` for `dtfs-<version>-linux-amd64.tar.gz` (a differently named file must be passed as the positional argument); without `--version` it takes the newest by version sort. `remote` downloads from `$DTFS_REPO_URL` (default `https://github.com/lischetzke/dtfs`, GitHub releases; other hosts are refused). `auto` without `--version` resolves the latest tag from the remote first, reuses a local tarball of exactly that tag or downloads it, and falls back to the newest local tarball (with a warning) only when the remote cannot be reached. A local tarball that no tag pinned is refused when it is older than the installed `dtfs-cli`. |
+| `--version <tag>` | `latest` | Release tag; `latest` is the newest full `vX.Y.Z`, alphas are skipped. The staged `dtfs-cli --version` must report this tag (or the tag `latest` resolved to), else the install is refused. |
 | `--role manager\|data\|fuse-client` | prompt | Host role. |
 | `--noninteractive` | off | No prompts; needs `--role` and `--managers`. |
 | `--managers hostname=addr:9401,...` `--cluster-name N` `--hostname H` `--secret S` | prompts | Config values. The secret also comes from `DTFS_SHARED_SECRET`; prefer that, `--secret` is visible in `ps`. For the manager role each entry must be `hostname=addr:port`, where `hostname` equals that manager's `[node].hostname`; a bare address is refused, except one self entry with `--bootstrap true`. Data and FUSE roles accept the same form and ignore the name. |
@@ -45,8 +45,10 @@ template its own ([Configuration Templating](../deployment/config-templating.md)
 
 Environment: `DTFS_REPO_URL`, `DTFS_REPO_TOKEN` (optional GitHub token for rate
 limits or a private fork), `DTFS_LOCAL_BIN_DIR`,
-`DTFS_SHARED_SECRET`. Downloads are cached in `~/.cache/dtfs` and staged in
-`/opt/dtfs/staging/<version>/` (kept after a failed run). Air-gapped: place the
+`DTFS_SHARED_SECRET`. Downloads are cached in `~/.cache/dtfs`. A tarball that passed the `MANIFEST`
+and version checks is kept as
+`/opt/dtfs/staging/<version>/dtfs-<version>-linux-amd64.tar.gz`, `<version>`
+being what its binaries report. Air-gapped: place the
 tarball there and use `--source local`. The units run with
 `ProtectSystem=strict`; the installer creates `/var/lib/dtfs/<role>` and writes
 the data node's `disks.conf` drop-in (disk mount points must exist before the
