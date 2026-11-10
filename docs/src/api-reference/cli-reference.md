@@ -96,7 +96,7 @@ Volume ids are lowercase names with spaces turned into `-`. Field meanings: [Vol
 
 ```
 dtfs-cli update <target> [--check] [--tag <tag>] [--repo-url <url>] [--install-dir <dir>]
-                [--config <file>] [--token <token>] [--no-restart] [-y|--yes]
+                [--config <file>] [--token <token>] [--no-restart] [--force] [-y|--yes]
 ```
 
 Updates binaries on **this host** (run as root). The rolling cluster-wide update is the pipeline playbook, see [CI Pipeline](../operations/ci-pipeline.md).
@@ -111,6 +111,7 @@ Updates binaries on **this host** (run as root). The rolling cluster-wide update
 | `--config <file>` | File to read `[updater]` from. Default `/etc/dtfs/<role>.toml` (`manager`, `data`, `fuse`); none for `cli` and `all`. |
 | `--token <token>` | Optional GitHub token (rate limits or a private fork). Precedence: flag, `DTFS_REPO_TOKEN`, `[updater].token`. Sent as `Authorization: Bearer` on the first request only. |
 | `--no-restart` | Install but leave services on the old binary until their next restart. |
+| `--force` | Reinstall and restart a binary that is already at the release version. |
 | `-y`, `--yes` | Skip the `Proceed? [y/N]` prompt (otherwise the command prompts; with no terminal input it prints `aborted; nothing installed` and still exits `0`, so always pass `-y` in automation). |
 
 Sequence:
@@ -119,8 +120,9 @@ Sequence:
 2. Download to a private temporary directory.
 3. **Minisign verification** when a public key is configured (`[updater].minisign_public_key` or `DTFS_MINISIGN_PUBKEY`; env wins): also download `SHA256SUMS` and `SHA256SUMS.minisig` from the same location, verify the signature, and require the tarball's SHA-256 to match the signed `SHA256SUMS`. Any failure aborts before extraction. Without a key a warning is printed and only the in-tarball `MANIFEST` is checked.
 4. Extract and verify every target binary against the tarball `MANIFEST` SHA-256; one mismatch aborts with nothing installed.
-5. Print the plan and ask for confirmation.
-6. Install each binary atomically (temporary file in the target directory, then rename), then `systemctl restart` the matching units unless `--no-restart`.
+5. Run each staged binary's `--version`. A binary whose version cannot be read aborts the update. A binary whose installed version token is the same (`v0.1.14` = `v0.1.14`, build date ignored) is skipped, unless `--force`. When every target is skipped the command prints `up to date` and exits `0` without installing or restarting anything.
+6. Print the plan and ask for confirmation.
+7. Install each binary atomically (temporary file in the target directory, then rename), then `systemctl restart` the matching units unless `--no-restart`. A restart counts as successful only when the unit is `active` right away and still `active` 10 s later with an unchanged `NRestarts` (the units use `RestartSec=5`), so a crash-looping daemon exits `1`.
 
 Token handling: the token header is attached only to the first request of each download. HTTP redirects are followed by the CLI itself (at most 5 hops, `https` only after the first hop, TLS 1.2 or newer), and redirect targets never receive the token, so a registry that redirects to object storage does not leak it. The header is passed to `curl` on its stdin (`-H @-`), never on the command line, so other local users cannot read the token from the process list (curl 7.55 or newer). The installer (`scripts/dtfs-install.sh`) does the same, and its secret prompt is a password box that never shows the secret in the process list (blank keeps the existing or generated secret; read it from `/etc/dtfs/<role>.toml`). Exit `1` on any failure.
 

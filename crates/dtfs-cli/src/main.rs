@@ -192,6 +192,9 @@ enum Commands {
         /// Skip the confirmation prompt.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Reinstall and restart even when the installed binary is already at the release version.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -860,7 +863,8 @@ async fn main() -> anyhow::Result<()> {
             minisign_key,
             no_restart,
             yes,
-        } => updater::run(target, check, tag, repo_url, install_dir, config, token, minisign_key, no_restart, yes)?,
+            force,
+        } => updater::run(target, check, tag, repo_url, install_dir, config, token, minisign_key, no_restart, yes, force)?,
     }
 
     Ok(())

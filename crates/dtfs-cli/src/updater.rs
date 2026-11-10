@@ -175,6 +175,7 @@ pub fn run(
     minisign_key_flag: Option<String>,
     no_restart: bool,
     yes: bool,
+    force: bool,
 ) -> Result<()> {
     let defaults = dtfs_common::config::UpdaterConfig::default();
 
@@ -222,6 +223,7 @@ pub fn run(
         minisign_key.as_deref(),
         no_restart,
         yes,
+        force,
     )
 }
 
@@ -279,6 +281,7 @@ fn run_update(
     minisign_key: Option<&str>,
     no_restart: bool,
     yes: bool,
+    force: bool,
 ) -> Result<()> {
     let bins = target_binaries(target);
     let url = resolve_tarball_url(source, tag)?;
@@ -333,11 +336,27 @@ fn run_update(
         eprintln!("verified {bin} (sha256 {}…)", &got[..12]);
     }
 
+    // Skip binaries already at the staged version (#153).
+    let mut todo: Vec<(&str, &PathBuf)> = Vec::new();
+    for (bin, src) in bins.iter().zip(&staged) {
+        let staged_v = binary_version(src);
+        let installed = installed_version(install_dir, bin);
+        match plan_install(&staged_v, &installed, force)? {
+            Plan::Install => todo.push((bin, src)),
+            Plan::UpToDate => eprintln!("{bin}: already at {installed}; skipping (--force reinstalls)"),
+        }
+    }
+    if todo.is_empty() {
+        eprintln!("up to date; nothing installed or restarted");
+        return Ok(());
+    }
+    let bins: Vec<&str> = todo.iter().map(|(b, _)| *b).collect();
+
     // Plan + single confirmation gate (install is itself disruptive).
     eprintln!("\nUpdate plan:");
     eprintln!("  source : {url}");
     eprintln!("  install: {install_dir}");
-    for bin in bins {
+    for bin in &bins {
         match service_for_binary(bin) {
             Some(svc) if !no_restart => eprintln!("  {bin}: install + restart {svc}"),
             Some(svc) => eprintln!("  {bin}: install (skip restart {svc})"),
@@ -349,7 +368,7 @@ fn run_update(
         bail!("aborted; nothing installed (pass -y to proceed non-interactively)");
     }
 
-    for (bin, src) in bins.iter().zip(&staged) {
+    for (bin, src) in &todo {
         let dst = format!("{install_dir}/{bin}");
         install_binary(src, &dst)?;
         eprintln!("installed {bin} -> {dst}");
@@ -359,7 +378,7 @@ fn run_update(
         eprintln!("--no-restart: services keep the old binary until the next restart");
     } else {
         let mut failures = Vec::new();
-        for bin in bins {
+        for bin in &bins {
             if let Some(svc) = service_for_binary(bin) {
                 restart_service(svc, &mut failures)?;
             }
@@ -370,7 +389,7 @@ fn run_update(
     Ok(())
 }
 
-use dtfs_common::version::version_is_newer;
+use dtfs_common::version::{version_is_newer, version_token};
 
 fn run_check(
     target: UpdateTarget,
@@ -406,9 +425,49 @@ fn run_check(
     Ok(())
 }
 
+/// Whether a staged binary needs installing (#153).
+#[derive(Debug, PartialEq)]
+enum Plan {
+    Install,
+    UpToDate,
+}
+
+/// Decide from the `--version` outputs of the staged and the installed
+/// binary. Same version token: nothing to do unless `force`.
+fn plan_install(staged: &str, installed: &str, force: bool) -> Result<Plan> {
+    let s = version_token(staged)
+        .with_context(|| format!("cannot read the version of the staged binary ({staged:?})"))?;
+    if !force && version_token(installed) == Some(s) {
+        return Ok(Plan::UpToDate);
+    }
+    Ok(Plan::Install)
+}
+
+/// Seconds a restarted unit must stay active, longer than the units'
+/// `RestartSec=5` so a crash loop shows up as a state or `NRestarts` change.
+const RESTART_SETTLE_SECS: u64 = 10;
+
+/// Verdict on a unit `RESTART_SETTLE_SECS` after its restart: still
+/// `active` and no automatic restart in between.
+fn check_settled(unit: &str, state: &str, restarts_before: Option<u64>, restarts_after: Option<u64>) -> Result<()> {
+    if state != "active" {
+        bail!("{unit} is {state} {RESTART_SETTLE_SECS}s after restart");
+    }
+    if let (Some(b), Some(a)) = (restarts_before, restarts_after) {
+        if a > b {
+            bail!("{unit} restarted {} time(s) within {RESTART_SETTLE_SECS}s (crash loop?)", a - b);
+        }
+    }
+    Ok(())
+}
+
 fn installed_version(install_dir: &str, bin: &str) -> String {
-    let path = format!("{install_dir}/{bin}");
-    match Command::new(&path).arg("--version").output() {
+    binary_version(Path::new(&format!("{install_dir}/{bin}")))
+}
+
+/// Trimmed `--version` output of `path`, or `not installed`.
+fn binary_version(path: &Path) -> String {
+    match Command::new(path).arg("--version").output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => "not installed".to_string(),
     }
@@ -640,17 +699,32 @@ fn systemctl(args: &[&str]) -> Result<()> {
 }
 
 fn assert_active(unit: &str) -> Result<()> {
+    let state = unit_state(unit)?;
+    if state != "active" {
+        bail!("{unit} did not come back active ({state})");
+    }
+    let before = n_restarts(unit);
+    eprintln!("waiting {RESTART_SETTLE_SECS}s for {unit} to stay up");
+    std::thread::sleep(std::time::Duration::from_secs(RESTART_SETTLE_SECS));
+    check_settled(unit, &unit_state(unit)?, before, n_restarts(unit))
+}
+
+/// `systemctl is-active` state word (`active`, `activating`, `failed`, ...).
+fn unit_state(unit: &str) -> Result<String> {
     let out = Command::new("systemctl")
         .args(["is-active", unit])
         .output()
         .context("running systemctl is-active")?;
-    if !out.status.success() {
-        bail!(
-            "{unit} did not come back active ({})",
-            String::from_utf8_lossy(&out.stdout).trim()
-        );
-    }
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Automatic restarts systemd counted for `unit`; `None` when unreadable.
+fn n_restarts(unit: &str) -> Option<u64> {
+    let out = Command::new("systemctl")
+        .args(["show", "-p", "NRestarts", "--value", unit])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 // ---- small utilities ----------------------------------------------------
@@ -904,6 +978,36 @@ mod tests {
         assert!(finish_restarts(vec![]).is_ok());
         let e = finish_restarts(vec!["a.service".into(), "b.service".into()]).unwrap_err().to_string();
         assert!(e.contains("2 service(s)") && e.contains("a.service, b.service"), "{e}");
+    }
+
+    #[test]
+    fn same_version_is_skipped_unless_forced() {
+        let staged = "dtfs-manager v0.1.14 (built 20261110-000000)";
+        // Same version, different build date: nothing to do.
+        assert_eq!(plan_install(staged, "dtfs-manager v0.1.14 (built 20261101-000000)", false).unwrap(), Plan::UpToDate);
+        assert_eq!(plan_install(staged, "dtfs-manager v0.1.14 (built 20261101-000000)", true).unwrap(), Plan::Install);
+        assert_eq!(plan_install(staged, "dtfs-manager v0.1.13 (built x)", false).unwrap(), Plan::Install);
+        // Suffix differs from the release: not the same version.
+        assert_eq!(plan_install(staged, "dtfs-manager v0.1.14-rc1 (built x)", false).unwrap(), Plan::Install);
+        assert_eq!(plan_install(staged, "not installed", false).unwrap(), Plan::Install);
+    }
+
+    #[test]
+    fn staged_binary_without_version_is_refused() {
+        let e = plan_install("dtfs-manager (built x)", "not installed", true).unwrap_err().to_string();
+        assert!(e.contains("cannot read the version of the staged binary"), "{e}");
+    }
+
+    #[test]
+    fn restart_settle_requires_active_and_no_auto_restart() {
+        assert!(check_settled("m.service", "active", Some(0), Some(0)).is_ok());
+        // NRestarts unreadable on an old systemd: state alone decides.
+        assert!(check_settled("m.service", "active", None, None).is_ok());
+        let e = check_settled("m.service", "activating", Some(0), Some(0)).unwrap_err().to_string();
+        assert!(e.contains("m.service is activating 10s after restart"), "{e}");
+        // Boundary: one automatic restart inside the window is a crash loop.
+        let e = check_settled("m.service", "active", Some(3), Some(4)).unwrap_err().to_string();
+        assert!(e.contains("m.service restarted 1 time(s) within 10s"), "{e}");
     }
 
     #[test]
