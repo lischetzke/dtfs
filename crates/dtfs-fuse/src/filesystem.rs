@@ -2361,7 +2361,7 @@ impl DtfsFilesystem {
         let cap = self.write_buffer.dirty_cap();
         let global = || {
             let bg: usize = self.bg_uploads.iter().map(|e| e.value().iter().map(|b| b.2).sum::<usize>()).sum();
-            global_write_wait(self.write_buffer.total_bytes(), incoming, self.write_buffer.chunk_size(), self.write_budget, bg)
+            global_write_wait(self.write_buffer.total_bytes(), incoming, self.write_budget, bg)
         };
         if global() {
             debug!(path = %path, incoming, budget = ?self.write_budget, "write waits for the global write budget");
@@ -4371,12 +4371,8 @@ pub(crate) fn write_budget_bytes(hard_cap_mb: u64, cache_mb: u64) -> Option<usiz
 /// some batch is in flight (`bg_inflight`, any path): those end on their own
 /// (they take no `path_guard`), so a sole writer always progresses and the
 /// budget never deadlocks; with nothing in flight the per-file cap rules.
-/// `incoming` counts at most one `chunk`: a 64 MiB hole-fill step then needs
-/// the headroom of a chunk-sized write, not 64 MiB that other streaming files
-/// never leave free (it starved holding its `path_guard`); the overshoot is
-/// bounded by one fill step per writer.
-fn global_write_wait(total: usize, incoming: usize, chunk: usize, budget: Option<usize>, bg_inflight: usize) -> bool {
-    budget.is_some_and(|b| bg_inflight > 0 && total.saturating_add(incoming.min(chunk)) > b)
+fn global_write_wait(total: usize, incoming: usize, budget: Option<usize>, bg_inflight: usize) -> bool {
+    budget.is_some_and(|b| bg_inflight > 0 && total.saturating_add(incoming) > b)
 }
 
 /// CR-1-2 (FUSE-7) — chunk indices a write of `len` bytes at `offset`
@@ -7297,10 +7293,10 @@ mod async_commit_fs_tests {
         assert_eq!(write_budget_bytes(0, 64), None);
         assert_eq!(write_budget_bytes(2048, 192), Some(1344 * mib));
         assert_eq!(write_budget_bytes(128, 512), Some(0), "saturates");
-        assert!(!global_write_wait(100, 28, 64, Some(128), 1), "at the budget");
-        assert!(global_write_wait(100, 29, 64, Some(128), 1));
-        assert!(!global_write_wait(100, 29, 64, Some(128), 0), "nothing in flight: never waits");
-        assert!(!global_write_wait(usize::MAX, 1, 64, None, 1), "no budget");
+        assert!(!global_write_wait(100, 28, Some(128), 1), "at the budget");
+        assert!(global_write_wait(100, 29, Some(128), 1));
+        assert!(!global_write_wait(100, 29, Some(128), 0), "nothing in flight: never waits");
+        assert!(!global_write_wait(usize::MAX, 1, None, 1), "no budget");
     }
 
     /// Review FUSE-5: a budget below one file's dirty cap (0 included) is
@@ -7312,19 +7308,6 @@ mod async_commit_fs_tests {
         assert!(write_budget_too_small(Some(cap - 1), cap), "boundary: one byte short");
         assert!(!write_budget_too_small(Some(cap), cap));
         assert!(!write_budget_too_small(None, cap), "no [memory] cap: no budget");
-    }
-
-    /// Review FUSE-2: a 64 MiB hole-fill step counts as one chunk against the
-    /// global budget, so it needs no more headroom than a chunk-sized write
-    /// (else other streaming files keep the total just under the budget and
-    /// it waits forever, holding its path_guard). Over by one byte it waits.
-    #[test]
-    fn global_wait_charges_a_large_incoming_as_one_chunk() {
-        let (mib, cs) = (1usize << 20, 4usize << 20);
-        let budget = Some(128 * mib);
-        assert!(!global_write_wait(124 * mib, 64 * mib, cs, budget, 1), "fill step must not need 64 MiB of headroom");
-        assert!(global_write_wait(124 * mib + 1, 64 * mib, cs, budget, 1), "boundary: total + chunk over the budget waits");
-        assert!(global_write_wait(125 * mib, 4 * mib, cs, budget, 1), "a chunk-sized write is unchanged");
     }
 
     /// No managers (fail fast): the background failure restores the batch,

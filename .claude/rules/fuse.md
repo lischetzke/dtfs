@@ -380,8 +380,7 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   early-returns). systemd `MemoryMax` is the backstop.
 - Write buffers (async_commit): `bg_backpressure` also waits while
   `WriteBuffer::total_bytes` (every path, buffered + in flight; summed on
-  demand, no drifting counter) plus the incoming write (counted as at most
-  one chunk, so a 64 MiB hole-fill step does not starve) exceeds
+  demand, no drifting counter) plus the incoming write exceeds
   `write_budget_bytes` (`hard_cap_mb - cache_mb - hard_cap_mb / 4`, none
   without a cap), but only while any background batch is in flight
   (`global_write_wait`): batches end without `path_guard`, so this never
