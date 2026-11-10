@@ -1,6 +1,8 @@
 // Quick + deep scrub engine.
 // Periodic integrity checking with configurable intervals and manual triggers.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dtfs_common::config::ScrubConfig;
@@ -91,6 +93,73 @@ pub fn effective_interval_secs(secs: u64, hours: u64) -> u64 {
     }
 }
 
+fn level_name(level: ScrubLevel) -> &'static str {
+    match level {
+        ScrubLevel::Quick => "quick",
+        ScrubLevel::Deep => "deep",
+    }
+}
+
+fn marker_path(disk: &Path, level: ScrubLevel) -> PathBuf {
+    disk.join(".dtfs").join(format!("last_{}_scrub_ms", level_name(level)))
+}
+
+fn read_marker(disk: &Path, level: ScrubLevel) -> Option<u64> {
+    std::fs::read_to_string(marker_path(disk, level)).ok()?.trim().parse().ok()
+}
+
+/// Persist `ms` as the last `level` scrub time of `disk` (tmp, sync_all, rename).
+fn write_marker(disk: &Path, level: ScrubLevel, ms: u64) -> std::io::Result<()> {
+    let path = marker_path(disk, level);
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(ms.to_string().as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)
+}
+
+/// Write the `level` marker on every disk; a failure is logged, the pass still counts.
+fn write_markers(disks: &[PathBuf], level: ScrubLevel, ms: u64) {
+    for d in disks {
+        if let Err(e) = write_marker(d, level, ms) {
+            tracing::warn!(disk = %d.display(), level = level_name(level), error = %e, "scrub marker write failed");
+        }
+    }
+}
+
+/// #117 — the wall-clock ms the `level` interval counts from, persisted
+/// across restarts: the oldest marker over `disks`. A disk without a marker
+/// gets `now_ms` written as its baseline, so a node restarted more often
+/// than the interval still reaches it (and a fresh install does not scrub
+/// at once).
+pub fn load_last_scrub_ms(disks: &[PathBuf], level: ScrubLevel, now_ms: u64) -> u64 {
+    let mut oldest = now_ms;
+    let mut missing = Vec::new();
+    for d in disks {
+        match read_marker(d, level) {
+            Some(ms) => oldest = oldest.min(ms),
+            None => missing.push(d.clone()),
+        }
+    }
+    write_markers(&missing, level, now_ms);
+    oldest
+}
+
+/// Is a scrub due `interval_secs` after `last_ms`? A clock stepped back
+/// before `last_ms` waits (saturating), it never scrubs early.
+pub fn scrub_due(now_ms: u64, last_ms: u64, interval_secs: u64) -> bool {
+    now_ms.saturating_sub(last_ms) >= interval_secs.saturating_mul(1000)
+}
+
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Background scrub scheduler that runs quick and deep scrubs on configured
 /// intervals against all disks managed by the chunk store. AZ-1: the
 /// `config` field is an `Arc<RwLock<ScrubConfig>>` so the manager's
@@ -131,9 +200,11 @@ impl ScrubScheduler {
         // Skip the first immediate tick so a fresh process doesn't
         // scrub on startup.
         ticker.tick().await;
-        let start = std::time::Instant::now();
-        let mut last_quick: Option<std::time::Instant> = None;
-        let mut last_deep: Option<std::time::Instant> = None;
+        // #117 — interval timers are persisted per disk, so a restart does
+        // not push the next scrub out by a full interval.
+        let disks = self.store.disk_paths();
+        let mut last_quick = load_last_scrub_ms(&disks, ScrubLevel::Quick, wall_ms());
+        let mut last_deep = load_last_scrub_ms(&disks, ScrubLevel::Deep, wall_ms());
 
         loop {
             tokio::select! {
@@ -143,22 +214,15 @@ impl ScrubScheduler {
                         (effective_interval_secs(c.quick_interval_secs, c.quick_interval_hours),
                          effective_interval_secs(c.deep_interval_secs, c.deep_interval_hours))
                     };
-                    let now = std::time::Instant::now();
-                    let quick_due = match last_quick {
-                        Some(t) => now.duration_since(t).as_secs() >= quick_secs,
-                        None => now.duration_since(start).as_secs() >= quick_secs,
-                    };
-                    let deep_due = match last_deep {
-                        Some(t) => now.duration_since(t).as_secs() >= deep_secs,
-                        None => now.duration_since(start).as_secs() >= deep_secs,
-                    };
-                    if quick_due {
+                    if scrub_due(wall_ms(), last_quick, quick_secs) {
                         self.run_scrub(ScrubLevel::Quick).await;
-                        last_quick = Some(std::time::Instant::now());
+                        last_quick = wall_ms();
+                        write_markers(&disks, ScrubLevel::Quick, last_quick);
                     }
-                    if deep_due {
+                    if scrub_due(wall_ms(), last_deep, deep_secs) {
                         self.run_scrub(ScrubLevel::Deep).await;
-                        last_deep = Some(std::time::Instant::now());
+                        last_deep = wall_ms();
+                        write_markers(&disks, ScrubLevel::Deep, last_deep);
                     }
                 }
                 Some(level) = scrub_now.recv() => {
@@ -166,10 +230,12 @@ impl ScrubScheduler {
                     // run for the interval timer of that level.
                     tracing::info!("CF-8 manual {:?} scrub starting (operator trigger)", level);
                     self.run_scrub(level).await;
+                    let ms = wall_ms();
                     match level {
-                        ScrubLevel::Quick => last_quick = Some(std::time::Instant::now()),
-                        ScrubLevel::Deep => last_deep = Some(std::time::Instant::now()),
+                        ScrubLevel::Quick => last_quick = ms,
+                        ScrubLevel::Deep => last_deep = ms,
                     }
+                    write_markers(&disks, level, ms);
                 }
             }
         }
@@ -303,5 +369,66 @@ mod cr_6_3_effective_interval_secs_tests {
     fn zero_secs_falls_back_to_hours() {
         // older manager / no override yet: secs is 0, derive from hours.
         assert_eq!(effective_interval_secs(0, 6), 6 * 3600);
+    }
+}
+
+#[cfg(test)]
+mod persisted_due_tests {
+    use super::*;
+
+    const H: u64 = 3600 * 1000;
+    const WEEK_SECS: u64 = 168 * 3600;
+
+    #[test]
+    fn fresh_disk_baselines_now_and_is_not_due() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".dtfs")).unwrap();
+        let disks = vec![d.path().to_path_buf()];
+        let now = 1_000 * H;
+        let last = load_last_scrub_ms(&disks, ScrubLevel::Deep, now);
+        assert_eq!(last, now);
+        assert!(!scrub_due(now, last, WEEK_SECS));
+        assert_eq!(read_marker(d.path(), ScrubLevel::Deep), Some(now), "baseline persisted");
+    }
+
+    #[test]
+    fn restart_long_after_last_pass_is_due() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".dtfs")).unwrap();
+        let disks = vec![d.path().to_path_buf()];
+        write_marker(d.path(), ScrubLevel::Deep, 1_000 * H).unwrap();
+        // Restarted 200 h later: the persisted time counts, not process start.
+        let now = 1_200 * H;
+        let last = load_last_scrub_ms(&disks, ScrubLevel::Deep, now);
+        assert_eq!(last, 1_000 * H);
+        assert!(scrub_due(now, last, WEEK_SECS));
+    }
+
+    #[test]
+    fn restart_shortly_after_pass_is_not_due_and_boundary_holds() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join(".dtfs")).unwrap();
+        let disks = vec![d.path().to_path_buf()];
+        write_marker(d.path(), ScrubLevel::Deep, 1_000 * H).unwrap();
+        let last = load_last_scrub_ms(&disks, ScrubLevel::Deep, 1_001 * H);
+        assert_eq!(last, 1_000 * H);
+        assert!(!scrub_due(1_000 * H + WEEK_SECS * 1000 - 1, last, WEEK_SECS));
+        assert!(scrub_due(1_000 * H + WEEK_SECS * 1000, last, WEEK_SECS));
+        // Clock stepped back before the marker: wait, never scrub early.
+        assert!(!scrub_due(999 * H, last, WEEK_SECS));
+    }
+
+    #[test]
+    fn oldest_marker_wins_and_levels_are_separate() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d.path().join(".dtfs")).unwrap();
+        }
+        write_marker(a.path(), ScrubLevel::Deep, 900 * H).unwrap();
+        write_marker(b.path(), ScrubLevel::Deep, 950 * H).unwrap();
+        let disks = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        assert_eq!(load_last_scrub_ms(&disks, ScrubLevel::Deep, 1_000 * H), 900 * H);
+        assert_eq!(load_last_scrub_ms(&disks, ScrubLevel::Quick, 1_000 * H), 1_000 * H);
     }
 }

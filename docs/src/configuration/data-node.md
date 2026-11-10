@@ -84,6 +84,8 @@ Local fallback used until the first heartbeat response arrives. From then on the
 
 Quarantined chunks are moved to `.dtfs/quarantine/<id>.dat.bad`, never deleted.
 
+Intervals count from the last finished pass, persisted per disk in `.dtfs/last_{quick,deep}_scrub_ms` (wall-clock ms), so a restart does not reset them; the oldest disk counts. A disk without the file starts its interval at first startup. An interrupted pass is not recorded and reruns from the beginning once due.
+
 ## `[memory]` (optional)
 
 `hard_cap_mb = 0` (default, or block absent) disables the ladder. Set a non-zero cap on every production deploy. With a cap, the node sizes `PutChunk` concurrency to it and, at the shed level, rejects new `PutChunk` with `RESOURCE_EXHAUSTED` (clients back off and retry) instead of risking an OOM kill. On a composite host the sum of all roles' caps must stay below host RAM.
