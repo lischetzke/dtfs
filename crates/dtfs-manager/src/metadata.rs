@@ -2773,7 +2773,7 @@ impl ManagerService for MetadataService {
             && allocation_anchor_dc(anchor_dc.clone(), req.defer_anchor.unwrap_or(false), requester_dc)
                 .is_none();
         let anchor_addresses =
-            sync_anchor_addrs(&data.nodes, anchor_dc.as_deref(), req.defer_anchor.unwrap_or(false));
+            sync_anchor_addrs(&data.nodes, anchor_dc.as_deref(), defer);
         let placed = if exclude_set.is_empty() && !defer {
             self.placement.place_chunks_with_anchor(
                 &effective_volume_id,
