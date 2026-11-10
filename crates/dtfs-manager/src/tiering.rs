@@ -670,7 +670,10 @@ impl TieringEngine {
                 let sm = self.state_data.read().await;
                 sm.files
                     .get(&d.file_path)
-                    .map(|fm| now_ms.saturating_sub(fm.updated_at_ms) < grace_ms)
+                    // #146 — a replica add stamps replica_added_at_ms, a
+                    // demote stamps neither (gated), so demotes of one file
+                    // no longer block each other (#147).
+                    .map(|fm| now_ms.saturating_sub(fm.updated_at_ms.max(fm.replica_added_at_ms)) < grace_ms)
                     .unwrap_or(false)
             };
             if recently_updated {
@@ -940,7 +943,7 @@ impl TieringEngine {
                     fm.volume_id.clone(),
                     placements,
                     cooldown,
-                    fm.updated_at_ms,
+                    fm.updated_at_ms.max(fm.replica_added_at_ms), // #146
                     policy.cache.promote_window_secs,
                 ));
             }

@@ -46,7 +46,7 @@ mod snapshot_persistence_tests {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
-                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None, replica_added_at_ms: 0,
             },
         );
         data.cluster_config.version = 7;
@@ -1071,7 +1071,7 @@ mod posix_path_regression {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
-                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None, replica_added_at_ms: 0,
             },
         );
 
@@ -1113,7 +1113,7 @@ mod posix_path_regression {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
-                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None, replica_added_at_ms: 0,
             },
         );
         sm
@@ -1423,7 +1423,7 @@ mod posix_path_regression {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
-                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None, replica_added_at_ms: 0,
             },
         );
         apply_request(
@@ -1631,7 +1631,7 @@ mod posix_path_regression {
             symlink_target: None,
             logical_size: None,
             is_directory: false,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None, replica_added_at_ms: 0,
         });
         sm
     }
@@ -2297,7 +2297,7 @@ mod posix_path_regression {
             symlink_target: None,
             logical_size: None,
             is_directory: false,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None, replica_added_at_ms: 0,
         };
         original.cache_cooldown_until_ms.insert(0, 1_000_000);
         original.cache_cooldown_until_ms.insert(2, 2_000_000);
@@ -3345,7 +3345,7 @@ mod audit_co_tests {
             symlink_target: None,
             logical_size: None,
             is_directory: false,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None, replica_added_at_ms: 0,
         });
         sm
     }
@@ -4336,7 +4336,7 @@ mod ever_committed_tests {
             path: "/l".into(), volume_id: "default".into(), chunk_size: MIB, chunks: vec![],
             created_at_ms: 0, updated_at_ms: 0, symlink_target: None, logical_size: None,
             is_directory: false, cache_cooldown_until_ms: Default::default(),
-            ever_committed: None,
+            ever_committed: None, replica_added_at_ms: 0,
         };
         assert!(f.committed_data_missing(), "legacy, size unset: may be real loss");
         f.logical_size = Some(0);
@@ -4444,7 +4444,7 @@ mod reported_size_tests {
             path: "/f".into(), volume_id: "default".into(), chunk_size: CS, chunks,
             created_at_ms: 0, updated_at_ms: 0, symlink_target: None, logical_size,
             is_directory: false, cache_cooldown_until_ms: Default::default(),
-            ever_committed: Some(true),
+            ever_committed: Some(true), replica_added_at_ms: 0,
         }
     }
 
@@ -4537,11 +4537,11 @@ mod named_remove_gate_tests {
 
     #[test]
     fn issue_121_request_extent_gate_needs_every_member_at_0_1_15() {
-        assert!(cluster_understands_request_extent(&sm_with(["v0.1.15", "v0.1.15", "v0.2.0"])));
+        assert!(cluster_on_v0_1_15(&sm_with(["v0.1.15", "v0.1.15", "v0.2.0"])));
         // Boundary: a v0.1.14 member keeps the legacy extent rule.
-        assert!(!cluster_understands_request_extent(&sm_with(["v0.1.15", "v0.1.14", "v0.1.15"])));
-        assert!(!cluster_understands_request_extent(&sm_with(["v0.1.15", "v0.1.15", "v0.0.0-dev"])));
-        assert!(!cluster_understands_request_extent(&StateMachineData::default()));
+        assert!(!cluster_on_v0_1_15(&sm_with(["v0.1.15", "v0.1.14", "v0.1.15"])));
+        assert!(!cluster_on_v0_1_15(&sm_with(["v0.1.15", "v0.1.15", "v0.0.0-dev"])));
+        assert!(!cluster_on_v0_1_15(&StateMachineData::default()));
     }
 }
 
@@ -4609,5 +4609,109 @@ mod issue_121_truncate_extent_tests {
         let mut sm = truncated_then_rewrite_chunk0(true);
         commit(&mut sm, 6, vec![row(2, "b2")], true);
         assert_eq!(sm.files["/f"].logical_size, Some(12 * MIB));
+    }
+}
+
+/// #146/#147 — replica-only changes leave the file mtime (`updated_at_ms`)
+/// alone once every manager is on v0.1.15; a replica ADD stamps
+/// `replica_added_at_ms` for the tiering grace instead.
+#[cfg(test)]
+mod issue_146_mtime_tests {
+    use super::*;
+    use super::named_remove_gate_tests::sm_with;
+    use dtfs_common::types::{DiskInfo, DiskStatus, DiskTier, HealthStatus, NodeRole};
+
+    fn lid(idx: u64) -> LogId {
+        use openraft::vote::RaftLeaderId;
+        let leader = openraft::impls::leader_id_adv::LeaderId::<u64, u64>::new(0, 0);
+        openraft::LogId::new(leader, idx)
+    }
+
+    fn row(node: &str) -> ChunkLocationEntry {
+        ChunkLocationEntry { chunk_index: 0, chunk_hash: "h".into(), node_id: node.into(), disk_id: 0, size_bytes: 1024 }
+    }
+
+    /// Managers 1-3 on `version`, data nodes 10 and 11, `/f` with one row on 10.
+    fn setup(version: &str) -> StateMachineData {
+        let mut sm = sm_with([version; 3]);
+        for id in [10u64, 11] {
+            let mut n = sm.nodes[&1].clone();
+            n.role = NodeRole::Data;
+            n.disks = vec![DiskInfo {
+                disk_id: 0, uuid: String::new(), mount_path: String::new(), tier: DiskTier::Cold,
+                total_bytes: 0, used_bytes: 0, status: DiskStatus::Healthy,
+            }];
+            sm.nodes.insert(id, n);
+        }
+        sm.files.insert("/f".into(), FileMetadata {
+            path: "/f".into(), volume_id: "default".into(), chunk_size: 1024, chunks: vec![row("10")],
+            created_at_ms: 1_000, updated_at_ms: 1_000, symlink_target: None, logical_size: Some(1024),
+            is_directory: false, cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            ever_committed: Some(true), replica_added_at_ms: 0,
+        });
+        sm
+    }
+
+    fn add_copy(sm: &mut StateMachineData, idx: u64, now_ms: u64) {
+        let r = apply_request(sm, &lid(idx), &ClientRequest::UpdateChunkLocations {
+            path: "/f".into(), chunks: vec![row("11")], lease_id: String::new(), now_ms, extent_from_request: false,
+        });
+        assert_eq!(r, ClientResponse::Success);
+    }
+
+    #[test]
+    fn issue_146_replica_moves_keep_mtime_once_gated() {
+        let mut sm = setup("v0.1.15");
+        add_copy(&mut sm, 1, 5_000);
+        assert_eq!((sm.files["/f"].updated_at_ms, sm.files["/f"].replica_added_at_ms), (1_000, 5_000));
+        let r = apply_request(&mut sm, &lid(2), &ClientRequest::RemoveCorruptChunkReplicas {
+            node_id: "11".into(), chunk_hashes: vec!["h".into()], disk_id: 0, now_ms: 6_000,
+        });
+        assert_eq!(r, ClientResponse::Success);
+        assert_eq!(sm.files["/f"].chunks.len(), 1);
+        add_copy(&mut sm, 3, 7_000);
+        let r = apply_request(&mut sm, &lid(4), &ClientRequest::RemoveChunkLocation {
+            path: "/f".into(), chunk_index: 0, node_id: "11".into(), disk_id: 0,
+            enforce_anchor: None, now_ms: 8_000, chunk_hash: None,
+        });
+        assert_eq!(r, ClientResponse::Success);
+        assert_eq!(sm.files["/f"].chunks.len(), 1);
+        sm.nodes.get_mut(&10).unwrap().health = HealthStatus::Down;
+        let r = apply_request(&mut sm, &lid(5), &ClientRequest::RemoveDeadNodeReplica {
+            path: "/f".into(), chunk_index: 0, node_id: "10".into(), disk_id: 0, now_ms: 9_000, chunk_hash: None,
+        });
+        assert_eq!(r, ClientResponse::Success);
+        // The lost file moved under /.dtfs-lost/; it is the only file.
+        let f = sm.files.values().next().unwrap();
+        assert!(f.chunks.is_empty());
+        // Removals never stamp the add time; the mtime never moved.
+        assert_eq!((f.updated_at_ms, f.replica_added_at_ms), (1_000, 7_000));
+    }
+
+    /// Gate closed (one v0.1.14 manager): legacy rule, so an old and a new
+    /// applier reach the same state.
+    #[test]
+    fn issue_146_gate_closed_keeps_legacy_mtime_bump() {
+        let mut sm = setup("v0.1.14");
+        add_copy(&mut sm, 1, 5_000);
+        assert_eq!((sm.files["/f"].updated_at_ms, sm.files["/f"].replica_added_at_ms), (5_000, 0));
+        let r = apply_request(&mut sm, &lid(2), &ClientRequest::RemoveChunkLocation {
+            path: "/f".into(), chunk_index: 0, node_id: "11".into(), disk_id: 0,
+            enforce_anchor: None, now_ms: 8_000, chunk_hash: None,
+        });
+        assert_eq!(r, ClientResponse::Success);
+        assert_eq!(sm.files["/f"].updated_at_ms, 8_000);
+    }
+
+    /// A leased (content) commit still moves the mtime with the gate open.
+    #[test]
+    fn issue_146_leased_commit_still_sets_mtime() {
+        let mut sm = setup("v0.1.15");
+        seed_lease(&mut sm, "/f");
+        let r = apply_request(&mut sm, &lid(2), &ClientRequest::UpdateChunkLocations {
+            path: "/f".into(), chunks: vec![row("11")], lease_id: "seed".into(), now_ms: 5_000, extent_from_request: true,
+        });
+        assert_eq!(r, ClientResponse::Success);
+        assert_eq!((sm.files["/f"].updated_at_ms, sm.files["/f"].replica_added_at_ms), (5_000, 0));
     }
 }

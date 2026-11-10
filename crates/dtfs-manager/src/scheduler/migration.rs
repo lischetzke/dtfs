@@ -1883,7 +1883,7 @@ mod sched_audit_tests {
             logical_size: None,
             is_directory: false,
             cache_cooldown_until_ms: std::collections::BTreeMap::new(),
-            ever_committed: None,
+            ever_committed: None, replica_added_at_ms: 0,
         }
     }
 

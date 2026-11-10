@@ -427,7 +427,7 @@ pub enum ClientRequest {
         /// #121 — a leased commit grows `logical_size` only to the extent of
         /// THIS request's rows, so a stale tail row kept by a non-aligned
         /// truncate cannot undo it. Proposers set it only once every manager
-        /// is >= `REQUEST_EXTENT_MIN_VERSION` (older appliers drop the field
+        /// is >= v0.1.15, `cluster_on_v0_1_15` (older appliers drop the field
         /// and use the whole file's rows); `false` = that legacy rule.
         #[serde(default)]
         extent_from_request: bool,

@@ -102,7 +102,7 @@ fn full_snapshot() -> StateMachineSnapshot {
         logical_size: Some(8192),
         is_directory: false,
         cache_cooldown_until_ms: cooldown,
-        ever_committed: None,
+        ever_committed: None, replica_added_at_ms: 0,
     };
     let mut snap = StateMachineSnapshot {
         last_applied_log: Some((3, 42)),
@@ -329,6 +329,14 @@ fn v1_fixtures_default_ever_committed_and_create_now_ms() {
         _ => None,
     });
     assert_eq!(create, Some(0));
+}
+
+/// #146 — the v1 snapshot predates `FileMetadata.replica_added_at_ms`.
+#[test]
+fn v1_snapshot_defaults_replica_added_at_ms() {
+    let snap = deserialize_snapshot(io::Cursor::new(SNAPSHOT_V1.as_bytes().to_vec())).unwrap();
+    assert!(!snap.files.is_empty());
+    assert!(snap.files.values().all(|f| f.replica_added_at_ms == 0));
 }
 
 /// Every top-level snapshot field except the original required six must be

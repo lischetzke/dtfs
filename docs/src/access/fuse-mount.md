@@ -74,7 +74,7 @@ Writes are buffered per chunk, flushed in batches (`write.flush_batch_chunks`, d
 
 - `opendir` takes one snapshot of the listing and serves `readdir` and `readdirplus` pages from it until `releasedir`.
 - The client counts kernel lookups per inode and drops an inode only when the count reaches zero. fuse3 batch-forget carries no counts, so an inode that was not looked up for 5 s is dropped instead.
-- Times: a new file reports its creation time; mtime then follows writes, truncates and renames. Explicit times from `utimensat` (`touch -d`, `touch -r`, `cp -p`, `rsync -t`) are ignored: there is no replicated command for them.
+- Times: a new file reports its creation time; mtime then follows writes, truncates and renames. Replica moves (repair, cache promote/demote) leave it alone once every manager runs v0.1.15 or later; with an older manager in the cluster they still change it. Explicit times from `utimensat` (`touch -d`, `touch -r`, `cp -p`, `rsync -t`) are ignored: there is no replicated command for them.
 - File attributes: symlinks are reported as symlinks (`is_symlink` from the manager); file mode overrides are kept client-side and re-keyed on rename. The metadata cache is bounded (4096 entries) and swept on its TTL.
 
 ## Locks

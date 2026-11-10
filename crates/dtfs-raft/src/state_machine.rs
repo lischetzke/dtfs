@@ -107,6 +107,12 @@ pub struct FileMetadata {
     /// file with chunks. `None` = entry from an older snapshot, unknown.
     #[serde(default)]
     pub ever_committed: Option<bool>,
+    /// #146 — when a lease-less `UpdateChunkLocations` (repair, anchor-lag,
+    /// cache promotion) last ADDED a replica row; the tiering grace reads
+    /// it so replica moves need not touch `updated_at_ms` (the mtime).
+    /// Set only once `cluster_on_v0_1_15`; 0 = never / older snapshot.
+    #[serde(default)]
+    pub replica_added_at_ms: u64,
 }
 
 impl FileMetadata {
@@ -544,7 +550,7 @@ impl StateMachineData {
                 logical_size: None,
                 is_directory: true,
                 cache_cooldown_until_ms: std::collections::BTreeMap::new(),
-                ever_committed: Some(false),
+                ever_committed: Some(false), replica_added_at_ms: 0,
             });
         }
         None
@@ -1239,7 +1245,7 @@ pub(crate) fn apply_request(
                         logical_size: None,
                         is_directory: is_dir,
                         cache_cooldown_until_ms: std::collections::BTreeMap::new(),
-                        ever_committed: Some(false),
+                        ever_committed: Some(false), replica_added_at_ms: 0,
                     },
                 );
             }
@@ -1358,7 +1364,11 @@ pub(crate) fn apply_request(
             }
 
             let mut stale_skipped: Option<Vec<u64>> = None;
+            // #146 — read before the mutable borrow; replicated state, so
+            // every applier decides the same.
+            let keep_mtime = lease_id.is_empty() && cluster_on_v0_1_15(sm);
             if let Some(file) = sm.files.get_mut(path) {
+                let rows_before = file.chunks.len();
                 if lease_id.is_empty() {
                     let skipped = union_chunk_location_entries_in_place(&mut file.chunks, chunks);
                     if !skipped.is_empty() {
@@ -1372,7 +1382,12 @@ pub(crate) fn apply_request(
                 if !file.chunks.is_empty() {
                     file.ever_committed = Some(true);
                 }
-                file.updated_at_ms = eff_now_ms;
+                if !keep_mtime {
+                    file.updated_at_ms = eff_now_ms;
+                } else if file.chunks.len() > rows_before {
+                    // A replica move is not a content change (mtime stays).
+                    file.replica_added_at_ms = eff_now_ms;
+                }
                 // RAFT-3 — `logical_size` is set once by SetFileSize (e.g.
                 // O_TRUNC → SetFileSize(0)) and never revisited, so a
                 // truncate-then-rewrite (cp, rsync --inplace, shell `>`,
@@ -1435,6 +1450,7 @@ pub(crate) fn apply_request(
             let mut dropped: u64 = 0;
             let mut affected_files: u64 = 0;
             let mut protected: u64 = 0;
+            let keep_mtime = cluster_on_v0_1_15(sm); // #146
             for (path, file) in sm.files.iter_mut() {
                 let before = file.chunks.len();
                 let is_corrupt = |c: &ChunkLocationEntry| {
@@ -1469,7 +1485,9 @@ pub(crate) fn apply_request(
                 if after < before {
                     dropped += (before - after) as u64;
                     affected_files += 1;
-                    file.updated_at_ms = eff_now_ms;
+                    if !keep_mtime {
+                        file.updated_at_ms = eff_now_ms;
+                    }
                 }
             }
             push_audit_capped(
@@ -2020,7 +2038,7 @@ pub(crate) fn apply_request(
                     logical_size: Some(target.len() as u64),
                     is_directory: false,
                     cache_cooldown_until_ms: std::collections::BTreeMap::new(),
-                    ever_committed: Some(false),
+                    ever_committed: Some(false), replica_added_at_ms: 0,
                 },
             );
             push_audit_capped(
@@ -2475,9 +2493,12 @@ pub(crate) fn apply_request(
                     ),
                 };
             }
+            let keep_mtime = cluster_on_v0_1_15(sm); // #146
             let file_mut = sm.files.get_mut(path).expect("checked above");
             file_mut.chunks.retain(|c| !is_row(c));
-            file_mut.updated_at_ms = now_ms; // proposer stamp, else log index (see top of apply_request)
+            if !keep_mtime {
+                file_mut.updated_at_ms = now_ms; // proposer stamp, else log index (see top of apply_request)
+            }
             tracing::warn!(%path, chunk_index, %node_id, disk_id, "dead-node replica row removed with data loss accepted");
             push_audit_capped(
                 &mut sm.audit_log,
@@ -2584,6 +2605,7 @@ fn apply_remove_chunk_location(
             && chunk_hash.map_or(true, |h| c.chunk_hash == h)
     };
     // Safe to drop. Mutate.
+    let keep_mtime = cluster_on_v0_1_15(sm); // #146
     let file_mut = sm.files.get_mut(path).expect("checked above");
     let before = file_mut.chunks.len();
     file_mut.chunks.retain(|c| !matches(c));
@@ -2597,7 +2619,10 @@ fn apply_remove_chunk_location(
     );
     // RAFT-4 — was a fresh `SystemTime::now()` per replica; now the
     // proposer-stamped (or `log_id.index`-fallback) deterministic value.
-    file_mut.updated_at_ms = now_ms;
+    // #146 — a replica removal is not a content change once gated.
+    if !keep_mtime {
+        file_mut.updated_at_ms = now_ms;
+    }
     ClientResponse::Success
 }
 
@@ -2648,20 +2673,21 @@ pub fn cluster_understands_named_remove(sm: &StateMachineData) -> bool {
         })
 }
 
-/// First release whose apply honours `UpdateChunkLocations.extent_from_request`.
-pub const REQUEST_EXTENT_MIN_VERSION: (u64, u64, u64) = (0, 1, 15);
+/// First release with the v0.1.15 apply rules gated by [`cluster_on_v0_1_15`].
+pub const V0_1_15_MIN_VERSION: (u64, u64, u64) = (0, 1, 15);
 
-/// #121 — may a proposer set `extent_from_request`? Same membership rule as
-/// [`cluster_understands_named_remove`], at [`REQUEST_EXTENT_MIN_VERSION`]:
-/// an older applier would grow `logical_size` from all rows while new ones
-/// use the request's rows only, diverging the state.
-pub fn cluster_understands_request_extent(sm: &StateMachineData) -> bool {
+/// Same membership rule as [`cluster_understands_named_remove`], at
+/// [`V0_1_15_MIN_VERSION`]. Gates rules an older applier would not run:
+/// #121 a proposer sets `UpdateChunkLocations.extent_from_request` only
+/// when true; #146 apply reads it (replicated state, so deterministic) and
+/// only then leaves `updated_at_ms` alone on replica-only changes.
+pub fn cluster_on_v0_1_15(sm: &StateMachineData) -> bool {
     let mut members = sm.last_membership.nodes().peekable();
     members.peek().is_some()
         && members.all(|(id, _)| {
             sm.nodes.get(id).is_some_and(|n| {
                 n.role == dtfs_common::types::NodeRole::Manager
-                    && dtfs_common::version::release_at_least(&n.version, REQUEST_EXTENT_MIN_VERSION)
+                    && dtfs_common::version::release_at_least(&n.version, V0_1_15_MIN_VERSION)
             })
         })
 }

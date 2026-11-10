@@ -517,7 +517,7 @@ mod bug_bp_tests {
             }).collect(),
             created_at_ms: 0, updated_at_ms: 0,
             symlink_target: link, logical_size: None, is_directory: dir,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: Some(true),
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: Some(true), replica_added_at_ms: 0,
         };
         let with = |mut f: FileMetadata, size: Option<u64>, ever: Option<bool>| {
             f.logical_size = size;
@@ -1578,7 +1578,7 @@ mod bug_bv3_data_node_count_tests {
                 symlink_target: None,
                 logical_size: None,
                 is_directory: false,
-                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
+                cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None, replica_added_at_ms: 0,
             },
         );
 
@@ -1694,7 +1694,7 @@ mod cnf1_stable_disk_id_tests {
             symlink_target: None,
             logical_size: None,
             is_directory: false,
-            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(), ever_committed: None, replica_added_at_ms: 0,
         });
 
         assert_eq!(
