@@ -48,6 +48,9 @@ impl IntegrityFaultCollector {
     /// At cap, drops the oldest entry to keep the buffer bounded
     /// (avoids unbounded growth if the mgr is unreachable for a
     /// long time — fresh faults are more informative than stale).
+    /// Test-only since f5079f8/8db9de1: read-path mismatches are quarantined
+    /// and reported disk-keyed, no node-wide fault is recorded.
+    #[cfg(test)]
     pub fn record(&self, fault: IntegrityFault) {
         if self.quarantine_on_fault.load(Ordering::Acquire) {
             self.self_quarantined.store(true, Ordering::Release);

@@ -626,6 +626,7 @@ impl ChunkStore {
     /// this path (Bug I parity for the read side: pre-fix `replicate_to`
     /// pulled the whole chunk into a heap `Bytes`, which under the
     /// 2026-06-06 task storm pinned the data node at its memory cap).
+    #[cfg(test)]
     pub async fn chunk_file_path(&self, chunk_id: &ChunkId) -> Option<(std::path::PathBuf, u64)> {
         self.chunk_file_path_on_disk(chunk_id, None).await
     }
