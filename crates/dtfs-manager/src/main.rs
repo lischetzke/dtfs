@@ -87,32 +87,11 @@ async fn main() -> anyhow::Result<()> {
     let log_store_path = config.node.data_dir.join("raft-log");
     let sm_dir = config.node.data_dir.join("raft-sm");
 
-    // Bug AC — poisoned-Raft-state detector. Before handing the local
-    // state to openraft, peek at the on-disk vote/log/snapshot triple.
-    // If we crashed into a stuck-candidate state (term inflated wildly
-    // by repeated self-vote elections while isolated, log lagging
-    // behind by hundreds of entries), wipe the local state so that on
-    // the next iteration we rejoin via InstallSnapshot from the
-    // current leader.
-    //
-    // We rename rather than delete so the operator can forensically
-    // inspect what was poisoned. Renamed dirs are not auto-deleted.
-    //
-    // Detection criteria (all must hold):
-    //   * vote.term >= 100              — many failed elections
-    //   * vote NOT committed            — we never won
-    //   * vote.node == self             — voting for ourselves (isolation)
-    //   * applied_index <= snapshot_idx  + 10  — barely caught up
-    //   * log.last_index - applied > 500 — huge replay backlog
-    //
-    // If ANY criterion is missing, we leave the state alone — false
-    // positive risk is real (e.g. a long-running healthy follower
-    // might briefly have a high uncommitted vote during an election).
-    if let Err(e) =
-        maybe_recover_poisoned_raft_state(&log_store_path, &sm_dir).await
-    {
-        tracing::warn!(error = %e, "Bug AC poisoned-state check failed; proceeding anyway");
-    }
+    // Issue #145 — no automatic wipe of raft-log / raft-sm here. A voter that
+    // forgets its vote and acknowledged entries can help elect a leader that
+    // lacks committed entries; an inflated term on an intact log heals on its
+    // own once the node reaches the leader. Manual recovery:
+    // docs/src/operations/cluster-management.md.
 
     // 1. Open the RocksDB log store with bounded info-LOG / MANIFEST (BP-1).
     let log_store = dtfs_raft::log_store::LogStore::new_with_opts(
@@ -893,150 +872,6 @@ async fn manager_self_register_lifecycle(
             );
         }
     }
-}
-
-/// Bug AC — pre-init poisoned-Raft-state detector + auto-recovery.
-///
-/// Inspects the local log store + state machine snapshot without
-/// handing them to openraft. If the triple is "poisoned" (term has
-/// inflated by hundreds of failed self-vote elections while
-/// isolated, with the state machine miles behind the log), renames
-/// the directories to backups so the next openraft initialization
-/// starts fresh. The leader then snapshot-installs us back into the
-/// cluster.
-///
-/// This trades a small startup delay (peek a few RocksDB keys) for
-/// eliminating the most common Raft-stuck failure mode in multi-DC
-/// clusters under intermittent network conditions.
-async fn maybe_recover_poisoned_raft_state(
-    log_store_path: &std::path::Path,
-    sm_dir: &std::path::Path,
-) -> anyhow::Result<()> {
-    use std::fs;
-    use std::time::SystemTime;
-
-    if !log_store_path.exists() || !sm_dir.exists() {
-        // First boot — nothing to recover.
-        return Ok(());
-    }
-
-    // Peek log + vote without opening as RaftLogStorage. We open the
-    // log store read-only here, then drop the handle BEFORE openraft
-    // re-opens it. Avoids long-lived dual handles.
-    let (last_log_id, vote) = {
-        let ls = dtfs_raft::log_store::LogStore::new(log_store_path)?;
-        let llid = ls.peek_last_log_id().ok().flatten();
-        let v = ls.peek_vote().ok().flatten();
-        // ls dropped here; RocksDB releases its lock.
-        (llid, v)
-    };
-
-    // Peek last_applied from the on-disk snapshot. The snapshot file
-    // contains the state machine's last_log_id at the time it was
-    // taken; the running state machine catches up from there via
-    // the log.
-    let snapshot_applied_idx = {
-        let sm = dtfs_raft::state_machine::StateMachineStore::open_at(sm_dir)?;
-        let data = sm.data().read().await;
-        let idx = data.last_applied_log.as_ref().map(|l| l.index).unwrap_or(0);
-        drop(data);
-        // sm dropped here.
-        idx
-    };
-
-    let last_log_index = last_log_id.as_ref().map(|l| l.index).unwrap_or(0);
-    let last_log_term = last_log_id
-        .as_ref()
-        .map(|l| {
-            // Term lives inside LeaderId — extract via Debug fallback so
-            // we don't depend on internal accessor stability.
-            // LogId display: term-index; vote term is usually the same shape.
-            // openraft 0.10 has `l.leader_id.term` but the API may shift; pull
-            // it through serde-stable Display:
-            let s = format!("{:?}", l);
-            // "LogId { leader_id: LeaderId { term: 19, ... }, index: 100 }"
-            s.split("term: ")
-                .nth(1)
-                .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0)
-        })
-        .unwrap_or(0);
-    let vote_term = vote
-        .as_ref()
-        .map(|v| {
-            // Vote's LeaderId is the same shape.
-            let s = format!("{:?}", v);
-            s.split("term: ")
-                .nth(1)
-                .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0)
-        })
-        .unwrap_or(0);
-    let vote_committed = vote
-        .as_ref()
-        .map(|v| v.is_committed())
-        .unwrap_or(false);
-    let applied_log_lag = last_log_index.saturating_sub(snapshot_applied_idx);
-
-    // Detection: ALL of the following must be true.
-    let too_many_failed_elections = vote_term >= 100;
-    let term_jumped_way_above_log = vote_term > last_log_term + 50;
-    let huge_applied_lag = applied_log_lag > 500;
-    let vote_never_committed = !vote_committed;
-
-    tracing::info!(
-        vote_term,
-        vote_committed,
-        last_log_index,
-        last_log_term,
-        snapshot_applied_idx,
-        applied_log_lag,
-        "Bug AC pre-init Raft state peek"
-    );
-
-    if !(too_many_failed_elections
-        && term_jumped_way_above_log
-        && huge_applied_lag
-        && vote_never_committed)
-    {
-        // Healthy state — leave as is.
-        return Ok(());
-    }
-
-    tracing::error!(
-        vote_term,
-        last_log_index,
-        last_log_term,
-        snapshot_applied_idx,
-        applied_log_lag,
-        "Bug AC POISONED RAFT STATE DETECTED — wiping local raft-log + raft-sm so this manager rejoins via InstallSnapshot from the leader"
-    );
-
-    // Rename rather than delete so an operator can inspect what was wiped.
-    let ts = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let log_backup = log_store_path.with_extension(format!("poisoned.{ts}"));
-    let sm_backup = sm_dir.with_extension(format!("poisoned.{ts}"));
-    if let Err(e) = fs::rename(log_store_path, &log_backup) {
-        tracing::error!(error = %e, "Bug AC failed to rename raft-log; manual recovery required");
-        anyhow::bail!("rename raft-log: {e}");
-    }
-    if let Err(e) = fs::rename(sm_dir, &sm_backup) {
-        tracing::error!(error = %e, "Bug AC failed to rename raft-sm; manual recovery required");
-        // Try to put the log back so we don't leave half-recovered state.
-        let _ = fs::rename(&log_backup, log_store_path);
-        anyhow::bail!("rename raft-sm: {e}");
-    }
-    tracing::warn!(
-        log_backup = %log_backup.display(),
-        sm_backup = %sm_backup.display(),
-        "Bug AC poisoned raft state moved to backup; fresh state will be initialized + snapshot-installed from leader"
-    );
-    Ok(())
 }
 
 /// Bug CK — operator-facing error for a server listener that cannot bind.

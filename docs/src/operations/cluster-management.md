@@ -88,9 +88,12 @@ candidate, poisoned vote, corrupt log):
 3. Start the service. The manager rejoins as a follower and installs a
    snapshot from the leader.
 
-The Bug AC poisoned-state detector performs this wipe automatically on
-startup when it detects a stuck-candidate state; the manual procedure covers
-cases the detector does not catch. Note again: this only works for a node
+The manager never does this wipe by itself (the old Bug AC auto-wipe was
+removed in v0.1.15): a wiped voter forgets its vote and the entries it
+acknowledged. Wipe only one manager at a time, only while the others hold
+quorum, and not merely because its term is high: an isolated manager with an
+intact log inflates its term and still rejoins on its own once it reaches
+the leader. Note again: this only works for a node
 already in the membership — wiping a never-joined manager just leaves it
 empty.
 

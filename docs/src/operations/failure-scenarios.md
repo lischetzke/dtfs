@@ -109,10 +109,10 @@ caller sees one retried RPC, not an error.
 
 **Re-join is automatic.** A manager that comes back online replays
 its Raft log against the current leader's log. If its log is too far
-behind, it pulls a snapshot and applies the tail. The poisoned-state
-detector (Bug AC) covers the corner case where a manager comes up as
-a stuck candidate — it wipes its own vote and log and rejoins as a
-follower.
+behind, it pulls a snapshot and applies the tail. A manager that was
+isolated and inflated its term rejoins the same way once it reaches the
+leader; it never wipes its own state (manual recovery:
+[Cluster Management](./cluster-management.md)).
 
 See also: [Consensus (Raft)](../architecture/consensus.md),
 [Cluster Management](./cluster-management.md).

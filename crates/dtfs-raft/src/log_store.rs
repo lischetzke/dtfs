@@ -180,8 +180,7 @@ impl LogStore {
     }
 
     /// Bug AC — peek at the persisted vote without acquiring `&mut self`
-    /// or going through the full RaftLogStorage trait. Used by the
-    /// pre-init poisoned-state detector in main.rs.
+    /// or going through the full RaftLogStorage trait (diagnostics).
     pub fn peek_vote(&self) -> Result<Option<Vote>, io::Error> {
         let cf = self.db.cf_handle(CF_META).expect("meta CF");
         match self.db.get_cf(&cf, META_KEY_VOTE) {
@@ -210,7 +209,7 @@ impl LogStore {
     }
 
     /// Bug AC — peek the last log entry's `LogId` without consuming
-    /// any iterator state. Used for poisoned-state detection.
+    /// any iterator state (diagnostics).
     pub fn peek_last_log_id(&self) -> Result<Option<LogId>, io::Error> {
         let cf = self.db.cf_handle(CF_LOGS).expect("logs CF");
         let mut iter = self.db.iterator_cf(&cf, rocksdb::IteratorMode::End);
