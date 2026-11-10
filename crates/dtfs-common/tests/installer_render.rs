@@ -60,6 +60,22 @@ fn rendered_manager_config_loads_with_matching_voter_hostnames() {
     assert!(cfg.cluster.initial_voters.iter().any(|v| v.hostname == "mgr02"));
 }
 
+/// #152 — `--allow-non-mountpoint` renders the opt-out on every disk; the
+/// default renders none, so a fresh unmounted disk still refuses to start.
+#[test]
+fn data_disks_allow_non_mountpoint_only_when_opted_in() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("data.toml");
+    for (flag, want) in [("0", false), ("1", true)] {
+        let env = with(&[("ROLE", "data"), ("MGR_LIST", "10.0.0.1:9401"), ("ALLOW_NON_MOUNTPOINT", flag)]);
+        let (ok, out) = render("data", &p, &env);
+        assert!(ok, "{out}");
+        let cfg: DataNodeConfig = load_config(&p).expect("rendered data.toml must load");
+        assert_eq!(cfg.disks.len(), 2);
+        assert!(cfg.disks.iter().all(|disk| disk.allow_non_mountpoint == want), "flag {flag}");
+    }
+}
+
 #[test]
 fn rendered_data_and_fuse_configs_load_and_strip_hostnames() {
     let d = tempfile::tempdir().unwrap();

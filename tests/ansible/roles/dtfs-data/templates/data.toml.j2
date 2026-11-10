@@ -34,6 +34,9 @@ mode = "{{ dtfs_tls_mode | default('off') }}"
 [[disks]]
 path = "{{ disk.path }}"
 tier = "{{ disk.tier }}"
+# Test harness: tasks/main.yml creates the disk paths as plain directories,
+# not mounted filesystems; without this a fresh node refuses to start (#152).
+allow_non_mountpoint = true
 
 {% endfor %}
 [cache]

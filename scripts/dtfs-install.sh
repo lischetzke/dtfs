@@ -66,6 +66,9 @@ Config flags (also usable interactively as prompt defaults):
                                the hostname=addr form and ignore the name.
   --chown-disks                data role: chown the disk paths to dtfs:dtfs
                                (default: only print the chown command)
+  --allow-non-mountpoint       data role: render allow_non_mountpoint = true
+                               on every disk, so a plain directory (no mounted
+                               filesystem) is accepted on first start (dev/test)
   --bootstrap true|false (manager)  --disks /a,/b (data)
   --mountpoint P (fuse-client)
   --minisign-key K             verify the release: K is a minisign public key
@@ -106,6 +109,7 @@ SHARED_SECRET="${DTFS_SHARED_SECRET:-}"
 BOOTSTRAP=""
 DISKS=""
 CHOWN_DISKS=0
+ALLOW_NON_MOUNTPOINT=0
 MINISIGN_KEY="${DTFS_MINISIGN_PUBKEY:-}"
 SUMS_URL_BASE=""   # set by the remote download; where SHA256SUMS(.minisig) live
 MOUNTPOINT=""
@@ -136,6 +140,7 @@ while [ $# -gt 0 ]; do
         --bootstrap)    shift; BOOTSTRAP="${1:-}" ;;
         --disks)        shift; DISKS="${1:-}" ;;
         --chown-disks)  CHOWN_DISKS=1 ;;
+        --allow-non-mountpoint) ALLOW_NON_MOUNTPOINT=1 ;;
         --minisign-key) shift; MINISIGN_KEY="${1:-}" ;;
         --mountpoint)   shift; MOUNTPOINT="${1:-}" ;;
         --role)
@@ -661,8 +666,11 @@ EOF
 [[disks]]
 path = "${DKS[$i]}"
 tier = "$tier"
-
 EOF
+        if [ "${ALLOW_NON_MOUNTPOINT:-0}" -eq 1 ]; then
+            echo 'allow_non_mountpoint = true' >> "$CFG"
+        fi
+        echo >> "$CFG"
     done
     cat >> "$CFG" <<EOF
 [scrub]
@@ -723,7 +731,11 @@ case "$ROLE" in
         printf '[Service]\nReadWritePaths=%s\n' "$(for d in $DISK_PATHS; do printf -- '-%s ' "$d"; done)" \
             > /etc/systemd/system/dtfs-data.service.d/disks.conf
         for d in $DISK_PATHS; do
-            [ -d "$d" ] || { warn "disk path $d does not exist; mount it and restart dtfs-data"; continue; }
+            [ -d "$d" ] || { warn "disk path $d does not exist; mount it and restart dtfs-data (for a plain directory instead: create it and re-run with --reconfigure --allow-non-mountpoint)"; continue; }
+            if ! grep -q '^allow_non_mountpoint = true' "$CFG" && command -v mountpoint >/dev/null \
+                && ! mountpoint -q "$d" && [ ! -e "$d/.dtfs-disk-id" ]; then
+                warn "disk path $d is not a mount point; dtfs-data refuses to initialise it. Mount the disk, or re-run with --reconfigure --allow-non-mountpoint to accept a plain directory"
+            fi
             if [ "$CHOWN_DISKS" -eq 1 ]; then chown dtfs:dtfs "$d"; fi
             if ! runuser -u dtfs -- test -w "$d" 2>/dev/null; then
                 warn "user dtfs cannot write $d; run: chown dtfs:dtfs $d  (or re-run with --chown-disks)"
