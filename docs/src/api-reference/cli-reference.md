@@ -21,8 +21,8 @@ Mutations must go to the leader (or the call returns `409`/`503`; see [REST API]
 
 | Code | Meaning |
 |---|---|
-| `0` | Success. Also: `update` answered `n` at the prompt (nothing installed). |
-| `1` | Any failure: connection error, non-success HTTP status, validation failure, a partially failed operation (see `files flush-cache`), `health` with a non-healthy status, update verification failure. |
+| `0` | Success. |
+| `1` | Any failure: connection error, non-success HTTP status, validation failure, a partially failed operation (see `files flush-cache`), `health` with a non-healthy status, update verification failure, `update` aborted at the prompt (answered `n` or no terminal input; nothing installed). |
 | `2` | Usage error (unknown flag, missing argument). |
 
 Error reporting differs by command. Read commands (`status`, `stats`, `nodes`, `files list`, `files inspect`, `audit`, `integrity faults`, `volumes list`, `volumes show`, `config`, `config effective`, `raft members`, `health`) and the mutations `volumes create`, `volumes migrate-policy`, `volumes set-cache`, `volumes set-mandatory`, `volumes set-write-safety`, `scrub` and `maintenance` report only the HTTP status line on failure. `volumes set-anchor`, `volumes set-spill`, `files flush-cache`, `scrub orphans` and `migrations create` print `HTTP <status>: <server error>` (for example `anchor.required_tier = Cold but mandatory_replicas.cold = 0`). `unquarantine`, `decommission`, `config set` and `raft add-learner|promote|remove` print the full JSON error body. To see the body of the first group, repeat the call with `curl`.
@@ -112,7 +112,7 @@ Updates binaries on **this host** (run as root). The rolling cluster-wide update
 | `--token <token>` | Optional GitHub token (rate limits or a private fork). Precedence: flag, `DTFS_REPO_TOKEN`, `[updater].token`. Sent as `Authorization: Bearer` on the first request only. |
 | `--no-restart` | Install but leave services on the old binary until their next restart. |
 | `--force` | Reinstall and restart a binary that is already at the release version. |
-| `-y`, `--yes` | Skip the `Proceed? [y/N]` prompt (otherwise the command prompts; with no terminal input it prints `aborted; nothing installed` and still exits `0`, so always pass `-y` in automation). |
+| `-y`, `--yes` | Skip the `Proceed? [y/N]` prompt (otherwise the command prompts; with no terminal input it prints `aborted; nothing installed` and exits `1`, so always pass `-y` in automation). |
 
 Sequence:
 
