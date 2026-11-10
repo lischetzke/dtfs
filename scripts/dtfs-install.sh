@@ -607,9 +607,6 @@ initial_voters = [
 ${VOTERS}]
 
 [raft]
-heartbeat_interval_ms = 50
-election_timeout_ms = 300
-snapshot_threshold = 200
 
 [grpc]
 listen_addr = "0.0.0.0:9401"

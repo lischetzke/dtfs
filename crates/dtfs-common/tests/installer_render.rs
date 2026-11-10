@@ -309,3 +309,18 @@ gate "" "dtfs-cli v0.1.13 (built x)" ""
     let res: Vec<&str> = out.lines().filter(|l| l.starts_with("ok:") || *l == "refused").collect();
     assert_eq!(res, ["refused", "ok:v0.1.14", "ok:v0.1.15", "ok:v0.1.13"], "{out}");
 }
+
+/// #126: the installer leaves Raft timing to the code defaults.
+#[test]
+fn rendered_manager_config_uses_default_raft_settings() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("manager.toml");
+    let env = with(&[("ROLE", "manager"), ("BOOTSTRAP", "true"), ("MGR_LIST", "mgr01=10.0.0.1:9401")]);
+    let (ok, out) = render("manager", &p, &env);
+    assert!(ok, "{out}");
+    let cfg: ManagerConfig = load_config(&p).unwrap();
+    assert_eq!(
+        (cfg.raft.heartbeat_interval_ms, cfg.raft.election_timeout_ms, cfg.raft.snapshot_threshold),
+        (150, 400, 10000)
+    );
+}
