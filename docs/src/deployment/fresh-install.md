@@ -47,7 +47,7 @@ exactly those three entries.
    cluster) but then every other manager must be added by Step 2.
 3. Within about 20 seconds the leader creates the `default` volume from its
    `[defaults]` while the cluster has no volume at all (create-only, so it
-   never overwrites later volume edits or recreates a deleted `default`) and takes an early snapshot. `[defaults]` is therefore consumed once,
+   never overwrites later volume edits; a deleted `default` is recreated only while some file still uses it) and takes an early snapshot. `[defaults]` is therefore consumed once,
    here; later changes go through the volume API.
 
 Gate (for each voter):

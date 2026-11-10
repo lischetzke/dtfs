@@ -91,7 +91,7 @@ the same build to GitHub Pages and the pages to the GitHub Wiki
 | `scripts/` | Build, release, install, healthcheck and docs scripts |
 | `docker/` | The build and test image |
 | `tools/dtfs-mcp/` | MCP server for diagnosing a live cluster |
-| `tests/` | Integration, chaos, performance and lab harnesses |
+| `tests/` | `integration/` (dev-cluster scripts), `proxmox/` and `release/` (the lab release gate, chaos cases included) |
 | `docs/` | Documentation source |
 
 ## Contributing

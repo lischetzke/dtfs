@@ -96,7 +96,7 @@ Volume ids are lowercase names with spaces turned into `-`. Field meanings: [Vol
 
 ```
 dtfs-cli update <target> [--check] [--tag <tag>] [--repo-url <url>] [--install-dir <dir>]
-                [--config <file>] [--token <token>] [--no-restart] [--force] [-y|--yes]
+                [--config <file>] [--token <token>] [--minisign-key <key>] [--no-restart] [--force] [-y|--yes]
 ```
 
 Updates binaries on **this host** (run as root). The rolling cluster-wide update is the pipeline playbook, see [CI Pipeline](../operations/ci-pipeline.md).
@@ -110,15 +110,16 @@ Updates binaries on **this host** (run as root). The rolling cluster-wide update
 | `--install-dir <dir>` | Default `[updater].install_dir`, else `/usr/local/bin`. |
 | `--config <file>` | File to read `[updater]` from. Default `/etc/dtfs/<role>.toml` (`manager`, `data`, `fuse`); none for `cli` and `all`. |
 | `--token <token>` | Optional GitHub token (rate limits or a private fork). Precedence: flag, `DTFS_REPO_TOKEN`, `[updater].token`. Sent as `Authorization: Bearer` on the first request only. |
+| `--minisign-key <key>` | Minisign public key (base64 line or `.pub` text) used to verify `SHA256SUMS`. Precedence: flag, `DTFS_MINISIGN_PUBKEY`, `[updater].minisign_public_key`. Blank values are skipped. |
 | `--no-restart` | Install but leave services on the old binary until their next restart. |
 | `--force` | Reinstall and restart a binary that is already at the release version. |
-| `-y`, `--yes` | Skip the `Proceed? [y/N]` prompt (otherwise the command prompts; with no terminal input it prints `aborted; nothing installed` and exits `1`, so always pass `-y` in automation). |
+| `-y`, `--yes` | Skip the `Proceed? [y/N]` prompt and the no-minisign-key prompt (step 3) (otherwise the command prompts; with no terminal input it prints `aborted; nothing installed` and exits `1`, so always pass `-y` in automation). |
 
 Sequence:
 
 1. Resolve the tarball (`dtfs-linux-amd64.tar.gz`) from the GitHub release (`.../releases/download/<tag>/` or `releases/latest/download/`).
 2. Download to a private temporary directory.
-3. **Minisign verification** when a public key is configured (`[updater].minisign_public_key` or `DTFS_MINISIGN_PUBKEY`; env wins): also download `SHA256SUMS` and `SHA256SUMS.minisig` from the same location, verify the signature, and require the tarball's SHA-256 to match the signed `SHA256SUMS`. Any failure aborts before extraction. Without a key a warning is printed and only the in-tarball `MANIFEST` is checked.
+3. **Minisign verification** when a public key is configured (`--minisign-key`, `DTFS_MINISIGN_PUBKEY` or `[updater].minisign_public_key`, in that order): also download `SHA256SUMS` and `SHA256SUMS.minisig` from the same location, verify the signature, and require the tarball's SHA-256 to match the signed `SHA256SUMS`. Any failure aborts before extraction. Without a key a warning is printed and only the in-tarball `MANIFEST` is checked. Without a key and without `-y`, the command also asks before running the staged binaries' `--version` (step 5); declining aborts with exit `1` (`aborted before running unverified binaries; nothing installed`).
 4. Extract and verify every target binary against the tarball `MANIFEST` SHA-256; one mismatch aborts with nothing installed.
 5. Run each staged binary's `--version`. A binary whose version cannot be read aborts the update. With `--tag T` every binary must report `T` (leading `v` optional); without `--tag` a binary older than the installed one is refused as a downgrade (use `--tag` to downgrade). `--force` bypasses neither check. This binds the signed asset set to a version, since `SHA256SUMS` itself names none. A binary whose installed version token is the same (`v0.1.14` = `v0.1.14`, build date ignored) is skipped, unless `--force`. When every target is skipped the command prints `up to date` and exits `0` without installing or restarting anything.
 6. Print the plan and ask for confirmation.

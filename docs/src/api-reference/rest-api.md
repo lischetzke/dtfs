@@ -140,8 +140,8 @@ All three are leader-only (`409` with leader hint otherwise) and need the secret
 
 | Endpoint | Body | Success response | Errors |
 |---|---|---|---|
-| `POST /api/v1/raft/add-learner` | `{"hostname", "addr", "shared_secret"}` | `{"status":"ok","node_id","hostname","addr","log_index"}` | `400` missing/wildcard `addr` or a hostname that collides with a registered data or client node; `503` Raft change failed |
-| `POST /api/v1/raft/promote` | `{"hostname", "shared_secret"}` | `{"status":"ok","node_id","hostname","log_index"}` | `404` not a member (add-learner first); `409` already a voter; `503` |
+| `POST /api/v1/raft/add-learner` | `{"hostname", "addr", "shared_secret"}` | `{"status":"ok","node_id","hostname","addr","log_index"}` | `400` missing/wildcard `addr` or a hostname that collides with a registered data or client node; `409` the target is not a registered manager at the open gate's minimum release (v0.1.15 once `cluster_on_v0_1_15` holds, else v0.1.14 once the named-remove gate holds); `503` Raft change failed |
+| `POST /api/v1/raft/promote` | `{"hostname", "shared_secret"}` | `{"status":"ok","node_id","hostname","log_index"}` | `404` not a member (add-learner first); `409` already a voter, or the target is not a registered manager at the open gate's minimum release (v0.1.15 once `cluster_on_v0_1_15` holds, else v0.1.14 once the named-remove gate holds); `503` |
 | `POST /api/v1/raft/remove` | `{"hostname", "shared_secret"}` | `{"status":"ok","node_id","hostname","was_voter","log_index"}` | `404` not a member; `400` last voter; `503` |
 
 ## Nodes
@@ -170,7 +170,7 @@ Body `{"operator_id": "<label>", "reason": "<text, optional>"}`. Response `{"nod
 
 Leader only (`409` not leader). Body `{"operator_id": "<label, required>", "reason": "<text>", "accept_data_loss": false, "dry_run": false}`. The node must be `Down` or `Failed` and silent for at least `down_after_missed * heartbeat_interval_secs` (`409` otherwise; `404` unknown node). Rows with another live replica are removed through the guarded `RemoveChunkLocation`; rows that would strand the volume anchor stay (`anchor_pending`); rows with no live replica are `data_loss_candidates`, removed only when `accept_data_loss` is true. The node is deregistered once no rows remain.
 
-Response: `{"node_id", "dry_run", "accept_data_loss", "removable", "anchor_pending", "data_loss_candidates", "sample": {"removable": [...], "anchor_pending": [...], "data_loss": [...]}}` (samples are up to 5 `path#chunk_index` strings), A non-dry run returns at once with `"running": true` and executes in the background on that manager (one run at a time; a second POST meanwhile gets `409`). `GET /api/v1/nodes/{id}/remove-dead` on the same manager returns the run (`404` if this manager has none for that node): the plan fields plus `running`, and once `running` is false `removed`, `data_loss_removed`, `failed`, `remaining_rows`, `deregistered` and `deregister_error` on a failed deregister. The run status is process-local and lost on restart. Safe to repeat.
+Response: `{"node_id", "dry_run", "accept_data_loss", "removable", "anchor_pending", "data_loss_candidates", "sample": {"removable": [...], "anchor_pending": [...], "data_loss": [...]}}` (samples are up to 5 `path#chunk_index` strings), A non-dry run returns at once with `"running": true` and executes in the background on that manager (one run at a time; a second POST meanwhile gets `409`). `GET /api/v1/nodes/{id}/remove-dead` on the same manager returns the run (`404` if this manager has none for that node): the plan fields plus `running`, and once `running` is false `removed`, `data_loss_removed`, `failed`, `remaining_rows`, `deregistered` and `deregister_error` on a failed deregister. `aborted` (`node no longer down` or `leader lost`) is set when the run stopped early; the node is then not deregistered. The run status is process-local and lost on restart. Safe to repeat.
 
 ## Files
 

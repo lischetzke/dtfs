@@ -57,14 +57,14 @@ Enable `true` once every manager runs a build that signs Raft RPCs. An empty sha
 
 ## ManagerService (`manager.proto`)
 
-Used by FUSE clients (metadata, leases, locks), data nodes (registration, heartbeat) and peer managers (`ForwardClientWrite`). Any manager serves these; writes are applied through Raft, and a follower forwards them to the leader.
+Used by FUSE clients (metadata, leases), data nodes (registration, heartbeat) and peer managers (`ForwardClientWrite`). Any manager serves these; writes are applied through Raft, and a follower forwards them to the leader.
 
 ### Namespace
 
 | RPC | Request | Response |
 |---|---|---|
 | `CreateFile` | `path`, optional `volume_id` | `success`, `chunk_size`, `volume_id` |
-| `GetFileLocations` | `path` | `path`, `total_size`, `chunks` (`ChunkLocationInfo`), `chunk_size`, `created_at_ms`, `modified_at_ms`, `is_directory`, `volume_id`, `is_symlink` |
+| `GetFileLocations` | `path`, optional `omit_chunks` (attributes only, no chunk list; an older manager ignores it and sends chunks) | `path`, `total_size`, `chunks` (`ChunkLocationInfo`), `chunk_size`, `created_at_ms`, `modified_at_ms`, `is_directory`, `volume_id`, `is_symlink` |
 | `DeleteFile` | `path` | `success` |
 | `ListDirectory` | `path` | `entries` (`DirectoryEntry`) |
 | `RenameFile` | `from`, `to` | `success`, `error` |
@@ -84,12 +84,12 @@ Order used by the FUSE client: `AcquireWriteLease`, `AllocateChunks`, stream `Pu
 
 | RPC | Request | Response |
 |---|---|---|
-| `AllocateChunks` | `path`, `num_chunks`, `volume_id`, `preferred_tier`, `exclude_addrs`, `requester_location` (the FUSE client's full `[location]`), optional `defer_anchor` | `placements`: per chunk `chunk_index`, `primary_address`, `replica_addresses`, `tier`. Placement follows the file's own volume. `defer_anchor = true` from outside the anchor datacenter skips the forced anchor slot (FUSE `write.anchor_sync = false`). |
+| `AllocateChunks` | `path`, `num_chunks`, `volume_id`, `preferred_tier`, `exclude_addrs`, `requester_location` (the FUSE client's full `[location]`), optional `defer_anchor` | `placements`: per chunk `chunk_index`, `primary_address`, `replica_addresses`, `tier`. Placement follows the file's own volume. `defer_anchor = true` from outside the anchor datacenter skips the forced anchor slot (FUSE `write.anchor_sync = false`). Also `ack_floor` (the write ack floor for the path; 0 means an older manager and the writer then assumes 2) and `anchor_addresses` (anchor-DC targets the writer re-puts until one acks; empty with `defer_anchor`, with no anchor DC, or from an older manager). |
 | `CommitChunkLocations` | `path`, `volume_id`, `lease_id`, `chunks` (`ChunkLocationCommit`: `chunk_index`, `chunk_id`, `primary_address`, `size_bytes`, `disk_id`) | `success`, `lease_conflict`, `error`. Rejected when a chunk landed on fewer distinct `(node_id, disk_id)` replicas than the volume's `write_safety.min_replicas_before_ack` (after clamping). |
 
 `ChunkLocationCommit.disk_id` must be the `disk_id` returned by `PutChunkResponse`; the manager resolves the replica's tier from it.
 
-### Leases and locks
+### Leases
 
 | RPC | Request | Response |
 |---|---|---|

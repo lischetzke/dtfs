@@ -98,7 +98,7 @@ See also: [Disk Management](./disk-management.md),
 
 **Raft tolerates `(N-1)/2` failures.** A three-manager quorum survives
 one failure. The leader (if it was the leader that died) is replaced
-in `election_timeout_min..election_timeout_max` (default ~1 second).
+within `raft.election_timeout_ms` to 2 x that (default 400-800 ms).
 Metadata reads continue throughout; writes pause for the duration of
 the election (sub-second under normal conditions).
 
