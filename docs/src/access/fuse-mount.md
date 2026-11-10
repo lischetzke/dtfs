@@ -79,7 +79,7 @@ Writes are buffered per chunk, flushed in batches (`write.flush_batch_chunks`, d
 
 ## Locks
 
-`fcntl` byte-range locks are tracked inside the client process only. Ranges from the kernel are inclusive; unlock carves the owner's ranges instead of dropping a whole overlapping lock, and `flush` drops the closing owner's locks. The manager lock RPCs exist but are not used, so locks do **not** coordinate between two mounts.
+`fcntl` byte-range locks are tracked inside the client process only. Ranges from the kernel are inclusive; unlock carves the owner's ranges instead of dropping a whole overlapping lock, and `flush` drops the closing owner's locks. There is no cluster-wide lock service (the unused manager lock RPCs were removed), so locks do **not** coordinate between two mounts.
 
 ## Memory
 

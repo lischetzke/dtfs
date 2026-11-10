@@ -44,16 +44,8 @@ service ManagerService {
   // Total/used cluster capacity (statvfs backing)
   rpc ClusterCapacity(ClusterCapacityRequest) returns (ClusterCapacityResponse);
 
-  // --- Cross-host fcntl coordination (F-039) ---
-
-  // Acquire a POSIX byte-range lock through the cluster
-  rpc AcquireLock(AcquireLockRequest) returns (AcquireLockResponse);
-
-  // Release a previously-acquired byte-range lock
-  rpc ReleaseLock(ReleaseLockRequest) returns (ReleaseLockResponse);
-
-  // Probe whether a lock would block (F_GETLK)
-  rpc ProbeLock(ProbeLockRequest) returns (ProbeLockResponse);
+  // AcquireLock / ReleaseLock / ProbeLock (F-039) were removed unused (#140);
+  // do not reuse those method or message names.
 
   // --- Single-writer leases (P0-1) ---
   // Prevent two FUSE clients from concurrently writing the same path; the
@@ -173,52 +165,6 @@ message ClusterCapacityResponse {
   uint64 total_bytes = 1;
   uint64 used_bytes = 2;
   uint64 file_count = 3;
-}
-
-// --- Distributed fcntl lock messages ---
-
-message AcquireLockRequest {
-  string path = 1;
-  string owner_id = 2;  // unique per (host, FUSE process, kernel lock_owner)
-  uint64 start = 3;
-  uint64 end = 4;
-  bool write = 5;       // false = shared (read), true = exclusive (write)
-  bool blocking = 6;    // true = caller can wait, false = non-blocking
-  uint64 lease_ms = 7;  // lock validity; manager evicts after this without renew
-}
-message AcquireLockResponse {
-  bool granted = 1;
-  // If not granted: who currently holds a conflicting lock.
-  string conflict_owner = 2;
-  uint64 conflict_start = 3;
-  uint64 conflict_end = 4;
-  bool conflict_write = 5;
-}
-
-message ReleaseLockRequest {
-  string path = 1;
-  string owner_id = 2;
-  uint64 start = 3;
-  uint64 end = 4;
-}
-message ReleaseLockResponse {
-  bool ok = 1;
-}
-
-message ProbeLockRequest {
-  string path = 1;
-  string owner_id = 2;
-  uint64 start = 3;
-  uint64 end = 4;
-  bool write = 5;
-}
-message ProbeLockResponse {
-  // True if this owner could acquire right now.
-  bool would_grant = 1;
-  string conflict_owner = 2;
-  uint64 conflict_start = 3;
-  uint64 conflict_end = 4;
-  bool conflict_write = 5;
 }
 
 // --- Single-writer lease messages (P0-1) ---

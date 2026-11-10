@@ -35,14 +35,14 @@ There are two planes so a stamp for one cannot be replayed on the other: `dtfs-d
 | DataService | `GetChunk`, `VerifyChunk`, `RecordCacheHit` | `chunk_id` |
 | DataService | `DeleteChunk` | `chunk_id\|disk_id\|if_mtime_le_ms` (unset = empty); legacy `chunk_id` accepted while `require_delete_binding = false` |
 | DataService | `ReplicateChunk` | `chunk_id`, a literal `\|`, then `target_address` |
-| ManagerService | `CreateFile`, `DeleteFile`, `AllocateChunks`, `CommitChunkLocations`, `SetFileSize`, `CreateSymlink`, `AcquireLock`, `ReleaseLock`, `AcquireWriteLease`, `RenewWriteLease`, `ReleaseWriteLease` | `path` |
+| ManagerService | `CreateFile`, `DeleteFile`, `AllocateChunks`, `CommitChunkLocations`, `SetFileSize`, `CreateSymlink`, `AcquireWriteLease`, `RenewWriteLease`, `ReleaseWriteLease` | `path` |
 | ManagerService | `RenameFile` | `from\nto` |
 | ManagerService | `CreateLink` | `source\ndest` |
 | ManagerService | `Heartbeat`, `ReportChunkStatus` | `node_id` |
 | ManagerService | `ReleaseLeasesByHost` | `hostname` |
 | ManagerService | `ForwardClientWrite` | hex `blake3(client_request_json)`; while `cluster.accept_legacy_forward_secret = true` (default) the follower also fills the legacy raw `shared_secret` field (for pre-HMAC leaders) and the leader accepts an unstamped forward on it; with `false` the field is sent empty and an unstamped forward is refused |
 | ManagerService | `RegisterNode` | no stamp; the request carries `shared_secret` instead |
-| ManagerService | `GetFileLocations`, `ListDirectory`, `ReadSymlink`, `ClusterCapacity`, `ProbeLock` | not authenticated (read-only) |
+| ManagerService | `GetFileLocations`, `ListDirectory`, `ReadSymlink`, `ClusterCapacity` | not authenticated (read-only) |
 
 ### Raft transport
 
@@ -97,9 +97,6 @@ Order used by the FUSE client: `AcquireWriteLease`, `AllocateChunks`, stream `Pu
 | `RenewWriteLease` | `path`, `lease_id`, `extension_ms` | `granted`, `new_expires_at_ms` |
 | `ReleaseWriteLease` | `path`, `lease_id` | `ok` |
 | `ReleaseLeasesByHost` | `hostname`, `except_pid` | `released_count` (drops the host's already-expired leases; never one of `except_pid`, never a live one) |
-| `AcquireLock` | `path`, `owner_id`, `start`, `end`, `write`, `blocking`, `lease_ms` | `granted`, `conflict_owner`, `conflict_start`, `conflict_end`, `conflict_write` |
-| `ReleaseLock` | `path`, `owner_id`, `start`, `end` | `ok` |
-| `ProbeLock` | `path`, `owner_id`, `start`, `end`, `write` | `would_grant`, conflict fields as above |
 
 ### Node lifecycle
 
