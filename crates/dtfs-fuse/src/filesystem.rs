@@ -2842,6 +2842,40 @@ impl DtfsFilesystem {
         (lost, then.await)
     }
 
+    /// Stop: `(path, lease_id)` of every lease an open, non-detached handle
+    /// still holds, once per lease id (handles of one owner share it).
+    fn open_leases(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for e in self.open_files.iter() {
+            let f = e.value();
+            if let Some(id) = &f.lease_id {
+                if !is_detached_path(&f.path) && !out.iter().any(|(_, i)| i == id) {
+                    out.push((f.path.clone(), id.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Stop (#136): release every lease an open writer still holds, after
+    /// the shutdown commit, so a restarted process (new pid, new owner) can
+    /// write those paths at once. Returns how many releases succeeded.
+    pub async fn release_open_leases(&self) -> usize {
+        let leases = self.open_leases();
+        let results = futures_util::future::join_all(
+            leases.iter().map(|(path, id)| self.client.release_write_lease(path, id)),
+        )
+        .await;
+        let mut released = 0;
+        for ((path, _), r) in leases.iter().zip(results) {
+            match r {
+                Ok(()) => released += 1,
+                Err(e) => warn!(path = %path, error = %format!("{e:#}"), "exit-time lease release failed; it expires"),
+            }
+        }
+        released
+    }
+
     /// Any writable, open handle of `path` (lease info for a commit).
     fn writable_fh(&self, path: &str) -> Option<u64> {
         self.open_files
@@ -6871,6 +6905,27 @@ mod async_commit_fs_tests {
         assert!(ran);
         assert_eq!(lost, cs as usize, "the cut-off commit's bytes are reported lost");
         hole.abort();
+    }
+
+    /// #136: the stop releases each lease an open writer still holds by its
+    /// id (release_leases_by_host spared this pid's leases), once per id;
+    /// readers, lease-less and detached handles have none to release.
+    #[test]
+    fn shutdown_releases_each_open_lease_once() {
+        let fs = fs(false);
+        let a = open(&fs, "/f", OpenFlags::ReadWrite);
+        let b = open(&fs, "/f", OpenFlags::ReadWrite);
+        let g = open(&fs, "/g", OpenFlags::ReadWrite);
+        set_lease(&fs, a, "h:1", "L1");
+        set_lease(&fs, b, "h:1", "L1");
+        set_lease(&fs, g, "h:2", "L2");
+        let det = open(&fs, &detached_handle_path("/d", "/d", 1).unwrap(), OpenFlags::ReadWrite);
+        set_lease(&fs, det, "h:3", "L3");
+        open(&fs, "/r", OpenFlags::ReadOnly);
+        open(&fs, "/n", OpenFlags::ReadWrite);
+        let mut got = fs.open_leases();
+        got.sort();
+        assert_eq!(got, [("/f".to_string(), "L1".to_string()), ("/g".to_string(), "L2".to_string())]);
     }
 
     /// Shutdown commit skips readers and detached handles (their bytes are

@@ -255,7 +255,9 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   buffer/handle re-key. A writer opened under `from` while rename waits for
   those guards is not covered (the kernel's rename locks make that rare).
 - Stop (main.rs, both modes): after the unmount attempt (clean, failed or
-  timed out) and BEFORE `release_leases_by_host`,
+  timed out) and BEFORE the lease release (`release_open_leases`: each
+  lease an open non-detached handle holds, by id, once per id; #136:
+  `release_leases_by_host` spares its pid and drops only expired leases),
   `commit_open_writers_then` commits each path with a writable,
   non-detached open fh once (`path_guard`, `commit_all`, which waits for the
   bg batch), and logs every path not confirmed committed (chunk indices,

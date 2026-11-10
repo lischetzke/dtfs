@@ -176,8 +176,10 @@ No manual intervention. Verify with `curl http://mgr01:9402/api/v1/health`.
    sending heartbeats. The manager marks them `Healthy` after the
    first successful heartbeat.
 3. Power on FUSE clients last. The mount unit runs
-   `release_leases_by_host` on startup to clear any orphan write
-   leases left behind by the crash, then opens the mount normally.
+   `release_leases_by_host` on startup, which drops only already-expired
+   leases of the host, then opens the mount normally. A lease the crashed
+   process held on a file open for writing blocks writers of that path
+   (`EBUSY`) until it expires (up to 120 s).
 4. Verify with the WebUI at `http://mgr01:9402/ui` — all nodes should
    show green within ~30 seconds.
 
@@ -249,10 +251,10 @@ The FUSE process is alive but every syscall hangs (typically because
 the manager pool was unreachable for longer than the retry budget and
 the client is stuck waiting on a never-completing RPC).
 
-1. `sudo systemctl restart dtfs-fuse@<volume>.service` — the unit's
-   `ExecStart` runs the orphan-lease cleanup
-   (`release_leases_by_host`) before opening the mount, so writes that
-   were in flight at restart get their leases released cleanly.
+1. `sudo systemctl restart dtfs-fuse@<volume>.service` — on stop the old
+   process commits its open writers and then releases the write leases
+   they hold, so writers of those paths do not get `EBUSY` after the
+   restart. After a crash (no clean stop) those leases expire within 120 s.
 2. The mount comes back. Applications retry their syscalls.
 
 ### The mount is gone (kernel detached)

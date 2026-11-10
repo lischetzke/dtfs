@@ -98,7 +98,7 @@ Order used by the FUSE client: `AcquireWriteLease`, `AllocateChunks`, stream `Pu
 | `AcquireWriteLease` | `path`, `owner_id`, `lease_ms` | `granted`, `lease_id`, `expires_at_ms`, `conflict_owner`, `conflict_expires_at_ms` |
 | `RenewWriteLease` | `path`, `lease_id`, `extension_ms` | `granted`, `new_expires_at_ms` |
 | `ReleaseWriteLease` | `path`, `lease_id` | `ok` |
-| `ReleaseLeasesByHost` | `hostname`, `except_pid` | `released_count` (clears leases left by a crashed FUSE process; keeps those of `except_pid`) |
+| `ReleaseLeasesByHost` | `hostname`, `except_pid` | `released_count` (drops the host's already-expired leases; never one of `except_pid`, never a live one) |
 | `AcquireLock` | `path`, `owner_id`, `start`, `end`, `write`, `blocking`, `lease_ms` | `granted`, `conflict_owner`, `conflict_start`, `conflict_end`, `conflict_write` |
 | `ReleaseLock` | `path`, `owner_id`, `start`, `end` | `ok` |
 | `ProbeLock` | `path`, `owner_id`, `start`, `end`, `write` | `would_grant`, conflict fields as above |

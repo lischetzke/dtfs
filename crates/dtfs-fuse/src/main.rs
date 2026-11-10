@@ -167,7 +167,7 @@ async fn main() -> Result<()> {
 
     // P0-6: clear orphan write leases from a previous crashed FUSE process
     // on this host BEFORE we start serving FUSE operations. Otherwise an
-    // orphan lease blocks all writers until the 15s lease_ms elapses.
+    // orphan lease blocks all writers until the 120 s lease_ms elapses.
     // We pass our own PID as `except_pid` so any healthy concurrent FUSE
     // process on this host keeps its leases.
     //
@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
     // Bug G shedding event, network partition) the call can take many
     // seconds, during which FUSE startup hangs and the systemd unit looks
     // permanently "active but not mounted". A 5 s ceiling lets startup
-    // proceed; leftover leases will expire via the 15 s lease_ms anyway.
+    // proceed; leftover leases will expire via the 120 s lease_ms anyway.
     let hostname_for_cleanup = fuse_config.location.host.clone();
     let current_pid = std::process::id();
     let cleanup_fut =
@@ -273,10 +273,6 @@ async fn main() -> Result<()> {
     let write_cfg = fuse_config.write.clone();
     let readahead_cache_mb = fuse_config.readahead.cache_mb;
     let client_location = fuse_config.location.clone();
-    // Bug U — keep a handle to the client (cheap Arc clone) so we can
-    // release this PID's leases on the way out, after DtfsFilesystem has
-    // taken ownership of its own copy.
-    let shutdown_client = client.clone();
     let mut fs = DtfsFilesystem::new(
         client,
         client_location,
@@ -483,33 +479,20 @@ async fn main() -> Result<()> {
             }
         };
         // Bug U step 2: release this process's leases before exiting.
-        // The kernel unmount above released local FDs but the *manager-side*
-        // lease state still names this PID. Without this call, a write to
-        // the same path right after we exit would block on the lease GC
-        // tick (1s) plus lease_ms (15s) before a new writer could acquire.
+        // A busy mount (failed unmount) leaves handles holding manager-side
+        // leases under this pid's owner ids; a restarted process has a new
+        // pid, so a writer of those paths got EBUSY until the lease (120 s)
+        // expired. Released by lease id (#136): release_leases_by_host
+        // spares the given pid and drops only expired leases.
         //
         // Bounded by 5s — same reasoning as the startup cleanup: don't
-        // hold systemd hostage. Use the same hostname/PID as startup so
-        // we exactly undo our own footprint.
+        // hold systemd hostage.
         let exit_release = async {
-            let release = shutdown_client.release_leases_by_host(&hostname_for_cleanup, current_pid);
+            let release = shutdown_fs.release_open_leases();
             match tokio::time::timeout(std::time::Duration::from_secs(SHUTDOWN_LEASE_RELEASE_SECS), release).await {
-                Ok(Ok(resp)) => {
-                    if resp.released_count > 0 {
-                        info!(
-                            host = %hostname_for_cleanup,
-                            pid = current_pid,
-                            released = resp.released_count,
-                            "Bug U released own write leases on exit"
-                        );
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "Bug U exit-time lease release failed");
-                }
-                Err(_) => {
-                    tracing::warn!("Bug U exit-time lease release timed out");
-                }
+                Ok(n) if n > 0 => info!(released = n, "Bug U released own write leases on exit"),
+                Ok(_) => {}
+                Err(_) => tracing::warn!("Bug U exit-time lease release timed out"),
             }
         };
         // A failed or timed-out unmount (busy mount: knfsd or a process
