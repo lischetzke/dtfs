@@ -324,3 +324,49 @@ fn rendered_manager_config_uses_default_raft_settings() {
         (150, 400, 10000)
     );
 }
+
+/// Key paths in `rendered` that `loaded` (the parsed struct serialized back)
+/// does not have: keys no config struct reads.
+fn unread_keys(rendered: &toml::Value, loaded: &toml::Value, path: &str, out: &mut Vec<String>) {
+    match (rendered, loaded) {
+        (toml::Value::Table(r), toml::Value::Table(l)) => {
+            for (k, v) in r {
+                let p = format!("{path}.{k}");
+                match l.get(k) {
+                    Some(lv) => unread_keys(v, lv, &p, out),
+                    None => out.push(p),
+                }
+            }
+        }
+        (toml::Value::Array(r), toml::Value::Array(l)) => {
+            for (i, (rv, lv)) in r.iter().zip(l).enumerate() {
+                unread_keys(rv, lv, &format!("{path}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// #132: every key the installer renders is read by the role's config struct.
+#[test]
+fn installer_renders_no_key_the_config_structs_ignore() {
+    fn check<T: serde::de::DeserializeOwned + serde::Serialize>(role: &'static str, fn_name: &str, extra: &[(&'static str, &'static str)]) {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join(format!("{fn_name}.toml"));
+        let mut env = with(&[("ROLE", role)]);
+        env.extend_from_slice(extra);
+        let (ok, out) = render(fn_name, &p, &env);
+        assert!(ok, "{out}");
+        let text = std::fs::read_to_string(&p).unwrap();
+        let rendered: toml::Value = toml::from_str(&text).unwrap();
+        let cfg: T = load_config(&p).unwrap();
+        let loaded = toml::Value::try_from(&cfg).unwrap();
+        let mut unread = Vec::new();
+        unread_keys(&rendered, &loaded, "", &mut unread);
+        assert!(unread.is_empty(), "{role}: rendered keys no struct reads: {unread:?}");
+    }
+    let mgr = [("BOOTSTRAP", "true"), ("MGR_LIST", "mgr01=10.0.0.1:9401")];
+    check::<ManagerConfig>("manager", "manager", &mgr);
+    check::<DataNodeConfig>("data", "data", &[("MGR_LIST", "mgr01=10.0.0.1:9401")]);
+    check::<FuseConfig>("fuse-client", "fuse", &[("MGR_LIST", "mgr01=10.0.0.1:9401")]);
+}

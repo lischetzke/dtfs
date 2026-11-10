@@ -665,10 +665,6 @@ tier = "$tier"
 EOF
     done
     cat >> "$CFG" <<EOF
-[cache]
-max_memory_mb = 2048
-policy = "arc"
-
 [scrub]
 quick_interval_hours = 24
 deep_interval_hours = 168
@@ -701,9 +697,6 @@ prefetch_chunks = 4
 prefetch_next_files = 2
 
 [cache]
-enabled = true
-max_size_mb = 512
-ttl_secs = 60
 
 [partition_safety]
 quorum_loss_timeout_secs = 30
