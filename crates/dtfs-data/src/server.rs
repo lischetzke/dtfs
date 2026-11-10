@@ -83,6 +83,23 @@ async fn detached<T: Send + 'static>(
         .unwrap_or_else(|e| Err(DtfsError::Internal(format!("store task failed: {e}"))))
 }
 
+/// `detached` for the put commit. The commit removes its tmp on every
+/// error it returns; a panic in the task does not, so remove it here
+/// (best effort). A `.dat` + WAL left by the panic is put-WAL replay's job.
+async fn detached_commit<T: Send + 'static>(
+    tmp_path: std::path::PathBuf,
+    fut: impl std::future::Future<Output = dtfs_common::error::DtfsResult<T>> + Send + 'static,
+) -> dtfs_common::error::DtfsResult<T> {
+    match tokio::spawn(fut).await {
+        Ok(r) => r,
+        Err(e) => {
+            let removed = tokio::fs::remove_file(&tmp_path).await;
+            tracing::error!(tmp = %tmp_path.display(), error = %e, tmp_removed = removed.is_ok(), "put commit task failed");
+            Err(DtfsError::Internal(format!("store task failed: {e}")))
+        }
+    }
+}
+
 /// Bug BU/BU-3 — map a put_chunk I/O error to a typed gRPC status. A
 /// no-space error (ENOSPC, errno 28) becomes `RESOURCE_EXHAUSTED` so the
 /// client can distinguish "disk full, reroute" from a real internal
@@ -594,7 +611,7 @@ impl DataService for DataServiceImpl {
         tmp_guard.disarm();
         let store = self.store.clone();
         let commit_id = chunk_id.clone();
-        let (meta, disk_id) = detached(async move {
+        let (meta, disk_id) = detached_commit(tmp_path.clone(), async move {
             store
                 .commit_chunk_from_tmp(&commit_id, &tmp_path, &vol_id, tier, total_size, hash)
                 .await
@@ -2096,6 +2113,32 @@ max_io_percent = 10
         .unwrap_err();
         assert!(matches!(err, DtfsError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound), "{err:?}");
         assert!(!store.has_chunk(&id).await);
+    }
+
+    /// Audit F1 — a panic in the detached put commit surfaces as Internal
+    /// and still removes the tmp file (no leak until restart).
+    #[tokio::test]
+    async fn detached_commit_panic_removes_tmp() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp_path = tmp.path().join("panic.dat.tmp");
+        std::fs::write(&tmp_path, b"x").unwrap();
+        let err = detached_commit::<()>(tmp_path.clone(), async { panic!("commit panicked") })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DtfsError::Internal(ref m) if m.starts_with("store task failed")), "{err:?}");
+        assert!(!tmp_path.exists(), "tmp must be removed after a commit-task panic");
+    }
+
+    /// Audit F1 negative — a successful detached commit's result is passed
+    /// through and an unrelated file at a stale tmp path is not the
+    /// commit's concern on success (nothing is removed).
+    #[tokio::test]
+    async fn detached_commit_success_leaves_files_alone() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp_path = tmp.path().join("kept.dat.tmp");
+        std::fs::write(&tmp_path, b"x").unwrap();
+        assert_eq!(detached_commit(tmp_path.clone(), async { Ok(7u8) }).await.unwrap(), 7);
+        assert!(tmp_path.exists());
     }
 }
 

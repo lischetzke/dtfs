@@ -35,7 +35,8 @@ text there.
    Put and delete of the same id serialize on the 256-way striped chunk
    lock; WAL names are op-keyed (`.put.wal.json` / `.delete.wal.json`).
    The PutChunk commit and the DeleteChunk unlink run in a spawned task
-   (`server::detached`): a cancelled RPC cannot stop them midway.
+   (`server::detached`): a cancelled RPC cannot stop them midway. A panic
+   in the put commit task removes only the tmp (`detached_commit`).
 
 ## Replica lifecycle
 
