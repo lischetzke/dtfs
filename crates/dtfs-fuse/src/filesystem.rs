@@ -548,6 +548,19 @@ impl CommitTracker {
         CommitToken { tracker: self, path: path.to_string(), generation, overlapped: in_flight > 1 }
     }
 
+    /// #134 review: the chunk indices of the commits on `path` in flight now
+    /// (sorted, deduped; empty = none), `None` if one is whole-file.
+    fn in_flight_chunks(&self, path: &str) -> Option<Vec<u32>> {
+        let Some(e) = self.0.get(path) else { return Some(Vec::new()) };
+        let mut all = Vec::new();
+        for c in &e.3 {
+            all.extend_from_slice(c.1.as_deref()?);
+        }
+        all.sort_unstable();
+        all.dedup();
+        Some(all)
+    }
+
     fn begin_fetch(&self, path: &str) -> FetchToken<'_> {
         let (in_flight, generation) = {
             let mut e = self.0.entry(path.to_string()).or_default();
@@ -593,18 +606,29 @@ fn seed_snapshot_usable(fetched_after_lease: bool, may_install: bool) -> bool {
     fetched_after_lease && may_install
 }
 
-/// #134: did someone else change the file between `snap` (the handle's) and
-/// `fresh` (fetched after a fresh lease grant)? A different `created_at_ms`
-/// = deleted and re-created or renamed over. With `quiet` (no local commit
-/// overlapped the fetch) also any chunk id the snapshot does not hold at
-/// that index; a local commit in flight could explain those, so not then.
-fn file_changed_under_lease(snap: &FileLocations, fresh: &FileLocations, quiet: bool) -> bool {
-    snap.created_at_ms != fresh.created_at_ms
+/// #134: did someone else change the file between `snap` (the handle's,
+/// read after the fetch) and `fresh` (fetched after a fresh lease grant)? A
+/// different `created_at_ms` = deleted and re-created or renamed over. Also
+/// any fresh chunk id the snapshot does not hold at that index, except the
+/// indices of local commits in flight (`in_flight`; `None` = a whole-file
+/// one, then no chunk is compared): those may be ours. With `quiet` (no
+/// local commit overlapped the fetch) also a different `total_size` or an
+/// index the snapshot has and fresh lacks (a shrink).
+fn file_changed_under_lease(snap: &FileLocations, fresh: &FileLocations, in_flight: Option<&[u32]>, quiet: bool) -> bool {
+    if snap.created_at_ms != fresh.created_at_ms {
+        return true;
+    }
+    let Some(skip) = in_flight else { return false };
+    let ours = |i: u64| u32::try_from(i).is_ok_and(|i| skip.binary_search(&i).is_ok());
+    let differs = fresh.chunks.iter().any(|c| {
+        c.chunk_index.is_some_and(|i| {
+            !ours(i) && snap.chunk_at(i).map(|s| s.chunk_id.as_str()) != Some(c.chunk_id.as_str())
+        })
+    });
+    differs
         || (quiet
-            && fresh.chunks.iter().any(|c| {
-                c.chunk_index
-                    .is_some_and(|i| snap.chunk_at(i).map(|s| s.chunk_id.as_str()) != Some(c.chunk_id.as_str()))
-            }))
+            && (snap.total_size != fresh.total_size
+                || snap.chunks.iter().any(|c| c.chunk_index.is_some_and(|i| fresh.chunk_at(i).is_none()))))
 }
 
 /// #149: how long a replica that failed a chunk fetch is tried last.
@@ -3717,14 +3741,22 @@ impl DtfsFilesystem {
     /// one `fh`'s snapshot shows (`file_changed_under_lease`). No snapshot:
     /// nothing to compare, Ok.
     async fn check_unchanged_since_snapshot(&self, fh: u64, path: &str) -> Result<()> {
-        let Some(snap) = self.open_files.get(&fh).and_then(|f| f.locations.clone()) else {
-            debug!(path, fh, "fresh lease grant on a handle without snapshot; not compared");
-            return Ok(());
-        };
+        // Before any snapshot read: a commit that merges after it is seen.
         // Not quiet_fetch: the caller may hold its own commit slot.
         let fetch = self.commit_tracker.begin_fetch(path);
+        if self.open_files.get(&fh).is_none_or(|f| f.locations.is_none()) {
+            debug!(path, fh, "fresh lease grant on a handle without snapshot; not compared");
+            return Ok(());
+        }
         let fresh = self.fetch_file_locations(path).await?;
-        if file_changed_under_lease(&snap, &fresh, fetch.may_install()) {
+        // In-flight set first, then the snapshot: a commit gone from the set
+        // merged into the handles (or set them None) before it ended.
+        let in_flight = self.commit_tracker.in_flight_chunks(path);
+        let Some(snap) = self.open_files.get(&fh).and_then(|f| f.locations.clone()) else {
+            debug!(path, fh, "handle snapshot went stale during the check; not compared");
+            return Ok(());
+        };
+        if file_changed_under_lease(&snap, &fresh, in_flight.as_deref(), fetch.may_install()) {
             warn!(path, fh, "file changed while the write lease was lost; refusing to write on from a stale snapshot");
             bail!("{path}: file changed while the write lease was lost; not writing on top of it");
         }
@@ -8495,9 +8527,9 @@ mod async_commit_fs_tests {
         let mut recreated = mine.clone();
         recreated.created_at_ms = 7;
         // A local commit in flight may explain a new chunk id, not a new file.
-        assert!(!file_changed_under_lease(&mine, &appended, false));
-        assert!(file_changed_under_lease(&mine, &recreated, false));
-        assert!(!file_changed_under_lease(&mine, &mine, true));
+        assert!(!file_changed_under_lease(&mine, &appended, Some(&[0]), false));
+        assert!(file_changed_under_lease(&mine, &recreated, None, false));
+        assert!(!file_changed_under_lease(&mine, &mine, Some(&[]), true));
         for (other, what) in [(appended, "another client rewrote chunk 0"), (recreated, "file re-created")] {
             fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(mine.clone()));
             *fs.lease_acquire_hook.lock().unwrap() = Some(grant("fresh"));
@@ -8513,6 +8545,71 @@ mod async_commit_fs_tests {
         *fs.locations_fetch_hook.lock().unwrap() = Some(serve(mine.clone()));
         fs.reacquire_write_lease(fh, "/f", Some("h:1")).await.expect("unchanged file");
         assert_eq!(lease_id(&fs, fh).as_deref(), Some("fresh"));
+    }
+
+    /// #134 review: with a local commit in flight only ITS indices are
+    /// skipped; a whole-file commit skips the chunk compare. With nothing in
+    /// flight a shrink (missing index, smaller size) is a change too.
+    #[test]
+    fn changed_under_lease_skips_only_in_flight_indices() {
+        let cs = 4u64;
+        let mut snap = holes("/f", 2 * cs, cs);
+        snap.chunks = (0..2).map(|i| committed_chunk_info(i, &format!("{i}").repeat(64), cs, vec!["n:1".into()], "warm")).collect();
+        let mut other_at_1 = snap.clone();
+        other_at_1.chunks[1].chunk_id = "b".repeat(64);
+        let mut ours_at_0 = snap.clone();
+        ours_at_0.chunks[0].chunk_id = "a".repeat(64);
+        assert!(file_changed_under_lease(&snap, &other_at_1, Some(&[0]), false), "index 1 not in flight");
+        assert!(!file_changed_under_lease(&snap, &ours_at_0, Some(&[0]), false), "own in-flight index");
+        assert!(!file_changed_under_lease(&snap, &other_at_1, None, false), "whole-file commit in flight");
+        let mut shrunk = snap.clone();
+        shrunk.chunks.pop();
+        shrunk.total_size = cs;
+        assert!(file_changed_under_lease(&snap, &shrunk, Some(&[]), true), "shrink");
+        assert!(!file_changed_under_lease(&snap, &shrunk, Some(&[1]), false), "shrink under an in-flight commit");
+        let mut resized = snap.clone();
+        resized.total_size = 2 * cs - 1;
+        assert!(file_changed_under_lease(&snap, &resized, Some(&[]), true), "boundary: size off by one");
+        assert!(!file_changed_under_lease(&snap, &snap, Some(&[]), true));
+    }
+
+    #[test]
+    fn in_flight_chunks_unions_and_whole_file_is_none() {
+        let t = CommitTracker::default();
+        assert_eq!(t.in_flight_chunks("/f"), Some(vec![]));
+        let _a = t.begin_chunks("/f", Some(vec![0, 2]));
+        let _b = t.begin_chunks("/f", Some(vec![2, 5]));
+        assert_eq!(t.in_flight_chunks("/f"), Some(vec![0, 2, 5]));
+        assert_eq!(t.in_flight_chunks("/g"), Some(vec![]));
+        let _c = t.begin("/f");
+        assert_eq!(t.in_flight_chunks("/f"), None);
+    }
+
+    /// #134 review: our own commit of chunk 0 in flight explains a new id at
+    /// 0 (re-acquire OK), not another client's new id at 1 (refused).
+    #[tokio::test]
+    async fn reacquire_with_own_commit_in_flight_compares_other_indices() {
+        let fs = fs(false);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        let mut mine = holes("/f", 2 * cs, cs);
+        mine.chunks = (0..2).map(|i| committed_chunk_info(i, &format!("{i}").repeat(64), cs, vec!["n:1".into()], "warm")).collect();
+        let grant = || dtfs_proto::dtfs::manager::AcquireWriteLeaseResponse {
+            granted: true,
+            lease_id: "fresh".to_string(),
+            ..Default::default()
+        };
+        let _own = fs.commit_tracker.begin_chunks("/f", Some(vec![0]));
+        for (idx, refused) in [(0usize, false), (1, true)] {
+            set_lease(&fs, fh, "h:1", "old");
+            fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(mine.clone()));
+            let mut fresh = mine.clone();
+            fresh.chunks[idx].chunk_id = "e".repeat(64);
+            *fs.lease_acquire_hook.lock().unwrap() = Some(Box::new(grant));
+            *fs.locations_fetch_hook.lock().unwrap() = Some(Box::new(move |_| fresh.clone()));
+            let res = fs.reacquire_write_lease(fh, "/f", Some("h:1")).await;
+            assert_eq!(res.is_err(), refused, "new id at {idx}: {res:?}");
+        }
     }
 
     /// FUSE-2: fallocate's size floor counts in-flight bytes, also when the

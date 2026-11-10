@@ -17,8 +17,15 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   gives up; only a lease held by another writer aborts. A FRESH grant (new
   lease id: ours was gone) is refused, released and not adopted when the
   manager's file is not the handle's snapshot (`file_changed_under_lease`:
-  other `created_at_ms`, or with no local commit overlapping the check
-  fetch, a chunk id the snapshot lacks; no snapshot = not compared) (#134).
+  other `created_at_ms`; a fresh chunk id the snapshot lacks at an index
+  no local commit in flight covers (`CommitTracker::in_flight_chunks`, a
+  whole-file one skips the chunk compare); with no local commit
+  overlapping the check fetch also another `total_size` or an index the
+  snapshot has and fresh lacks; no snapshot = not compared) (#134).
+  `check_unchanged_since_snapshot` takes `begin_fetch` first, reads the
+  in-flight set after the fetch, then the handle's snapshot (a commit
+  gone from the set merged or set `None` before it ended), so no own
+  commit can cause a refusal.
   A commit failing with an unknown outcome (`commit_outcome_unknown`:
   timeout, transport, Unknown/Unavailable/Internal; not a `rejected`
   response or a definite status) sets the path's handles `locations =
