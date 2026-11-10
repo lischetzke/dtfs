@@ -50,11 +50,13 @@ impl RaftTransportHandler {
     async fn handle_rpc(&self, body: Bytes) -> Result<Bytes, Status> {
         let msg: RaftMessage = serde_json::from_slice(&body)
             .map_err(|e| Status::invalid_argument(format!("bad raft msg: {}", e)))?;
+        // Snapshot-sized: keep one copy at a time (issue #113 raised the cap).
+        drop(body);
 
         let response_payload = match msg.kind {
             RaftRpcKind::AppendEntries => self.handle_append_entries(&msg.payload).await,
             RaftRpcKind::Vote => self.handle_vote(&msg.payload).await,
-            RaftRpcKind::Snapshot => self.handle_snapshot(&msg.payload).await,
+            RaftRpcKind::Snapshot => self.handle_snapshot(msg.payload).await,
         };
 
         let resp_msg = RaftMessage {
@@ -106,7 +108,7 @@ impl RaftTransportHandler {
         }
     }
 
-    async fn handle_snapshot(&self, payload: &str) -> String {
+    async fn handle_snapshot(&self, payload: String) -> String {
         #[derive(Deserialize)]
         struct SnapshotPayload {
             vote: openraft::type_config::alias::VoteOf<dtfs_raft::TypeConfig>,
@@ -114,7 +116,9 @@ impl RaftTransportHandler {
             data_base64: String,
         }
 
-        match serde_json::from_str::<SnapshotPayload>(payload) {
+        let parsed = serde_json::from_str::<SnapshotPayload>(&payload);
+        drop(payload);
+        match parsed {
             Ok(snap) => {
                 debug!("RaftTransport: InstallSnapshot");
                 let data = base64_decode(&snap.data_base64);
@@ -274,6 +278,27 @@ struct RaftTransportSvc {
     self_id: u64,
 }
 
+impl RaftTransportSvc {
+    fn new(handler: RaftTransportHandler, config: &ManagerConfig) -> Self {
+        Self {
+            handler,
+            secret: config.cluster.shared_secret.clone(),
+            require_auth: config.cluster.require_raft_auth,
+            self_id: dtfs_common::node_id_from_hostname(&config.node.hostname),
+            // Issue #113 — a snapshot is the whole state in ONE body, so any cap
+            // below its size stalls the follower forever. Bound only by the
+            // gRPC frame (u32 length) the sender can encode; never below the
+            // operator's gRPC cap. shortcut: snapshots above ~4 GiB on the
+            // wire (~20M chunk rows) still fail, chunked install when needed.
+            max_body_bytes: RAFT_MAX_BODY_BYTES
+                .max(dtfs_common::config::max_message_bytes(config.grpc.max_message_size_mb)),
+        }
+    }
+}
+
+/// One gRPC frame: 5-byte header + the largest u32-length message.
+const RAFT_MAX_BODY_BYTES: usize = 5 + u32::MAX as usize;
+
 impl tonic::server::NamedService for RaftTransportSvc {
     const NAME: &'static str = "dtfs.manager.RaftTransport";
 }
@@ -308,6 +333,21 @@ impl tower::Service<tonic::codegen::http::Request<tonic::body::Body>> for RaftTr
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
+
+            // Issue #113 — the body cap is snapshot-sized, so refuse a missing
+            // or half stamp before buffering anything (it needs no body).
+            let (ts, mac) = (
+                hdr(dtfs_common::crypto::DATA_RPC_AUTH_TS),
+                hdr(dtfs_common::crypto::DATA_RPC_AUTH_MAC),
+            );
+            if ts.is_none() || mac.is_none() {
+                if let RaftAuthDecision::Reject(why) =
+                    raft_auth_decision(&secret, require_auth, ts, mac, "", now)
+                {
+                    warn!(reason = why, "RaftTransport: rejected unauthenticated Raft RPC");
+                    return Ok(grpc_error_response(7, "raft rpc authentication failed"));
+                }
+            }
 
             // Bounded collect: tonic's decode cap does not apply to this
             // hand-rolled service, so an unbounded body would buffer in RAM.
@@ -427,15 +467,7 @@ pub async fn run_grpc_server(
         anyhow::anyhow!("invalid grpc.listen_addr '{}': {e}", config.grpc.listen_addr)
     })?;
 
-    let raft_svc = RaftTransportSvc {
-        handler: RaftTransportHandler::new(raft),
-        secret: config.cluster.shared_secret.clone(),
-        require_auth: config.cluster.require_raft_auth,
-        self_id: dtfs_common::node_id_from_hostname(&config.node.hostname),
-        // A snapshot rides base64-in-JSON inside one body; the manager gRPC
-        // message cap is the existing operator-tuned bound for it.
-        max_body_bytes: dtfs_common::config::max_message_bytes(config.grpc.max_message_size_mb),
-    };
+    let raft_svc = RaftTransportSvc::new(RaftTransportHandler::new(raft), &config);
 
     // Bug CK — bind the listener explicitly BEFORE logging "listening", so a
     // failure (e.g. the Tailscale interface not up yet at boot →
@@ -683,5 +715,64 @@ mod raft_transport_hardening_tests {
         assert!(err.downcast_ref::<http_body_util::LengthLimitError>().is_some());
         let resp = grpc_error_response(8, "raft rpc body too large");
         assert_eq!(resp.headers().get("grpc-status").unwrap(), "8");
+    }
+
+    async fn svc_with(
+        mb: u32,
+        secret: &str,
+        require: bool,
+    ) -> (RaftTransportSvc, crate::api::test_support::Harness) {
+        let h = crate::api::test_support::harness().await;
+        let mut cfg = h.state.config.clone();
+        cfg.grpc.max_message_size_mb = mb;
+        cfg.cluster.shared_secret = secret.to_string();
+        cfg.cluster.require_raft_auth = require;
+        (RaftTransportSvc::new(RaftTransportHandler::new(h.state.raft.clone()), &cfg), h)
+    }
+
+    fn grpc_status(resp: &tonic::codegen::http::Response<tonic::body::Body>) -> String {
+        resp.headers().get("grpc-status").unwrap().to_str().unwrap().to_string()
+    }
+
+    /// Issue #113 — a snapshot body above `grpc.max_message_size_mb` must
+    /// reach the handler instead of being refused with status 8 forever.
+    #[tokio::test]
+    async fn issue_113_snapshot_body_above_grpc_cap_is_accepted() {
+        use tower::Service;
+        let (mut svc, _h) = svc_with(1, "", false).await;
+        let msg = RaftMessage { kind: RaftRpcKind::Snapshot, payload: "x".repeat(2 * 1024 * 1024) };
+        let json = serde_json::to_vec(&msg).unwrap();
+        let mut prost = vec![0x0A];
+        let mut v = json.len() as u64;
+        while v >= 0x80 {
+            prost.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        prost.push(v as u8);
+        prost.extend_from_slice(&json);
+        let req = tonic::codegen::http::Request::builder()
+            .body(tonic::body::Body::new(http_body_util::Full::new(frame(&prost))))
+            .unwrap();
+        let resp = svc.call(req).await.unwrap();
+        // Unparseable snapshot payload -> handler answers empty with status 0.
+        assert_eq!(grpc_status(&resp), "0", "2 MiB snapshot body over a 1 MiB gRPC cap refused");
+    }
+
+    /// Issue #113 negative — with auth required, an unstamped RPC is refused
+    /// BEFORE its (now large-capped) body is buffered.
+    #[tokio::test]
+    async fn issue_113_unstamped_rpc_rejected_before_body_read() {
+        use tower::Service;
+        let (mut svc, _h) = svc_with(1, SECRET, true).await;
+        // Reading this body errors (inner limit), so a read would answer 8/13, not 7.
+        let failing = http_body_util::Limited::new(
+            http_body_util::Full::new(Bytes::from_static(b"must not be read")),
+            1,
+        );
+        let req = tonic::codegen::http::Request::builder()
+            .body(tonic::body::Body::new(failing))
+            .unwrap();
+        let resp = svc.call(req).await.unwrap();
+        assert_eq!(grpc_status(&resp), "7");
     }
 }

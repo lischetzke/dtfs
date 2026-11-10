@@ -158,8 +158,13 @@ stamp after a size-bounded read of the body (a missing or non-numeric
 is rejected when `require_raft_auth = true`, otherwise accepted as unsigned
 with the rate-limited warning, even if it carries a stamp).
 
-- The Raft request body is capped at the manager gRPC message limit
-  (`[grpc].max_message_size_mb`); larger bodies are rejected before parsing.
+- The Raft request body is capped at one gRPC frame (about 4 GiB, or
+  `[grpc].max_message_size_mb` if larger), because an InstallSnapshot carries
+  the whole state in one body; larger bodies are rejected with
+  `ResourceExhausted` before parsing and the sender logs it at error level.
+  A request with no stamp (or one header only) is rejected before the body
+  is read whenever that alone decides it (`require_raft_auth = true`, or a
+  half stamp).
 - A stamped-but-invalid request (bad MAC, skew, one header only) is always
   rejected with `PermissionDenied`.
 - An unsigned request is accepted with a rate-limited warning unless

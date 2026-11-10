@@ -231,6 +231,7 @@ impl DtfsNetwork {
         timeout: std::time::Duration,
     ) -> Result<String, RPCError<TypeConfig>> {
         let channel = self.ensure_channel().await?;
+        let is_snapshot = matches!(kind, RaftRpcKind::Snapshot);
 
         let msg = RaftMessage {
             kind,
@@ -272,6 +273,11 @@ impl DtfsNetwork {
             tonic::codec::ProstCodec::<bytes::Bytes, bytes::Bytes>::default();
 
         let response = client.unary(request, path, codec).await.map_err(|e| {
+            if is_snapshot && e.code() == tonic::Code::ResourceExhausted {
+                // Issue #113: retried forever by openraft, so make the stall loud.
+                tracing::error!(target_id = self.target_id, error = %e,
+                    "Raft snapshot refused as too large by the peer; it cannot catch up");
+            }
             self.channel = None;
             unreachable_err(format!("rpc failed: {e}"))
         })?;
