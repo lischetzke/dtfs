@@ -238,6 +238,13 @@ same gate with v0.1.15 as the minimum (`cluster_on_v0_1_15`). Once all
 managers ran v0.1.15, do not roll a manager back below v0.1.15 and never join
 one below it.
 
+The membership API enforces the join rule: while either gate is open,
+`POST /api/v1/raft/add-learner` and `/api/v1/raft/promote` return 409 unless
+the target is a registered manager reporting at least the gate's release
+(v0.1.15 when `cluster_on_v0_1_15` holds, else v0.1.14). Start the new manager
+on the current release so it registers, then add it. A rollback of an existing
+member is not caught by this check.
+
 Per node:
 
 1. If maintenance mode is warranted (data node, longer than 30 s), enable it.

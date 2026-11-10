@@ -210,6 +210,26 @@ pub(super) fn check_is_leader(state: &AppState) -> Result<(), (StatusCode, Json<
     ))
 }
 
+/// 409 unless the target's registered release meets every apply gate the
+/// cluster has opened (an older manager diverges on log replay).
+async fn check_target_apply_gates(
+    state: &AppState,
+    hostname: &str,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let sm = state.sm_data.read().await;
+    let registered = sm
+        .nodes
+        .get(&dtfs_common::node_id_from_hostname(hostname))
+        .map(|n| (n.role, n.version.as_str()));
+    crate::membership::ensure_target_meets_apply_gates(
+        hostname,
+        registered,
+        dtfs_raft::state_machine::cluster_on_v0_1_15(&sm),
+        dtfs_raft::state_machine::cluster_understands_named_remove(&sm),
+    )
+    .map_err(|e| (StatusCode::CONFLICT, Json(json!({"error": e}))))
+}
+
 /// POST /api/v1/raft/add-learner — add a manager to the cluster as a
 /// non-voting learner. The leader sets up replication immediately
 /// (snapshot + log); progress is visible in the target's
@@ -241,6 +261,7 @@ pub(super) async fn raft_add_learner(
         registered_role,
     )
     .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    check_target_apply_gates(&state, &hostname).await?;
 
     let node = dtfs_raft::DtfsNode {
         addr: addr.to_string(),
@@ -328,6 +349,7 @@ pub(super) async fn raft_promote(
     };
     let nid = crate::membership::validate_membership_target(&hostname, None, registered_role)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    check_target_apply_gates(&state, &hostname).await?;
 
     {
         let metrics = state.raft.metrics().borrow_watched().clone();

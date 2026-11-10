@@ -55,6 +55,41 @@ pub fn validate_membership_target(
     }
 }
 
+/// Refuse a membership target older than an apply gate the cluster has
+/// opened (`cluster_on_v0_1_15` / `cluster_understands_named_remove`): it
+/// would replay the log with the legacy apply rules and diverge.
+/// `registered` is the target's node-registry `(role, version)`, if any.
+pub fn ensure_target_meets_apply_gates(
+    hostname: &str,
+    registered: Option<(NodeRole, &str)>,
+    v0_1_15_open: bool,
+    named_remove_open: bool,
+) -> Result<(), String> {
+    let min = if v0_1_15_open {
+        dtfs_raft::state_machine::V0_1_15_MIN_VERSION
+    } else if named_remove_open {
+        dtfs_raft::state_machine::NAMED_REMOVE_MIN_VERSION
+    } else {
+        return Ok(());
+    };
+    if let Some((NodeRole::Manager, v)) = registered {
+        if dtfs_common::version::release_at_least(v, min) {
+            return Ok(());
+        }
+    }
+    let seen = match registered {
+        Some((role, v)) => format!("{role:?} {v:?}"),
+        None => "no".to_string(),
+    };
+    let min = format!("v{}.{}.{}", min.0, min.1, min.2);
+    tracing::warn!(hostname, registered = %seen, required = %min, "membership change refused: target below an open apply gate");
+    Err(format!(
+        "{hostname:?} must be a registered manager on {min} or later: the cluster's {min} apply \
+         rules are active and an older manager would diverge on log replay (registered: {seen}); \
+         start it on the current release first"
+    ))
+}
+
 /// Refuse a voter-set change that would leave the cluster unable to commit.
 ///
 /// Openraft commits the joint configuration with a majority of BOTH the old
@@ -93,6 +128,37 @@ pub fn ensure_voter_change_has_quorum(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apply_gates_refuse_v0_1_14_target_when_v0_1_15_gate_open() {
+        let err = ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.14")), true, true)
+            .unwrap_err();
+        assert!(err.contains("on v0.1.15 or later"), "{err}");
+        // Only the named-remove gate open: v0.1.14 is enough, v0.1.13 is not.
+        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.14")), false, true).is_ok());
+        let err = ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.13")), false, true)
+            .unwrap_err();
+        assert!(err.contains("on v0.1.14 or later"), "{err}");
+    }
+
+    #[test]
+    fn apply_gates_refuse_unregistered_or_non_manager_target() {
+        let err = ensure_target_meets_apply_gates("mgr06", None, false, true).unwrap_err();
+        assert!(err.contains("(registered: no)"), "{err}");
+        let err = ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Data, "v0.1.15")), true, true)
+            .unwrap_err();
+        assert!(err.contains("(registered: Data \"v0.1.15\")"), "{err}");
+        // A dev build never satisfies an open gate.
+        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.0.0-dev")), true, true).is_err());
+    }
+
+    #[test]
+    fn apply_gates_allow_any_target_when_closed_and_current_release_when_open() {
+        assert!(ensure_target_meets_apply_gates("mgr06", None, false, false).is_ok());
+        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.0.0-dev")), false, false).is_ok());
+        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.15")), true, true).is_ok());
+        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.2.0")), true, true).is_ok());
+    }
 
     #[test]
     fn cf2_empty_hostname_rejected() {
