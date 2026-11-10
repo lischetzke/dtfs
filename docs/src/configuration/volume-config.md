@@ -80,11 +80,14 @@ Result: every chunk has one cold replica in `leli`; two reads from a datacenter 
 | `next_max_gb` | 0 | GiB cap on that selection (0 = no byte cap) |
 | `series_max_gb` | 20 | GiB budget per series (plex) |
 | `max_series` | 3 | series kept pre-cached per volume per datacenter (plex) |
+| `pins` | `[]` | up to 32 `{prefix, datacenter}` entries: subtrees kept pre-cached in a datacenter whatever the mode (see [Tiering](../storage/tiering.md#pinned-prefixes)) |
 
-Constraints for any mode other than `off`: a cache tier with `cache_replicas.<tier>.max > 0` whose `mandatory_replicas.<tier>` is 0, and `cache_replicas.per_dc = true`. Plex needs `series_max_gb` and `max_series` above 0; files needs `next_files` or `next_max_gb` above 0. The setting needs every manager on v0.1.16 or later (409 otherwise).
+Constraints for any mode other than `off`: a cache tier with `cache_replicas.<tier>.max > 0` whose `mandatory_replicas.<tier>` is 0, and `cache_replicas.per_dc = true`. A pin prefix must start with `/` and must not be `/`; the pin datacenter must match a registered node's datacenter (case-insensitive, REST answers 400 otherwise). Pins alone (mode `off`) are valid and need the same cache tier and `per_dc`. Plex needs `series_max_gb` and `max_series` above 0; files needs `next_files` or `next_max_gb` above 0. The setting needs every manager on v0.1.16 or later (409 otherwise).
 
 ```bash
 dtfs-cli volumes set-precache media --mode plex --series-max-gb 20 --max-series 3
+dtfs-cli volumes set-precache media --pin /tv/Bluey@toro --pin /movies/Kids@toro   # replaces the pin list
+dtfs-cli volumes set-precache media --clear-pins
 ```
 
 ## Deleting a volume

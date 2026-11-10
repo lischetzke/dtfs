@@ -305,6 +305,13 @@ enum VolumesCmd {
         /// Series pre-cached per volume per DC (plex mode).
         #[arg(long)]
         max_series: Option<u32>,
+        /// Pin a subtree to a DC's cache, `PREFIX@DC` (split at the last '@');
+        /// repeatable, replaces the current pin list.
+        #[arg(long = "pin", value_name = "PREFIX@DC", conflicts_with = "clear_pins")]
+        pins: Vec<String>,
+        /// Remove every pin.
+        #[arg(long)]
+        clear_pins: bool,
     },
     /// Bug AV (AV-4-1a) — set or update the volume's
     /// `mandatory_replicas` (durability floor enforced by the
@@ -798,11 +805,11 @@ async fn main() -> anyhow::Result<()> {
                 ).await?
             }
             VolumesCmd::SetPrecache {
-                volume_id, mode, next_files, next_max_gb, series_max_gb, max_series,
+                volume_id, mode, next_files, next_max_gb, series_max_gb, max_series, pins, clear_pins,
             } => {
                 cmd_volumes_set_precache(
                     &api, &args.format, &volume_id,
-                    set_precache_body(mode.as_deref(), next_files, next_max_gb, series_max_gb, max_series),
+                    set_precache_body(mode.as_deref(), next_files, next_max_gb, series_max_gb, max_series, &pins, clear_pins)?,
                 ).await?
             }
             VolumesCmd::SetMandatory {
@@ -1382,14 +1389,29 @@ fn set_precache_body(
     next_max_gb: Option<u32>,
     series_max_gb: Option<u32>,
     max_series: Option<u32>,
-) -> serde_json::Value {
+    pins: &[String],
+    clear_pins: bool,
+) -> anyhow::Result<serde_json::Value> {
     let mut body = serde_json::Map::new();
     if let Some(v) = mode { body.insert("mode".into(), v.into()); }
     if let Some(v) = next_files { body.insert("next_files".into(), v.into()); }
     if let Some(v) = next_max_gb { body.insert("next_max_gb".into(), v.into()); }
     if let Some(v) = series_max_gb { body.insert("series_max_gb".into(), v.into()); }
     if let Some(v) = max_series { body.insert("max_series".into(), v.into()); }
-    serde_json::Value::Object(body)
+    if clear_pins {
+        body.insert("pins".into(), serde_json::json!([]));
+    } else if !pins.is_empty() {
+        let mut out = Vec::new();
+        for p in pins {
+            let (prefix, dc) = p
+                .rsplit_once('@')
+                .filter(|(a, b)| !a.is_empty() && !b.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("--pin '{p}': expected PREFIX@DC"))?;
+            out.push(serde_json::json!({"prefix": prefix, "datacenter": dc}));
+        }
+        body.insert("pins".into(), out.into());
+    }
+    Ok(serde_json::Value::Object(body))
 }
 
 /// `dtfs-cli volumes set-precache <id> [--mode plex ...]`.
@@ -1415,6 +1437,9 @@ async fn cmd_volumes_set_precache(
             println!("  next_max_gb:    {}", c["next_max_gb"].as_u64().unwrap_or(0));
             println!("  series_max_gb:  {}", c["series_max_gb"].as_u64().unwrap_or(0));
             println!("  max_series:     {}", c["max_series"].as_u64().unwrap_or(0));
+            for p in c["pins"].as_array().into_iter().flatten() {
+                println!("  pin:            {}@{}", p["prefix"].as_str().unwrap_or(""), p["datacenter"].as_str().unwrap_or(""));
+            }
         }
     }
     Ok(())
@@ -2965,10 +2990,26 @@ mod precache_tests {
     #[test]
     fn set_precache_body_only_carries_supplied_flags() {
         assert_eq!(
-            set_precache_body(Some("plex"), None, None, Some(20), Some(3)),
+            set_precache_body(Some("plex"), None, None, Some(20), Some(3), &[], false).unwrap(),
             serde_json::json!({"mode":"plex","series_max_gb":20,"max_series":3})
         );
-        assert_eq!(set_precache_body(None, None, None, None, None), serde_json::json!({}));
+        assert_eq!(set_precache_body(None, None, None, None, None, &[], false).unwrap(), serde_json::json!({}));
+        // Split at the last '@'; repeatable.
+        let pins = ["/tv/a@b@toro".to_string(), "/tv/c@nrb".to_string()];
+        assert_eq!(
+            set_precache_body(None, None, None, None, None, &pins, false).unwrap(),
+            serde_json::json!({"pins":[
+                {"prefix":"/tv/a@b","datacenter":"toro"},
+                {"prefix":"/tv/c","datacenter":"nrb"}]})
+        );
+        assert_eq!(
+            set_precache_body(None, None, None, None, None, &[], true).unwrap(),
+            serde_json::json!({"pins":[]})
+        );
+        for bad in ["/tv/a", "@toro", "/tv/a@"] {
+            let e = set_precache_body(None, None, None, None, None, &[bad.to_string()], false).unwrap_err();
+            assert!(e.to_string().contains("PREFIX@DC"), "{bad}: {e}");
+        }
     }
 }
 

@@ -373,6 +373,7 @@ pub(crate) fn volume_config_to_json(
             "next_max_gb":   cfg.precache.next_max_gb,
             "series_max_gb": cfg.precache.series_max_gb,
             "max_series":    cfg.precache.max_series,
+            "pins":          cfg.precache.pins,
         },
     })
 }
@@ -507,6 +508,21 @@ pub(crate) struct SetPrecacheRequest {
     pub next_max_gb: Option<u32>,
     pub series_max_gb: Option<u32>,
     pub max_series: Option<u32>,
+    /// Replaces the whole pin list (empty clears it).
+    pub pins: Option<Vec<dtfs_common::types::PrecachePin>>,
+}
+
+/// Every pin DC must be the datacenter of some registered node (case-insensitive).
+pub(crate) fn check_pin_dcs(
+    pins: &[dtfs_common::types::PrecachePin],
+    nodes: &std::collections::BTreeMap<u64, dtfs_raft::NodeInfo>,
+) -> Result<(), String> {
+    for p in pins {
+        if !nodes.values().any(|n| n.location.datacenter.eq_ignore_ascii_case(&p.datacenter)) {
+            return Err(format!("pin '{}': no node in datacenter '{}'", p.prefix, p.datacenter));
+        }
+    }
+    Ok(())
 }
 
 /// Merge a partial precache update onto a clone of `current`, then validate
@@ -521,6 +537,7 @@ pub(crate) fn apply_set_precache(
     if let Some(v) = req.next_max_gb { next.precache.next_max_gb = v; }
     if let Some(v) = req.series_max_gb { next.precache.series_max_gb = v; }
     if let Some(v) = req.max_series { next.precache.max_series = v; }
+    if let Some(v) = &req.pins { next.precache.pins = v.clone(); }
     next.precache.validate(&next.cache_replicas, next.effective_mandatory_replicas())?;
     Ok(next)
 }
@@ -532,9 +549,10 @@ pub(super) async fn set_volume_precache_endpoint(
 ) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
     use axum::http::StatusCode;
 
-    let (current, gate_open) = {
+    let (current, gate_open, dc_check) = {
         let sm = state.sm_data.read().await;
-        (sm.volumes.get(&volume_id).cloned(), dtfs_raft::state_machine::cluster_on_v0_1_16(&sm))
+        let dc_check = body.pins.as_deref().map_or(Ok(()), |p| check_pin_dcs(p, &sm.nodes));
+        (sm.volumes.get(&volume_id).cloned(), dtfs_raft::state_machine::cluster_on_v0_1_16(&sm), dc_check)
     };
     let Some(current) = current else {
         return Err((
@@ -543,7 +561,7 @@ pub(super) async fn set_volume_precache_endpoint(
         ));
     };
 
-    let next = apply_set_precache(&current, &body).map_err(|e| {
+    let next = apply_set_precache(&current, &body).and_then(|n| dc_check.map(|()| n)).map_err(|e| {
         warn!(volume = %volume_id, error = %e, "set_volume_precache rejected");
         (StatusCode::BAD_REQUEST, Json(json!({"error": e})))
     })?;

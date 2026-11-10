@@ -229,6 +229,10 @@ Reactive promotion waits for reads to reach a datacenter. Pre-caching copies the
 
 **Bandwidth and yield.** Copies start at an average of `[tiering] precache_max_mbps` (default 10, 120 s burst); a copy that does not fit the balance waits, later ones do not jump ahead. The normal scheduler limits (6 copies at once, 2 per target node) still apply. With 24 or more live scheduler tasks of any class (repair included) pre-caching schedules nothing.
 
+### Pinned prefixes
+
+`precache.pins` (`{prefix, datacenter}`, at most 32 per volume) keeps a subtree cached in one datacenter whatever the mode, even with mode `off`; reads are not needed. Each pass lists the regular files of the pin's own volume under the prefix (whole path components: `/tv/Blue` does not match `/tv/Bluey`; sidecars under 16 MiB, dot-files and files being written are skipped) and applies every pre-caching placement rule: cache tiers only, never onto a node already holding the chunk, never for anchor-pending chunks, capacity and reserve, the rate limit and the repair yield. Pin copies rank after every cursor copy. Cached pinned chunks are protected from the idle demote for as long as the pin exists; an operator `flush_cache` still removes them. At most 5000 files are listed per pin per pass; `truncated` in the status marks a larger subtree.
+
 **Anchor.** Pre-caching only adds cache replicas through the verified replication path. Chunks without a live anchor copy (anchor-pending) are not copied.
 
 **Leader change.** Copy tasks are Raft state and finish on their own. The new leader starts with an empty protection set and rebuilds cursors within 30 to 90 s; idle demote is refused for `promote_window_secs` after a new leader's tenure starts, so nothing is lost in between. A volume whose policy stops validating (for example after `set-cache` removed the cache tier) is skipped and logged once.

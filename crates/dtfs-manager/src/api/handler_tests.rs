@@ -917,6 +917,47 @@ async fn set_precache_404_400_409_and_noop() {
 }
 
 #[test]
+fn apply_set_precache_pins_replace_and_validate() {
+    use dtfs_common::types::PrecachePin;
+    let pin = |p: &str| PrecachePin { prefix: p.into(), datacenter: "toro".into() };
+    let req = |pins: Vec<PrecachePin>| SetPrecacheRequest { pins: Some(pins), ..Default::default() };
+    let one = apply_set_precache(&precache_vol("v"), &req(vec![pin("/tv/a")])).unwrap();
+    assert_eq!(one.precache.pins, vec![pin("/tv/a")]);
+    // Replaces, does not append; None keeps; empty clears.
+    let two = apply_set_precache(&one, &req(vec![pin("/tv/b")])).unwrap();
+    assert_eq!(two.precache.pins, vec![pin("/tv/b")]);
+    assert_eq!(apply_set_precache(&two, &SetPrecacheRequest::default()).unwrap().precache.pins, two.precache.pins);
+    assert!(apply_set_precache(&two, &req(vec![])).unwrap().precache.pins.is_empty());
+    for bad in ["", "/", "tv/x"] {
+        assert!(apply_set_precache(&precache_vol("v"), &req(vec![pin(bad)])).is_err(), "{bad}");
+    }
+    assert!(apply_set_precache(&precache_vol("v"), &req((0..33).map(|i| pin(&format!("/p{i}"))).collect())).is_err());
+}
+
+#[tokio::test]
+async fn set_precache_pin_unknown_dc_is_400() {
+    use dtfs_common::types::PrecachePin;
+    let h = harness().await;
+    {
+        let mut sm = h.state.sm_data.write().await;
+        sm.volumes.insert("v".into(), precache_vol("v"));
+        open_v0_1_16_gate(&mut sm);
+        sm.nodes.get_mut(&10).unwrap().location = dtfs_common::topology::Location::new("r", "toro", "rk", "h");
+    }
+    let body = |dc: &str| SetPrecacheRequest {
+        pins: Some(vec![PrecachePin { prefix: "/tv/a".into(), datacenter: dc.into() }]),
+        ..Default::default()
+    };
+    let p = || axum::extract::Path("v".to_string());
+    let e = set_volume_precache_endpoint(State(h.state.clone()), p(), Json(body("nowhere"))).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::BAD_REQUEST);
+    assert!(e.1.0["error"].as_str().unwrap().contains("nowhere"), "{:?}", e.1.0);
+    // Known DC (case-insensitive) passes the check; the leaderless Raft write then fails (503).
+    let e = set_volume_precache_endpoint(State(h.state.clone()), p(), Json(body("TORO"))).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[test]
 fn volume_json_carries_precache_block() {
     let mut v = precache_vol("v");
     v.precache.mode = dtfs_common::types::PrecacheMode::Plex;

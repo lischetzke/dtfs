@@ -1,7 +1,7 @@
 //! Predictive pre-caching, pure kernels (no I/O, no async, no locks):
 //! playback ordering, series-root detection, selection and play detection.
 
-use crate::scheduler::survivor_replica_tier;
+use crate::scheduler::{path_matches_prefix, survivor_replica_tier};
 use crate::tiering::{
     anchor_violated_after_copy, node_selection_view, select_promotion_target, tier_rank,
 };
@@ -234,6 +234,8 @@ pub(crate) const MAX_FILE_CURSORS_PER_DC: usize = 8;
 pub(crate) const MAX_DIR_ENTRIES: usize = 10_000;
 /// Share of a node's tier capacity pre-caching never fills.
 pub(crate) const PRECACHE_RESERVE_PCT: u64 = 10;
+/// Eligible files listed per pin per pass.
+pub(crate) const MAX_PIN_FILES: usize = 5000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SeriesEntry {
@@ -316,6 +318,17 @@ pub(crate) struct SkippedVolume {
     pub detail: String,
 }
 
+/// One pinned prefix in one DC.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct PinStatus {
+    pub volume: String,
+    pub prefix: String,
+    pub dc: String,
+    pub bytes: u64,
+    pub cached_bytes: u64,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub(crate) struct PrecacheStatus {
     pub is_leader: bool,
@@ -327,6 +340,7 @@ pub(crate) struct PrecacheStatus {
     pub dcs: Vec<DcStatus>,
     pub series: Vec<GroupStatus>,
     pub cursors: Vec<GroupStatus>,
+    pub pins: Vec<PinStatus>,
     pub skipped_volumes: Vec<SkippedVolume>,
 }
 
@@ -524,6 +538,36 @@ impl Group {
     }
 }
 
+/// Register the status row of `dc` once: the hottest eligible tier with a usable target there.
+fn ensure_dc(ctx: &mut Ctx, elig: &[DiskTier], dc: &str) {
+    if ctx.dcs.contains_key(dc) {
+        return;
+    }
+    let (sm, placement) = (ctx.sm, ctx.placement);
+    let tier = elig
+        .iter()
+        .copied()
+        .find(|t| {
+            sm.nodes.iter().any(|(id, n)| {
+                let v = node_selection_view(*id, n, *t, placement);
+                v.datacenter.eq_ignore_ascii_case(dc) && v.has_target_tier_disk && !v.draining
+            })
+        })
+        .unwrap_or(elig[0]);
+    ctx.dcs.insert(
+        dc.to_string(),
+        DcStatus {
+            dc: dc.to_string(),
+            tier,
+            room_bytes: 0,
+            desired_bytes: 0,
+            cached_bytes: 0,
+            capacity_limited: false,
+            no_target: false,
+        },
+    );
+}
+
 fn plan_file(
     ctx: &mut Ctx,
     vol: &VolumeConfig,
@@ -674,7 +718,7 @@ pub(crate) fn plan_precache(
     // 1. Active volumes; an enabled policy that stopped validating is skipped, not planned.
     let mut vols: BTreeMap<&str, &VolumeConfig> = BTreeMap::new();
     for (vid, v) in &sm.volumes {
-        if v.precache.mode == PrecacheMode::Off {
+        if v.precache.mode == PrecacheMode::Off && v.precache.pins.is_empty() {
             continue;
         }
         match v.precache.validate(&v.cache_replicas, v.effective_mandatory_replicas()) {
@@ -695,6 +739,10 @@ pub(crate) fn plan_precache(
     for ((path, dc), act) in &snap.activity {
         let Some(fm) = sm.files.get(path) else { continue };
         let Some(vol) = vols.get(fm.volume_id.as_str()) else { continue };
+        // Mode off with pins only: reads create no cursors.
+        if vol.precache.mode == PrecacheMode::Off {
+            continue;
+        }
         if fm.is_directory || fm.symlink_target.is_some() || !within_window(now_ms, act.last_read_ms, vol) {
             continue;
         }
@@ -811,30 +859,7 @@ pub(crate) fn plan_precache(
         let rank = rank_run.2;
         rank_run.2 += 1;
 
-        if !ctx.dcs.contains_key(&g.dc) {
-            let tier = elig
-                .iter()
-                .copied()
-                .find(|t| {
-                    sm.nodes.iter().any(|(id, n)| {
-                        let v = node_selection_view(*id, n, *t, placement);
-                        v.datacenter.eq_ignore_ascii_case(&g.dc) && v.has_target_tier_disk && !v.draining
-                    })
-                })
-                .unwrap_or(elig[0]);
-            ctx.dcs.insert(
-                g.dc.clone(),
-                DcStatus {
-                    dc: g.dc.clone(),
-                    tier,
-                    room_bytes: 0,
-                    desired_bytes: 0,
-                    cached_bytes: 0,
-                    capacity_limited: false,
-                    no_target: false,
-                },
-            );
-        }
+        ensure_dc(&mut ctx, &elig, &g.dc);
         let (max_files, max_bytes) = if g.root.is_some() {
             (0, u64::from(pol.series_max_gb) * GIB)
         } else {
@@ -866,6 +891,45 @@ pub(crate) fn plan_precache(
             plan.status.series.push(st);
         } else {
             plan.status.cursors.push(st);
+        }
+    }
+
+    // Pins: whole files under each pinned prefix, ranked after every cursor copy.
+    let mut pin_ord: u32 = 0;
+    for (vid, vol) in &vols {
+        let elig = cache_tiers(vol);
+        for pin in &vol.precache.pins {
+            let dc = pin.datacenter.to_lowercase();
+            ensure_dc(&mut ctx, &elig, &dc);
+            let base = pin.prefix.trim_end_matches('/');
+            let mut listed: Vec<(&String, &FileMetadata)> = sm
+                .files
+                .range::<str, _>((Bound::Included(base), Bound::Unbounded))
+                .take_while(|(k, _)| k.starts_with(base))
+                .filter(|(k, fm)| {
+                    path_matches_prefix(k, base)
+                        && fm.volume_id == *vid
+                        && eligible_file(sm, k, fm, now_ms)
+                })
+                .take(MAX_PIN_FILES + 1)
+                .collect();
+            let truncated = listed.len() > MAX_PIN_FILES;
+            listed.truncate(MAX_PIN_FILES);
+            let mut ps = PinStatus {
+                volume: (*vid).to_string(),
+                prefix: pin.prefix.clone(),
+                dc: dc.clone(),
+                bytes: 0,
+                cached_bytes: 0,
+                truncated,
+            };
+            for (path, fm) in listed {
+                let fs = plan_file(&mut ctx, vol, &elig, &dc, path, fm, Take::Whole, u32::MAX, pin_ord);
+                ps.bytes += fs.desired_bytes;
+                ps.cached_bytes += fs.cached_bytes;
+            }
+            pin_ord += 1;
+            plan.status.pins.push(ps);
         }
     }
 
@@ -1381,6 +1445,101 @@ mod planner_tests {
         w.sm.files.get_mut(&e2).unwrap().cache_cooldown_until_ms.insert(0, NOW - 1);
         let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
         assert_eq!(per_path(&p)[&e2], 75);
+    }
+
+    fn pin(w: &mut W, prefix: &str, dc: &str) {
+        w.vol().precache.pins.push(dtfs_common::types::PrecachePin {
+            prefix: prefix.into(),
+            datacenter: dc.into(),
+        });
+    }
+
+    #[test]
+    fn pin_copies_every_chunk_ranked_after_cursor_copies() {
+        let mut w = show5();
+        for n in ["a", "b"] {
+            w.file(&format!("/tv/Bluey/{n}.mkv"), 75, &[1]);
+        }
+        pin(&mut w, "/tv/Bluey", "TORO");
+        let p = w.plan(&[("/tv/Show/Season 01/E01.mkv", "toro")]);
+        let m = per_path(&p);
+        assert_eq!((m["/tv/Bluey/a.mkv"], m["/tv/Bluey/b.mkv"]), (75, 75));
+        assert!(p.copies.iter().all(|c| c.target_node == 2));
+        let first_pin = p.copies.iter().position(|c| c.file_path.starts_with("/tv/Bluey")).unwrap();
+        assert!(first_pin > 0 && p.copies[..first_pin].iter().all(|c| c.file_path.starts_with("/tv/Show")));
+        assert!(p.copies[first_pin..].iter().all(|c| c.file_path.starts_with("/tv/Bluey")));
+        let ps = &p.status.pins[0];
+        assert_eq!((ps.prefix.as_str(), ps.dc.as_str(), ps.bytes, ps.cached_bytes, ps.truncated),
+            ("/tv/Bluey", "toro", 600 * MIB, 0, false));
+    }
+
+    #[test]
+    fn pin_of_cached_chunk_is_protected_not_copied() {
+        let mut w = world();
+        w.file("/tv/Bluey/a.mkv", 75, &[1, 2]);
+        pin(&mut w, "/tv/Bluey", "toro");
+        let p = w.plan(&[]);
+        assert!(p.copies.is_empty());
+        assert!(p.protected.contains(&("/tv/Bluey/a.mkv#0".to_string(), 2)));
+        assert_eq!(p.status.pins[0].cached_bytes, 300 * MIB);
+    }
+
+    #[test]
+    fn pin_acts_with_mode_off_and_ignores_reads() {
+        let mut w = world();
+        w.vol().precache.mode = PrecacheMode::Off;
+        w.series("/tv/Show", &["E01.mkv", "E02.mkv"]);
+        w.file("/tv/Bluey/a.mkv", 75, &[1]);
+        pin(&mut w, "/tv/Bluey", "toro");
+        let p = w.plan(&[("/tv/Show/E01.mkv", "toro")]);
+        assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), ["/tv/Bluey/a.mkv"]);
+        assert!(p.status.series.is_empty() && p.status.cursors.is_empty());
+        // Without the pin, mode off plans nothing.
+        w.vol().precache.pins.clear();
+        assert!(w.plan(&[]).copies.is_empty());
+    }
+
+    #[test]
+    fn pin_prefix_matches_whole_components_and_own_volume_only() {
+        let mut w = world();
+        w.file("/tv/Bluey/a.mkv", 75, &[1]);
+        w.file("/tv/Bluey2/a.mkv", 75, &[1]);
+        w.file("/tv/Bluey/other.mkv", 75, &[1]);
+        w.sm.files.get_mut("/tv/Bluey/other.mkv").unwrap().volume_id = "w".into();
+        pin(&mut w, "/tv/Blue", "toro");
+        assert!(w.plan(&[]).copies.is_empty(), "/tv/Blue must not match /tv/Bluey");
+        w.vol().precache.pins.clear();
+        pin(&mut w, "/tv/Bluey/", "toro");
+        let p = w.plan(&[]);
+        assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), ["/tv/Bluey/a.mkv"]);
+    }
+
+    #[test]
+    fn pin_respects_anchor_pending_and_already_held_node() {
+        let mut w = world();
+        w.file("/tv/Bluey/pending.mkv", 75, &[3]); // no anchor replica yet
+        w.file("/tv/Bluey/ok.mkv", 75, &[1]);
+        pin(&mut w, "/tv/Bluey", "toro");
+        let p = w.plan(&[]);
+        assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), ["/tv/Bluey/ok.mkv"]);
+        assert!(!p.protected.iter().any(|(c, _)| c.contains("pending")));
+    }
+
+    #[test]
+    fn pin_listing_is_capped_and_flags_truncated() {
+        let mut w = world();
+        w.vol().precache.mode = PrecacheMode::Off;
+        for i in 0..MAX_PIN_FILES {
+            w.file(&format!("/big/{i:05}.mkv"), 4, &[1]);
+        }
+        pin(&mut w, "/big", "toro");
+        let p = w.plan(&[]);
+        assert!(!p.status.pins[0].truncated, "exactly the cap is not truncated");
+        assert_eq!(per_path(&p).len(), MAX_PIN_FILES);
+        w.file("/big/zzzzz.mkv", 4, &[1]);
+        let p = w.plan(&[]);
+        assert!(p.status.pins[0].truncated);
+        assert_eq!(per_path(&p).len(), MAX_PIN_FILES);
     }
 
     #[test]

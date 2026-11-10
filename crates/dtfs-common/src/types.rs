@@ -614,7 +614,20 @@ pub struct PrecachePolicy {
     /// Series kept pre-cached per volume per DC (plex mode).
     #[serde(default = "PrecachePolicy::default_max_series")]
     pub max_series: u32,
+    /// Operator-pinned subtrees kept pre-cached in a DC whatever the mode.
+    #[serde(default)]
+    pub pins: Vec<PrecachePin>,
 }
+
+/// Subtree `prefix` pinned to the cache of datacenter `datacenter`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrecachePin {
+    pub prefix: String,
+    pub datacenter: String,
+}
+
+/// Pins per volume.
+pub const MAX_PRECACHE_PINS: usize = 32;
 
 impl PrecachePolicy {
     fn default_next_files() -> u32 { 2 }
@@ -628,7 +641,18 @@ impl PrecachePolicy {
         cache: &CacheReplication,
         mandatory: &TierReplication,
     ) -> Result<(), String> {
-        if self.mode == PrecacheMode::Off {
+        if self.pins.len() > MAX_PRECACHE_PINS {
+            return Err(format!("at most {MAX_PRECACHE_PINS} pins per volume"));
+        }
+        for p in &self.pins {
+            if !p.prefix.starts_with('/') || p.prefix.trim_end_matches('/').is_empty() {
+                return Err(format!("pin prefix '{}' must start with '/' and name a subtree, not '/'", p.prefix));
+            }
+            if p.datacenter.trim().is_empty() {
+                return Err(format!("pin '{}' needs a datacenter", p.prefix));
+            }
+        }
+        if self.mode == PrecacheMode::Off && self.pins.is_empty() {
             return Ok(());
         }
         let usable = (cache.hot.max > 0 && mandatory.hot == 0)
@@ -661,6 +685,7 @@ impl Default for PrecachePolicy {
             next_max_gb: 0,
             series_max_gb: Self::default_series_max_gb(),
             max_series: Self::default_max_series(),
+            pins: Vec::new(),
         }
     }
 }
@@ -945,6 +970,34 @@ mod tests {
         assert_eq!(cfg.precache, PrecachePolicy::default());
         let p: PrecachePolicy = serde_json::from_str("{}").unwrap();
         assert_eq!(p, PrecachePolicy::default());
+    }
+
+    #[test]
+    fn precache_pins_old_json_loads_empty() {
+        let p: PrecachePolicy = serde_json::from_str(r#"{"mode":"plex","next_files":2}"#).unwrap();
+        assert!(p.pins.is_empty());
+        let p: PrecachePolicy =
+            serde_json::from_str(r#"{"pins":[{"prefix":"/tv/Bluey","datacenter":"toro"}]}"#).unwrap();
+        assert_eq!(p.pins, vec![PrecachePin { prefix: "/tv/Bluey".into(), datacenter: "toro".into() }]);
+    }
+
+    #[test]
+    fn precache_pin_validate() {
+        let (c, m) = pc_warm_cache();
+        let pin = |p: &str| PrecachePin { prefix: p.into(), datacenter: "toro".into() };
+        let with = |pins: Vec<PrecachePin>| PrecachePolicy { pins, ..PrecachePolicy::default() };
+        // Mode off with a pin is valid and still needs a cache tier.
+        assert!(with(vec![pin("/tv/x")]).validate(&c, &m).is_ok());
+        assert!(with(vec![pin("/tv/x")]).validate(&CacheReplication::default(), &m).unwrap_err().contains("cache tier"));
+        for bad in ["", "/", "//", "tv/x"] {
+            let e = with(vec![pin(bad)]).validate(&c, &m).unwrap_err();
+            assert!(e.contains("must start with '/'"), "{bad}: {e}");
+        }
+        let e = with(vec![PrecachePin { prefix: "/a".into(), datacenter: " ".into() }]).validate(&c, &m).unwrap_err();
+        assert!(e.contains("datacenter"), "{e}");
+        let many = |n: usize| with((0..n).map(|i| pin(&format!("/p{i}"))).collect());
+        assert!(many(32).validate(&c, &m).is_ok());
+        assert!(many(33).validate(&c, &m).unwrap_err().contains("at most 32"));
     }
 
     #[test]
