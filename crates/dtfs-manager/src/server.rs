@@ -341,6 +341,10 @@ fn raft_pre_body_check<'a>(
     if secret.is_empty() {
         return Ok(RAFT_MAX_BODY_BYTES);
     }
+    // Permissive rollout: an unsigned sender (no secret yet) keeps the legacy gRPC cap.
+    if !require && ts.is_none() && mac.is_none() {
+        return Ok(grpc_cap);
+    }
     // Only new senders use the snapshot path, and they always pre-stamp the
     // declared length, so no unauthenticated peer can force a large buffer.
     let from = hdr(n::RAFT_RPC_FROM_HEADER).and_then(|f| f.parse::<u64>().ok());
@@ -637,6 +641,16 @@ mod raft_transport_hardening_tests {
     }
 
     #[test]
+    fn unsigned_snapshot_permissive_gets_grpc_cap_and_require_refuses() {
+        let none = |_: &str| None;
+        assert_eq!(raft_pre_body_check(SECRET, false, true, 2, 1000, 0, none), Ok(1000));
+        assert_eq!(
+            raft_pre_body_check(SECRET, true, true, 2, 1000, 0, none),
+            Err((7, "missing stamp"))
+        );
+    }
+
+    #[test]
     fn mac_bound_to_body_and_target() {
         let (ts, mac) = stamp();
         let d = |b: &str| raft_auth_decision(SECRET, true, Some(&ts), Some(&mac), b, now());
@@ -926,8 +940,9 @@ mod raft_transport_hardening_tests {
     /// pre-stamp before any body is read.
     #[tokio::test]
     async fn issue_113_snapshot_path_needs_pre_stamp() {
+        let (mut strict, _h0) = svc_with(1, SECRET, true).await;
+        assert_eq!(call(&mut strict, SNAP, &[], unreadable()).await, "7");
         let (mut svc, _h) = svc_with(1, SECRET, false).await;
-        assert_eq!(call(&mut svc, SNAP, &[], unreadable()).await, "7");
         let mut h = signed(&svc, b"abc", None);
         h[3].1 = "999999999".to_string(); // declared length no longer matches the pre-MAC
         assert_eq!(call(&mut svc, SNAP, &h, unreadable()).await, "7");
