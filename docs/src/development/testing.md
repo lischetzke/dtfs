@@ -29,7 +29,7 @@ Unit tests sit beside the code in `#[cfg(test)]` modules or `tests.rs` files (`d
 
 ## Dormant harnesses
 
-`tests/release/`, `tests/chaos/` and `tests/integration/` are shell harnesses for a live cluster (the integration one can target the local dev cluster below). They are not part of the verification loop and need no change to ship a fix. See [Lab: Chaos Testing](../lab/chaos-testing.md) and [Release Testing](../lab/release-testing.md).
+`tests/release/` (the lab release gate, chaos cases included; needs a lab inventory, see [Lab: Chaos Testing](../lab/chaos-testing.md) and [Release Testing](../lab/release-testing.md)) and `tests/integration/` (shell scripts that target the local dev cluster below) are the only cluster harnesses left. They are not part of the verification loop and need no change to ship a fix. CI (`.github/workflows/ci.yml`) starts no cluster: runtime behaviour is checked by hand on `scripts/dev-cluster.sh` (`empty-files`, `big-file`, `nfs-check`). The unreferenced Ansible and performance harnesses and the stale chaos README were removed (#137).
 
 The host-side Python tooling under `tools/dtfs-mcp` is tested separately (`uv run --with pytest --with "mcp<2" --with httpx pytest tools/dtfs-mcp`), outside the cargo loop.
 
