@@ -52,6 +52,26 @@ impl Drop for TmpCleanup {
     }
 }
 
+/// Longest wait for the next PutChunk piece before the put fails with
+/// DEADLINE_EXCEEDED (the tmp is removed by `TmpCleanup`, the slot freed).
+const PUT_PIECE_IDLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(if cfg!(test) { 1 } else { 60 });
+
+async fn next_put_piece(
+    stream: &mut Streaming<PutChunkRequest>,
+) -> Result<Option<PutChunkRequest>, Status> {
+    match tokio::time::timeout(PUT_PIECE_IDLE_TIMEOUT, stream.message()).await {
+        Ok(r) => r.map_err(|e| Status::internal(e.to_string())),
+        Err(_) => {
+            tracing::warn!(idle_secs = PUT_PIECE_IDLE_TIMEOUT.as_secs(), "put_chunk rejected: sender idle, stream abandoned");
+            Err(Status::deadline_exceeded(format!(
+                "put_chunk: no piece within {}s",
+                PUT_PIECE_IDLE_TIMEOUT.as_secs()
+            )))
+        }
+    }
+}
+
 /// Bug BU/BU-3 — map a put_chunk I/O error to a typed gRPC status. A
 /// no-space error (ENOSPC, errno 28) becomes `RESOURCE_EXHAUSTED` so the
 /// client can distinguish "disk full, reroute" from a real internal
@@ -196,7 +216,13 @@ pub async fn run_grpc_server(
 
     // CF-6 — when the [tls] context resolved certificates, every incoming
     // connection must complete a mutual-TLS handshake against the cluster CA.
-    let mut builder = tonic::transport::Server::builder();
+    // A dead PutChunk sender (client crash, network cut) must not hold a
+    // write slot forever: keepalives detect the dead peer, and
+    // `next_put_piece` bounds the wait for each piece.
+    let mut builder = tonic::transport::Server::builder()
+        .http2_keepalive_interval(Some(std::time::Duration::from_secs(10)))
+        .http2_keepalive_timeout(Some(std::time::Duration::from_secs(20)))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(30)));
     if let Some(server_tls) = tls.server_tls() {
         builder = builder
             .tls_config(server_tls)
@@ -460,11 +486,7 @@ impl DataService for DataServiceImpl {
         let mut stream = request.into_inner();
 
         // Pull the first piece to learn the requested volume_id + tier.
-        let first = match stream
-            .message()
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-        {
+        let first = match next_put_piece(&mut stream).await? {
             Some(m) => m,
             None => {
                 return Err(Status::invalid_argument(
@@ -519,11 +541,7 @@ impl DataService for DataServiceImpl {
                     .map_err(|e| io_status("write tmp", e))?;
             }
             // Remaining pieces.
-            while let Some(msg) = stream
-                .message()
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-            {
+            while let Some(msg) = next_put_piece(&mut stream).await? {
                 if msg.data.is_empty() {
                     continue;
                 }
@@ -1851,6 +1869,19 @@ max_io_percent = 10
         declared_chunk_id: &str,
         data: &[u8],
     ) -> (Result<PutChunkResponse, Status>, Arc<ChunkStore>) {
+        let req = PutChunkRequest {
+            chunk_id: declared_chunk_id.to_string(),
+            volume_id: String::new(),
+            tier: "hot".to_string(),
+            data: data.to_vec(),
+        };
+        run_put_chunk_stream(disk_path, tokio_stream::iter(vec![req])).await
+    }
+
+    async fn run_put_chunk_stream(
+        disk_path: &std::path::Path,
+        pieces: impl tokio_stream::Stream<Item = PutChunkRequest> + Send + 'static,
+    ) -> (Result<PutChunkResponse, Status>, Arc<ChunkStore>) {
         use dtfs_proto::dtfs::data::data_service_client::DataServiceClient;
         use tokio_stream::wrappers::TcpListenerStream;
 
@@ -1873,13 +1904,7 @@ max_io_percent = 10
             .unwrap();
         let mut client = DataServiceClient::new(channel);
 
-        let req = PutChunkRequest {
-            chunk_id: declared_chunk_id.to_string(),
-            volume_id: String::new(),
-            tier: "hot".to_string(),
-            data: data.to_vec(),
-        };
-        let mut request = Request::new(tokio_stream::iter(vec![req]));
+        let mut request = Request::new(pieces);
         if let Some((ts, mac)) = stamp_data_rpc_auth(&secret, "PutChunk", "") {
             request
                 .metadata_mut()
@@ -1944,6 +1969,56 @@ max_io_percent = 10
         let (result, store) = run_put_chunk(tmp.path(), &real_id.as_hex(), data).await;
         let resp = result.expect("matching declared id must be accepted");
         assert_eq!(resp.chunk_id, real_id.as_hex());
+        assert!(store.has_chunk(&real_id).await);
+    }
+
+    fn piece(data: &[u8]) -> PutChunkRequest {
+        PutChunkRequest {
+            chunk_id: String::new(),
+            volume_id: String::new(),
+            tier: "hot".to_string(),
+            data: data.to_vec(),
+        }
+    }
+
+    fn streaming_tmps(disk: &std::path::Path) -> usize {
+        std::fs::read_dir(disk.join("tmp"))
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".dat.tmp"))
+            .count()
+    }
+
+    /// A sender that goes silent after the first piece (dead client) fails
+    /// with DEADLINE_EXCEEDED after PUT_PIECE_IDLE_TIMEOUT and leaves no tmp.
+    #[tokio::test]
+    async fn put_chunk_idle_sender_times_out_and_removes_tmp() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(piece(b"first")).await.unwrap();
+        let run = run_put_chunk_stream(tmp.path(), ReceiverStream::new(rx));
+        let (result, _store) = tokio::time::timeout(std::time::Duration::from_secs(15), run)
+            .await
+            .expect("an idle put must not hang");
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+        drop(tx);
+        assert_eq!(streaming_tmps(tmp.path()), 0, "tmp removed on timeout");
+    }
+
+    /// Pieces that arrive slower than streaming but within the idle bound
+    /// commit normally.
+    #[tokio::test]
+    async fn put_chunk_slow_sender_within_idle_bound_commits() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            for p in [&b"slow-"[..], b"but-", b"alive"] {
+                tx.send(piece(p)).await.unwrap();
+                tokio::time::sleep(PUT_PIECE_IDLE_TIMEOUT / 4).await;
+            }
+        });
+        let (result, store) = run_put_chunk_stream(tmp.path(), ReceiverStream::new(rx)).await;
+        let real_id = ChunkId::from_bytes(checksum::compute(b"slow-but-alive"));
+        assert_eq!(result.expect("slow put commits").chunk_id, real_id.as_hex());
         assert!(store.has_chunk(&real_id).await);
     }
 }
