@@ -631,6 +631,15 @@ fn file_changed_under_lease(snap: &FileLocations, fresh: &FileLocations, in_flig
                 || snap.chunks.iter().any(|c| c.chunk_index.is_some_and(|i| fresh.chunk_at(i).is_none()))))
 }
 
+/// #124: a read-only handle re-fetches a file another client may be growing
+/// at most this often, and only when a read reaches its snapshot's EOF.
+const EOF_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+/// #124: is an EOF refresh due, given the last one?
+fn eof_refresh_due(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= EOF_REFRESH_INTERVAL)
+}
+
 /// #149: how long a replica that failed a chunk fetch is tried last.
 const FAILED_REPLICA_DEMOTE: Duration = Duration::from_secs(30);
 
@@ -770,6 +779,10 @@ struct OpenFile {
     /// its missing entries are confirmed holes and a failed read on it is not
     /// re-fetched again (until the snapshot changes).
     holes_confirmed: Option<Weak<FileLocations>>,
+    /// #124: when read() last re-fetched because it read at or past the
+    /// snapshot's EOF (read-only handles; at most once per
+    /// `EOF_REFRESH_INTERVAL`).
+    eof_refetch_at: Option<Instant>,
     /// `write.async_commit`: a failed background commit of this path,
     /// reported once by the next fsync/flush/release on this fh (EIO).
     write_error: Option<String>,
@@ -1288,6 +1301,7 @@ impl DtfsFilesystem {
                 last_read_chunk: None,
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
+                eof_refetch_at: None,
                 write_error: None,
                 failed_chunks: Vec::new(),
                 close_seen: false,
@@ -1400,6 +1414,25 @@ impl DtfsFilesystem {
         let buffered_eof = self.write_buffer.visible_size(&file_path).unwrap_or(0);
         let file_size = locations.total_size.max(buffered_eof);
         if offset >= file_size {
+            // #124: another client may have grown the file since this
+            // read-only handle's snapshot. Re-fetch (rate-limited); the new
+            // snapshot makes read() run another pass. Not with a local
+            // writer: its commits merge into the handles, and the guarded
+            // fetch would wait for its batches to go quiet.
+            let local_writer = self.has_writable_handle(&file_path);
+            let due = !local_writer && self.open_files.get_mut(&fh).is_some_and(|mut f| {
+                let now = Instant::now();
+                let due = eof_refresh_due(f.eof_refetch_at, now);
+                if due {
+                    f.eof_refetch_at = Some(now);
+                }
+                due
+            });
+            if due {
+                if let Err(e) = self.refetch_locations(&file_path).await {
+                    debug!(path = %file_path, error = %format!("{e:#}"), "EOF refresh failed; serving EOF");
+                }
+            }
             return Ok((Bytes::new(), locations));
         }
         let actual_size = effective_read_len(file_size, offset, size);
@@ -3143,6 +3176,7 @@ impl DtfsFilesystem {
                 last_read_chunk: None,
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
+                eof_refetch_at: None,
                 write_error: None,
                 failed_chunks: Vec::new(),
                 close_seen: false,
@@ -6778,6 +6812,7 @@ mod async_commit_fs_tests {
                 last_read_chunk: None,
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
+                eof_refetch_at: None,
                 write_error: None,
                 failed_chunks: Vec::new(),
                 close_seen: false,
@@ -8588,6 +8623,43 @@ mod async_commit_fs_tests {
         resized.total_size = 2 * cs - 1;
         assert!(file_changed_under_lease(&snap, &resized, Some(&[]), true), "boundary: size off by one");
         assert!(!file_changed_under_lease(&snap, &snap, Some(&[]), true));
+    }
+
+    /// #124: a read-only handle reading at its snapshot's EOF re-fetches
+    /// (the file grew on another client) at most once per
+    /// EOF_REFRESH_INTERVAL; not while a local writer of the path is open.
+    #[tokio::test]
+    async fn reader_at_eof_refetches_a_growing_file_rate_limited() {
+        let fs = fs(false);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fetches = Arc::new(AtomicU64::new(0));
+        let n = fetches.clone();
+        *fs.locations_fetch_hook.lock().unwrap() = Some(Box::new(move |_| {
+            n.fetch_add(1, Ordering::Relaxed);
+            holes("/f", 2 * cs, cs)
+        }));
+        let fh = open(&fs, "/f", OpenFlags::ReadOnly);
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(holes("/f", cs, cs)));
+        let got = fs.read(fh, cs, 4).await.unwrap();
+        assert_eq!(got.len(), 4, "grown region (a hole) served, not EOF");
+        let before = fetches.load(Ordering::Relaxed);
+        assert!(before >= 1);
+        assert!(fs.read(fh, 2 * cs, 4).await.unwrap().is_empty());
+        assert_eq!(fetches.load(Ordering::Relaxed), before, "boundary: within the interval, no fetch");
+        let w = open(&fs, "/f", OpenFlags::ReadWrite);
+        fs.open_files.get_mut(&w).unwrap().locations = Some(Arc::new(holes("/f", cs, cs)));
+        fs.open_files.get_mut(&fh).unwrap().eof_refetch_at = None;
+        assert!(fs.read(w, 2 * cs, 4).await.unwrap().is_empty());
+        assert!(fs.read(fh, 2 * cs, 4).await.unwrap().is_empty());
+        assert_eq!(fetches.load(Ordering::Relaxed), before, "local writer open: no EOF refresh");
+    }
+
+    #[test]
+    fn eof_refresh_is_due_once_per_interval() {
+        let t = Instant::now();
+        assert!(eof_refresh_due(None, t));
+        assert!(!eof_refresh_due(Some(t), t + EOF_REFRESH_INTERVAL - Duration::from_millis(1)));
+        assert!(eof_refresh_due(Some(t), t + EOF_REFRESH_INTERVAL), "boundary");
     }
 
     /// #135: stat (lookup, link, logical_size) asks the manager for

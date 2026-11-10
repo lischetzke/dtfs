@@ -383,6 +383,12 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   pass (every candidate failed) re-fetches the locations once per snapshot
   and per call (`holes_confirmed` marks a re-fetched snapshot) and retries
   (#124): a snapshot taken while a replica was down lacks it.
+  A read at or past the snapshot's EOF re-fetches (`refetch_locations`)
+  at most once per `EOF_REFRESH_INTERVAL` (2 s) per fh
+  (`eof_refetch_at`, `eof_refresh_due`), so a reader sees a file growing
+  on another client; not while a writable handle of the path is open
+  (local commits merge, and the guarded fetch would wait on its batches).
+  No per-read fetch.
 
 - Foreground miss: first `readahead.join_pending()` on the FIRST candidate
   only, bounded by `PREFETCH_JOIN_TIMEOUT` (2 s), refusing to wait on a
