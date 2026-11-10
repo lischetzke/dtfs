@@ -173,6 +173,7 @@ pub(super) async fn create_volume(
         anchor: None,
         spill: dtfs_common::types::SpillPolicy::default(),
         version: 0,
+        precache: dtfs_common::types::PrecachePolicy::default(),
     };
 
     // Some(0) = "must not exist": a concurrent create loses with 409.
@@ -366,6 +367,13 @@ pub(crate) fn volume_config_to_json(
             "forbidden_tiers":       cfg.spill.forbidden_tiers,
             "forbidden_datacenters": cfg.spill.forbidden_datacenters,
         },
+        "precache": {
+            "mode":          cfg.precache.mode,
+            "next_files":    cfg.precache.next_files,
+            "next_max_gb":   cfg.precache.next_max_gb,
+            "series_max_gb": cfg.precache.series_max_gb,
+            "max_series":    cfg.precache.max_series,
+        },
     })
 }
 
@@ -481,6 +489,87 @@ pub(super) async fn set_volume_cache_endpoint(
         state.audit_log.log(
             "api", "volume.set_cache", &volume_id, "noop",
         );
+    }
+
+    Ok(Json(json!({
+        "volume_id": volume_id,
+        "changed": changed,
+        "config": volume_config_to_json(&next),
+    })))
+}
+
+/// Request body for `POST /api/v1/volumes/{id}/set-precache`. Every field is
+/// optional; supplied fields are merged onto the current policy.
+#[derive(Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SetPrecacheRequest {
+    pub mode: Option<dtfs_common::types::PrecacheMode>,
+    pub next_files: Option<u32>,
+    pub next_max_gb: Option<u32>,
+    pub series_max_gb: Option<u32>,
+    pub max_series: Option<u32>,
+}
+
+/// Merge a partial precache update onto a clone of `current`, then validate
+/// it against the volume's own tier policy.
+pub(crate) fn apply_set_precache(
+    current: &dtfs_common::types::VolumeConfig,
+    req: &SetPrecacheRequest,
+) -> Result<dtfs_common::types::VolumeConfig, String> {
+    let mut next = current.clone();
+    if let Some(v) = req.mode { next.precache.mode = v; }
+    if let Some(v) = req.next_files { next.precache.next_files = v; }
+    if let Some(v) = req.next_max_gb { next.precache.next_max_gb = v; }
+    if let Some(v) = req.series_max_gb { next.precache.series_max_gb = v; }
+    if let Some(v) = req.max_series { next.precache.max_series = v; }
+    next.precache.validate(&next.cache_replicas, next.effective_mandatory_replicas())?;
+    Ok(next)
+}
+
+pub(super) async fn set_volume_precache_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(volume_id): axum::extract::Path<String>,
+    Json(body): Json<SetPrecacheRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, Json<Value>)> {
+    use axum::http::StatusCode;
+
+    let (current, gate_open) = {
+        let sm = state.sm_data.read().await;
+        (sm.volumes.get(&volume_id).cloned(), dtfs_raft::state_machine::cluster_on_v0_1_16(&sm))
+    };
+    let Some(current) = current else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("volume not found: {volume_id}")})),
+        ));
+    };
+
+    let next = apply_set_precache(&current, &body).map_err(|e| {
+        warn!(volume = %volume_id, error = %e, "set_volume_precache rejected");
+        (StatusCode::BAD_REQUEST, Json(json!({"error": e})))
+    })?;
+
+    let changed = current != next;
+    if changed {
+        // Older appliers drop the unknown `precache` field and would diverge.
+        if !gate_open {
+            warn!(volume = %volume_id, "set_volume_precache refused: cluster not on v0.1.16");
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "pre-caching needs every manager on v0.1.16 or later",
+                    "min_version": "v0.1.16",
+                })),
+            ));
+        }
+        let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: next.clone(), expected_version: Some(current.version) };
+        let resp = state.raft.client_write(req).await.map_err(|e| {
+            warn!(volume = %volume_id, error = %e, "set_volume_precache Raft write failed");
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": format!("raft write failed: {e}")})))
+        })?;
+        volume_cas_check(&resp.data)?;
+        state.audit_log.log("api", "volume.set_precache", &volume_id, "success");
+    } else {
+        state.audit_log.log("api", "volume.set_precache", &volume_id, "noop");
     }
 
     Ok(Json(json!({

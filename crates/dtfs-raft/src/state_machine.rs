@@ -2703,6 +2703,23 @@ pub fn cluster_on_v0_1_15(sm: &StateMachineData) -> bool {
         })
 }
 
+/// First release that understands `VolumeConfig.precache`.
+pub const V0_1_16_MIN_VERSION: (u64, u64, u64) = (0, 1, 16);
+
+/// Same membership rule as [`cluster_on_v0_1_15`], at [`V0_1_16_MIN_VERSION`].
+/// An older applier drops the unknown `precache` field of `UpsertVolume`
+/// and would diverge, so the proposer sets it only while this is true.
+pub fn cluster_on_v0_1_16(sm: &StateMachineData) -> bool {
+    let mut members = sm.last_membership.nodes().peekable();
+    members.peek().is_some()
+        && members.all(|(id, _)| {
+            sm.nodes.get(id).is_some_and(|n| {
+                n.role == dtfs_common::types::NodeRole::Manager
+                    && dtfs_common::version::release_at_least(&n.version, V0_1_16_MIN_VERSION)
+            })
+        })
+}
+
 /// Guard half of `RemoveChunkLocation`, shared with the manager's
 /// remove-dead-node planner so plan and apply cannot disagree.
 /// `Ok(false)` = nothing to remove (idempotent no-op), `Ok(true)` = the

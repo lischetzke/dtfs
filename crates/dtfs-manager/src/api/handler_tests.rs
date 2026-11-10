@@ -401,6 +401,7 @@ fn vol(id: &str) -> dtfs_common::types::VolumeConfig {
         anchor: None,
         spill: SpillPolicy::default(),
         version: 0,
+        precache: PrecachePolicy::default(),
     }
 }
 
@@ -837,4 +838,87 @@ fn delete_volume_recheck_refuses_a_file_that_appeared() {
     assert_eq!(e.0, StatusCode::CONFLICT);
     assert_eq!(e.1.0["files"], json!(1));
     assert!(delete_volume_check("media", &u, true).is_ok());
+}
+
+// ---- pre-caching policy endpoint --------------------------------------------
+
+fn plex_req() -> SetPrecacheRequest {
+    SetPrecacheRequest { mode: Some(dtfs_common::types::PrecacheMode::Plex), ..Default::default() }
+}
+
+/// Volume with warm cache 1/1 per-DC and warm mandatory 0 (precache-capable).
+fn precache_vol(id: &str) -> dtfs_common::types::VolumeConfig {
+    let mut v = vol(id);
+    v.mandatory_replicas = dtfs_common::types::TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+    v.cache_replicas.warm = dtfs_common::types::CacheTierConfig { min: 1, max: 1 };
+    v.cache_replicas.per_dc = true;
+    v
+}
+
+fn open_v0_1_16_gate(sm: &mut dtfs_raft::state_machine::StateMachineData) {
+    let mut m = data_node(0);
+    m.role = dtfs_common::types::NodeRole::Manager;
+    m.version = "v0.1.16".into();
+    sm.nodes.insert(10, m);
+    let nodes: std::collections::BTreeMap<u64, dtfs_raft::DtfsNode> =
+        [(10, dtfs_raft::DtfsNode { addr: String::new(), hostname: String::new() })].into();
+    let mem = openraft::Membership::new(vec![[10u64].into_iter().collect()], nodes).unwrap();
+    sm.last_membership = openraft::StoredMembership::new(None, mem);
+}
+
+#[test]
+fn apply_set_precache_merges_and_refuses() {
+    use dtfs_common::types::PrecacheMode;
+    let next = apply_set_precache(&precache_vol("v"), &SetPrecacheRequest {
+        series_max_gb: Some(5), max_series: Some(2), ..plex_req()
+    }).unwrap();
+    assert_eq!(next.precache.mode, PrecacheMode::Plex);
+    assert_eq!((next.precache.series_max_gb, next.precache.max_series, next.precache.next_files), (5, 2, 2));
+    // No cache tier on the volume.
+    assert!(apply_set_precache(&vol("v"), &plex_req()).unwrap_err().contains("cache tier"));
+    // per_dc off.
+    let mut v = precache_vol("v");
+    v.cache_replicas.per_dc = false;
+    assert!(apply_set_precache(&v, &plex_req()).unwrap_err().contains("per_dc"));
+    // Plex with series_max_gb 0.
+    let e = apply_set_precache(&precache_vol("v"), &SetPrecacheRequest { series_max_gb: Some(0), ..plex_req() }).unwrap_err();
+    assert!(e.contains("series_max_gb"), "{e}");
+}
+
+#[tokio::test]
+async fn set_precache_404_400_409_and_noop() {
+    let h = harness().await;
+    let p = || axum::extract::Path("v".to_string());
+    let e = set_volume_precache_endpoint(State(h.state.clone()), p(), Json(plex_req())).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::NOT_FOUND);
+
+    h.state.sm_data.write().await.volumes.insert("v".into(), vol("v"));
+    let e = set_volume_precache_endpoint(State(h.state.clone()), p(), Json(plex_req())).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::BAD_REQUEST, "no cache tier");
+
+    h.state.sm_data.write().await.volumes.insert("v".into(), precache_vol("v"));
+    // Dev/unstamped cluster: gate closed, a real change is refused.
+    let e = set_volume_precache_endpoint(State(h.state.clone()), p(), Json(plex_req())).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert!(e.1.0["error"].as_str().unwrap().contains("v0.1.16"), "{:?}", e.1.0);
+    assert_eq!(e.1.0["min_version"], "v0.1.16");
+
+    // A no-change body needs no gate and no write.
+    let r = set_volume_precache_endpoint(State(h.state.clone()), p(), Json(SetPrecacheRequest::default())).await.unwrap();
+    assert_eq!(r.0["changed"], false);
+    assert_eq!(r.0["config"]["precache"]["mode"], "off");
+
+    // Gate open: past the gate; the leaderless Raft write is what fails (503).
+    open_v0_1_16_gate(&mut *h.state.sm_data.write().await);
+    let e = set_volume_precache_endpoint(State(h.state.clone()), p(), Json(plex_req())).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[test]
+fn volume_json_carries_precache_block() {
+    let mut v = precache_vol("v");
+    v.precache.mode = dtfs_common::types::PrecacheMode::Plex;
+    let j = volume_config_to_json(&v);
+    assert_eq!(j["precache"]["mode"], "plex");
+    assert_eq!(j["precache"]["series_max_gb"], 20);
 }

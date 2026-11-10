@@ -204,6 +204,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // `cache_replicas`; omitted fields keep their current
         // values. Atomic via Raft UpsertVolume.
         .route("/api/v1/volumes/{id}/set-cache", post(set_volume_cache_endpoint))
+        // Predictive pre-caching policy (v0.1.16 gate on the proposer).
+        .route("/api/v1/volumes/{id}/set-precache", post(set_volume_precache_endpoint))
         // CF-3a — operator-friendly write-safety editor. Merges the
         // supplied min_replicas_before_ack / write_timeout_secs into
         // the volume's `write_safety`; omitted fields keep their

@@ -69,6 +69,24 @@ dtfs-cli volumes set-write-safety media --min-replicas-before-ack 1 --write-time
 
 Result: every chunk has one cold replica in `leli`; two reads from a datacenter within four hours add one warm replica there; an operator flush removes it and blocks re-promotion for five minutes while the cold anchor stays.
 
+## Pre-caching policy
+
+`precache` (set with `dtfs-cli volumes set-precache` or `POST /api/v1/volumes/{id}/set-precache`) tells the manager to copy the files a reader is likely to open next into the reader's datacenter cache tier. It only adds cache replicas; the existing idle demote removes them.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `mode` | `off` | `off`, `files` (next files in the same directory) or `plex` (next episodes of a series whose root holds a `.plexmatch` file) |
+| `next_files` | 2 | whole files to pre-cache after the file being watched |
+| `next_max_gb` | 0 | GiB cap on that selection (0 = no byte cap) |
+| `series_max_gb` | 20 | GiB budget per series (plex) |
+| `max_series` | 3 | series kept pre-cached per volume per datacenter (plex) |
+
+Constraints for any mode other than `off`: a cache tier with `cache_replicas.<tier>.max > 0` whose `mandatory_replicas.<tier>` is 0, and `cache_replicas.per_dc = true`. Plex needs `series_max_gb` and `max_series` above 0; files needs `next_files` or `next_max_gb` above 0. The setting needs every manager on v0.1.16 or later (409 otherwise).
+
+```bash
+dtfs-cli volumes set-precache media --mode plex --series-max-gb 20 --max-series 3
+```
+
 ## Deleting a volume
 
 `dtfs-cli volumes delete <id>` (REST `DELETE /api/v1/volumes/{id}`). An empty volume needs one confirmation. A volume that still holds files (or directory markers) needs two, the second being the volume id typed exactly; non-interactively pass `--yes --confirm <id>`. Its files are then deleted the same way as an unlink: metadata first, and the orphan reaper reclaims the chunk bytes after `orphan_grace_secs` (at least 6 h). The `default` volume cannot be deleted, and a volume with a file open for writing is refused until the writer closes it. Clients still configured with the deleted volume id get "volume not found" on create.

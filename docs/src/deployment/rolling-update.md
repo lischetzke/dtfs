@@ -241,6 +241,13 @@ same gate with v0.1.15 as the minimum (`cluster_on_v0_1_15`). Once all
 managers ran v0.1.15, do not roll a manager back below v0.1.15 and never join
 one below it.
 
+**v0.1.16: pre-caching policy.** `VolumeConfig.precache` is new replicated
+state; an older applier drops it and diverges. `POST
+/api/v1/volumes/{id}/set-precache` therefore answers 409 (`min_version`
+`v0.1.16`) while any manager is below v0.1.16 (`cluster_on_v0_1_16`), and the
+membership join rule below uses v0.1.16 once that gate holds. Do not roll a
+manager back below v0.1.16 once a volume has a non-default `precache`.
+
 The membership API enforces the join rule: while either gate is open,
 `POST /api/v1/raft/add-learner` and `/api/v1/raft/promote` return 409 unless
 the target is a registered manager reporting at least the gate's release

@@ -62,10 +62,13 @@ pub fn validate_membership_target(
 pub fn ensure_target_meets_apply_gates(
     hostname: &str,
     registered: Option<(NodeRole, &str)>,
+    v0_1_16_open: bool,
     v0_1_15_open: bool,
     named_remove_open: bool,
 ) -> Result<(), String> {
-    let min = if v0_1_15_open {
+    let min = if v0_1_16_open {
+        dtfs_raft::state_machine::V0_1_16_MIN_VERSION
+    } else if v0_1_15_open {
         dtfs_raft::state_machine::V0_1_15_MIN_VERSION
     } else if named_remove_open {
         dtfs_raft::state_machine::NAMED_REMOVE_MIN_VERSION
@@ -131,33 +134,41 @@ mod tests {
 
     #[test]
     fn apply_gates_refuse_v0_1_14_target_when_v0_1_15_gate_open() {
-        let err = ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.14")), true, true)
+        let err = ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.14")), false, true, true)
             .unwrap_err();
         assert!(err.contains("on v0.1.15 or later"), "{err}");
         // Only the named-remove gate open: v0.1.14 is enough, v0.1.13 is not.
-        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.14")), false, true).is_ok());
-        let err = ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.13")), false, true)
+        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.14")), false, false, true).is_ok());
+        let err = ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.13")), false, false, true)
             .unwrap_err();
         assert!(err.contains("on v0.1.14 or later"), "{err}");
     }
 
     #[test]
+    fn apply_gates_v0_1_16_gate_wins_when_open() {
+        let err = ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.15")), true, true, true)
+            .unwrap_err();
+        assert!(err.contains("v0.1.16"), "{err}");
+        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.16")), true, true, true).is_ok());
+    }
+
+    #[test]
     fn apply_gates_refuse_unregistered_or_non_manager_target() {
-        let err = ensure_target_meets_apply_gates("mgr06", None, false, true).unwrap_err();
+        let err = ensure_target_meets_apply_gates("mgr06", None, false, false, true).unwrap_err();
         assert!(err.contains("(registered: no)"), "{err}");
-        let err = ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Data, "v0.1.15")), true, true)
+        let err = ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Data, "v0.1.15")), false, true, true)
             .unwrap_err();
         assert!(err.contains("(registered: Data \"v0.1.15\")"), "{err}");
         // A dev build never satisfies an open gate.
-        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.0.0-dev")), true, true).is_err());
+        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.0.0-dev")), false, true, true).is_err());
     }
 
     #[test]
     fn apply_gates_allow_any_target_when_closed_and_current_release_when_open() {
-        assert!(ensure_target_meets_apply_gates("mgr06", None, false, false).is_ok());
-        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.0.0-dev")), false, false).is_ok());
-        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.15")), true, true).is_ok());
-        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.2.0")), true, true).is_ok());
+        assert!(ensure_target_meets_apply_gates("mgr06", None, false, false, false).is_ok());
+        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.0.0-dev")), false, false, false).is_ok());
+        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.1.15")), false, true, true).is_ok());
+        assert!(ensure_target_meets_apply_gates("mgr06", Some((NodeRole::Manager, "v0.2.0")), false, true, true).is_ok());
     }
 
     #[test]

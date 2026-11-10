@@ -340,6 +340,7 @@ pub(crate) mod test_fixture {
                     min_replicas_before_ack: 1,
                     write_timeout_secs: 30,
                 },
+                precache: Default::default(),
             },
         );
         let mut put = |f: FileMetadata| {
@@ -642,6 +643,7 @@ mod tests {
                     min_replicas_before_ack: 1,
                     write_timeout_secs: 30,
                 },
+                precache: Default::default(),
             },
         );
         sm.files.insert(

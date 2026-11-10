@@ -8,7 +8,7 @@ DTFS has **no live configuration reload**. No daemon watches its TOML file or ha
 |---|---|
 | Any key in a role's TOML file | Restart that daemon (`systemctl restart dtfs-manager`, `dtfs-data`, `dtfs-fuse@<mount>`). |
 | Manager `[scrub]` policy (intervals, `max_io_percent`, `verify_on_read`, `quarantine_on_fault`, `auto_unquarantine_secs`) | Restart the managers. Each manager sends the values to every data node in the next heartbeat response; data nodes apply them without a restart. |
-| Volume policy (`set-cache`, `set-mandatory`, `set-anchor`, `set-write-safety`, `set-spill`) | Immediately: it is Raft state, picked up by the next write or scheduler pass. See [Volume Configuration](./volume-config.md). |
+| Volume policy (`set-cache`, `set-precache`, `set-mandatory`, `set-anchor`, `set-write-safety`, `set-spill`) | Immediately: it is Raft state, picked up by the next write or scheduler pass. See [Volume Configuration](./volume-config.md). |
 | `POST /api/v1/config` override | Stored in Raft and returned by `GET /api/v1/config` and `/config/effective`. No daemon applies it at runtime. See [Cluster-wide Configuration](./cluster-config.md). |
 | Maintenance mode, unquarantine, migrations, flush-cache | Immediately (REST/CLI operations, not configuration). |
 

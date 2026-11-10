@@ -224,6 +224,7 @@ async fn check_target_apply_gates(
     crate::membership::ensure_target_meets_apply_gates(
         hostname,
         registered,
+        dtfs_raft::state_machine::cluster_on_v0_1_16(&sm),
         dtfs_raft::state_machine::cluster_on_v0_1_15(&sm),
         dtfs_raft::state_machine::cluster_understands_named_remove(&sm),
     )

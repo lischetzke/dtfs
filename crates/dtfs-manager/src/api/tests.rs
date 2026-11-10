@@ -132,6 +132,7 @@ mod audit_co_tests {
             anchor: None,
             spill: SpillPolicy::default(),
             version: 0,
+            precache: Default::default(),
         };
 
         let mut sm = StateMachineData::default();
@@ -574,6 +575,7 @@ mod bug_bp_tests {
             version: 0,
             anchor_datacenter: None,
             write_safety: WriteSafety { min_replicas_before_ack: 1, write_timeout_secs: 30 },
+            precache: Default::default(),
         };
         // No tape disk → tape replication dropped.
         assert!(normalize_tape_replication(&mut cfg, false));
@@ -961,6 +963,7 @@ mod bug_av_set_cache_tests {
                 min_replicas_before_ack: 2,
                 write_timeout_secs: 30,
             },
+            precache: Default::default(),
         }
     }
 
@@ -1257,6 +1260,7 @@ mod bug_av_set_mandatory_tests {
                 min_replicas_before_ack: 2,
                 write_timeout_secs: 30,
             },
+            precache: Default::default(),
         }
     }
 
@@ -1566,6 +1570,7 @@ mod bug_bv3_data_node_count_tests {
                     min_replicas_before_ack: 1,
                     write_timeout_secs: 30,
                 },
+                precache: Default::default(),
             },
         );
         sm.files.insert(
@@ -1693,6 +1698,7 @@ mod cnf1_stable_disk_id_tests {
             version: 0,
             anchor_datacenter: None,
             write_safety: WriteSafety { min_replicas_before_ack: 1, write_timeout_secs: 30 },
+            precache: Default::default(),
         });
 
         sm.files.insert("/f.bin".into(), dtfs_raft::state_machine::FileMetadata {

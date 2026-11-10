@@ -275,6 +275,27 @@ enum VolumesCmd {
         #[arg(long)]
         cooldown_secs: Option<u64>,
     },
+    /// Set the volume's predictive pre-caching policy (needs every manager
+    /// on v0.1.16 or later). Omitted flags keep the current value.
+    SetPrecache {
+        /// Volume id to update.
+        volume_id: String,
+        /// Pre-caching mode.
+        #[arg(long, value_parser = ["off", "files", "plex"])]
+        mode: Option<String>,
+        /// Whole files to pre-cache after the file being watched.
+        #[arg(long)]
+        next_files: Option<u32>,
+        /// GiB cap on the next-files selection (0 = no cap).
+        #[arg(long)]
+        next_max_gb: Option<u32>,
+        /// GiB budget per series (plex mode).
+        #[arg(long)]
+        series_max_gb: Option<u32>,
+        /// Series pre-cached per volume per DC (plex mode).
+        #[arg(long)]
+        max_series: Option<u32>,
+    },
     /// Bug AV (AV-4-1a) — set or update the volume's
     /// `mandatory_replicas` (durability floor enforced by the
     /// under-replication scheduler). Every flag is optional;
@@ -756,6 +777,14 @@ async fn main() -> anyhow::Result<()> {
                     &api, &args.format, &volume_id,
                     warm_min, warm_max, hot_min, hot_max,
                     per_dc, promote_reads, promote_window_secs, cooldown_secs,
+                ).await?
+            }
+            VolumesCmd::SetPrecache {
+                volume_id, mode, next_files, next_max_gb, series_max_gb, max_series,
+            } => {
+                cmd_volumes_set_precache(
+                    &api, &args.format, &volume_id,
+                    set_precache_body(mode.as_deref(), next_files, next_max_gb, series_max_gb, max_series),
                 ).await?
             }
             VolumesCmd::SetMandatory {
@@ -1322,6 +1351,51 @@ async fn cmd_volumes_set_cache(
             println!("  promote_reads:        {}", c["promote_reads"].as_u64().unwrap_or(2));
             println!("  promote_window_secs:  {}", c["promote_window_secs"].as_u64().unwrap_or(14_400));
             println!("  cooldown_secs:        {}", c["cooldown_secs"].as_u64().unwrap_or(300));
+        }
+    }
+    Ok(())
+}
+
+/// Request body for `set-precache`: only the supplied flags.
+fn set_precache_body(
+    mode: Option<&str>,
+    next_files: Option<u32>,
+    next_max_gb: Option<u32>,
+    series_max_gb: Option<u32>,
+    max_series: Option<u32>,
+) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = mode { body.insert("mode".into(), v.into()); }
+    if let Some(v) = next_files { body.insert("next_files".into(), v.into()); }
+    if let Some(v) = next_max_gb { body.insert("next_max_gb".into(), v.into()); }
+    if let Some(v) = series_max_gb { body.insert("series_max_gb".into(), v.into()); }
+    if let Some(v) = max_series { body.insert("max_series".into(), v.into()); }
+    serde_json::Value::Object(body)
+}
+
+/// `dtfs-cli volumes set-precache <id> [--mode plex ...]`.
+async fn cmd_volumes_set_precache(
+    api: &ApiClient,
+    format: &OutputFormat,
+    volume_id: &str,
+    body: serde_json::Value,
+) -> anyhow::Result<()> {
+    let resp = api.post(&format!("/api/v1/volumes/{}/set-precache", volume_id), &body).await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&resp)?),
+        OutputFormat::Table => {
+            let changed = resp["changed"].as_bool().unwrap_or(false);
+            let c = &resp["config"]["precache"];
+            println!(
+                "Volume '{}' set-precache: {}",
+                volume_id,
+                if changed { "applied" } else { "no-op" },
+            );
+            println!("  mode:           {}", c["mode"].as_str().unwrap_or("off"));
+            println!("  next_files:     {}", c["next_files"].as_u64().unwrap_or(0));
+            println!("  next_max_gb:    {}", c["next_max_gb"].as_u64().unwrap_or(0));
+            println!("  series_max_gb:  {}", c["series_max_gb"].as_u64().unwrap_or(0));
+            println!("  max_series:     {}", c["max_series"].as_u64().unwrap_or(0));
         }
     }
     Ok(())
@@ -2760,5 +2834,19 @@ mod audit_co_tests {
         let msg = value["error"].as_str().map(str::to_string)
             .unwrap_or_else(|| value.to_string());
         assert_eq!(msg, "{\"leader\":null}");
+    }
+}
+
+#[cfg(test)]
+mod precache_tests {
+    use super::*;
+
+    #[test]
+    fn set_precache_body_only_carries_supplied_flags() {
+        assert_eq!(
+            set_precache_body(Some("plex"), None, None, Some(20), Some(3)),
+            serde_json::json!({"mode":"plex","series_max_gb":20,"max_series":3})
+        );
+        assert_eq!(set_precache_body(None, None, None, None, None), serde_json::json!({}));
     }
 }

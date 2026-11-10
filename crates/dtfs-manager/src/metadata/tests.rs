@@ -597,6 +597,7 @@ mod bug_av_preferred_tier_tests {
                 min_replicas_before_ack: 1,
                 write_timeout_secs: 30,
             },
+            precache: Default::default(),
         }
     }
 
@@ -711,6 +712,7 @@ mod rev_4_10_hint_ack_floor_tests {
                 min_replicas_before_ack: floor,
                 write_timeout_secs: 30,
             },
+            precache: Default::default(),
         }
     }
 
@@ -2121,6 +2123,7 @@ mod tests {
                 min_replicas_before_ack: floor,
                 write_timeout_secs: 30,
             },
+            precache: Default::default(),
         }
     }
 }

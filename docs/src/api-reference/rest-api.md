@@ -73,6 +73,7 @@ Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserve
 | DELETE | `/api/v1/volumes/{id}` | yes | leader (409) | Delete volume (`?delete_files=true` also deletes its files) |
 | POST | `/api/v1/volumes/{id}/migrate-policy` | yes | leader (503) | Copy legacy replication |
 | POST | `/api/v1/volumes/{id}/set-cache` | yes | leader (503) | Edit cache policy |
+| POST | `/api/v1/volumes/{id}/set-precache` | yes | leader (503) | Edit pre-caching policy (needs every manager on v0.1.16, else 409) |
 | POST | `/api/v1/volumes/{id}/set-mandatory` | yes | leader (503) | Edit mandatory replicas |
 | POST | `/api/v1/volumes/{id}/set-write-safety` | yes | leader (503) | Edit write safety |
 | POST | `/api/v1/volumes/{id}/set-anchor` | yes | leader (503) | Edit anchor |
@@ -267,6 +268,7 @@ All take a JSON body in which omitted fields keep their value, and answer `{"vol
 | Endpoint | Body fields | `400` cases |
 |---|---|---|
 | `set-cache` | `warm_min`, `warm_max`, `hot_min`, `hot_max`, `cold_min`, `cold_max`, `tape_min`, `tape_max` (u32); `per_dc` (bool); `promote_reads` (u32); `promote_window_secs`, `cooldown_secs` (u64) | `max < min` for any tier |
+| `set-precache` | `mode` (`off`/`files`/`plex`); `next_files`, `next_max_gb`, `series_max_gb`, `max_series` (u32) | a mode other than `off` without a cache tier (`cache_replicas.<tier>.max > 0` and mandatory 0), without `per_dc`; plex with `series_max_gb` or `max_series` 0; files with `next_files` and `next_max_gb` both 0. A change while any manager is below v0.1.16 answers `409` with `min_version` `v0.1.16`; a body that changes nothing is a no-op at any version |
 | `set-mandatory` | `hot_replicas`, `warm_replicas`, `cold_replicas`, `tape_replicas` (u32); unknown fields rejected | result all zero; zero on the anchor's `required_tier`; non-zero `tape` without a tape disk |
 | `set-write-safety` | `min_replicas_before_ack`, `write_timeout_secs` (u32) | value below 1 |
 | `set-anchor` | `datacenter` (string; `""` clears the anchor), `required_tier` (`hot`/`warm`/`cold`/`tape`/`""`), `force` (bool) | unknown tier; `mandatory_replicas.<tier> = 0`; datacenter unknown to the cluster without `force: true` |

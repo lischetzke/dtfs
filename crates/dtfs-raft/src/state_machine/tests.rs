@@ -456,6 +456,7 @@ mod snapshot_persistence_tests {
                 min_replicas_before_ack: 1,
                 write_timeout_secs: 30,
             },
+            precache: Default::default(),
         };
         apply_request(
             &mut sm,
@@ -526,6 +527,7 @@ mod snapshot_persistence_tests {
                 min_replicas_before_ack: 1,
                 write_timeout_secs: 30,
             },
+            precache: Default::default(),
         };
         apply_request(
             &mut sm,
@@ -4542,6 +4544,15 @@ mod named_remove_gate_tests {
         assert!(!cluster_on_v0_1_15(&sm_with(["v0.1.15", "v0.1.14", "v0.1.15"])));
         assert!(!cluster_on_v0_1_15(&sm_with(["v0.1.15", "v0.1.15", "v0.0.0-dev"])));
         assert!(!cluster_on_v0_1_15(&StateMachineData::default()));
+    }
+
+    #[test]
+    fn precache_gate_needs_every_member_at_0_1_16() {
+        assert!(cluster_on_v0_1_16(&sm_with(["v0.1.16", "v0.1.16", "v0.2.0"])));
+        // Boundary: a v0.1.15 member keeps the gate closed.
+        assert!(!cluster_on_v0_1_16(&sm_with(["v0.1.16", "v0.1.15", "v0.1.16"])));
+        assert!(!cluster_on_v0_1_16(&sm_with(["v0.1.16", "v0.1.16", "v0.0.0-dev"])));
+        assert!(!cluster_on_v0_1_16(&StateMachineData::default()));
     }
 }
 

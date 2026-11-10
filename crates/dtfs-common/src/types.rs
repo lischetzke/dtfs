@@ -579,6 +579,90 @@ pub struct VolumeConfig {
     /// `#[serde(default)]` keeps old snapshots loadable (0 = never bumped).
     #[serde(default)]
     pub version: u64,
+
+    /// Predictive pre-caching policy (v0.1.16). `#[serde(default)]` keeps
+    /// old snapshots loadable (default = mode off).
+    #[serde(default)]
+    pub precache: PrecachePolicy,
+}
+
+/// Pre-caching mode: `off`, `files` (next files in the directory) or
+/// `plex` (next episodes of a series, series root marked by `.plexmatch`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrecacheMode {
+    #[default]
+    Off,
+    Files,
+    Plex,
+}
+
+/// Per-volume pre-caching policy. Every field has a serde default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrecachePolicy {
+    #[serde(default)]
+    pub mode: PrecacheMode,
+    /// Whole files to pre-cache after the file being watched.
+    #[serde(default = "PrecachePolicy::default_next_files")]
+    pub next_files: u32,
+    /// GiB cap on the "next files" selection (0 = no byte cap).
+    #[serde(default)]
+    pub next_max_gb: u32,
+    /// GiB budget per series (plex mode).
+    #[serde(default = "PrecachePolicy::default_series_max_gb")]
+    pub series_max_gb: u32,
+    /// Series kept pre-cached per volume per DC (plex mode).
+    #[serde(default = "PrecachePolicy::default_max_series")]
+    pub max_series: u32,
+}
+
+impl PrecachePolicy {
+    fn default_next_files() -> u32 { 2 }
+    fn default_series_max_gb() -> u32 { 20 }
+    fn default_max_series() -> u32 { 3 }
+
+    /// Reject a policy that cannot work with the volume's tier policy.
+    /// `off` is always valid.
+    pub fn validate(
+        &self,
+        cache: &CacheReplication,
+        mandatory: &TierReplication,
+    ) -> Result<(), String> {
+        if self.mode == PrecacheMode::Off {
+            return Ok(());
+        }
+        let usable = (cache.hot.max > 0 && mandatory.hot == 0)
+            || (cache.warm.max > 0 && mandatory.warm == 0)
+            || (cache.cold.max > 0 && mandatory.cold == 0)
+            || (cache.tape.max > 0 && mandatory.tape == 0);
+        if !usable {
+            return Err("pre-caching needs a cache tier (cache_replicas max > 0 with mandatory 0 on that tier)".into());
+        }
+        if !cache.per_dc {
+            return Err("pre-caching needs cache_replicas.per_dc = true".into());
+        }
+        match self.mode {
+            PrecacheMode::Plex if self.series_max_gb == 0 || self.max_series == 0 => {
+                Err("plex mode needs series_max_gb > 0 and max_series > 0".into())
+            }
+            PrecacheMode::Files if self.next_files == 0 && self.next_max_gb == 0 => {
+                Err("files mode needs next_files > 0 or next_max_gb > 0".into())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl Default for PrecachePolicy {
+    fn default() -> Self {
+        Self {
+            mode: PrecacheMode::Off,
+            next_files: Self::default_next_files(),
+            next_max_gb: 0,
+            series_max_gb: Self::default_series_max_gb(),
+            max_series: Self::default_max_series(),
+        }
+    }
 }
 
 /// Bug BZ — per-volume capacity-spill exclusions. When the mandated tier
@@ -703,6 +787,7 @@ impl Default for VolumeConfig {
             anchor: None,
             spill: SpillPolicy::default(),
             version: 0,
+            precache: PrecachePolicy::default(),
         }
     }
 }
@@ -840,6 +925,78 @@ mod tests {
         });
         let cfg: VolumeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.chunk_size_bytes, 134217728);
+    }
+
+    #[test]
+    fn precache_policy_defaults() {
+        let p = PrecachePolicy::default();
+        assert_eq!((p.mode, p.next_files, p.next_max_gb, p.series_max_gb, p.max_series),
+            (PrecacheMode::Off, 2, 0, 20, 3));
+    }
+
+    #[test]
+    fn volume_config_without_precache_loads_default() {
+        let json = serde_json::json!({
+            "id": "default", "name": "default", "chunk_size_bytes": 134217728u64,
+            "replication": { "hot": 3, "warm": 2, "cold": 1, "tape": 1 },
+            "write_safety": { "min_replicas_before_ack": 2, "write_timeout_secs": 30 }
+        });
+        let cfg: VolumeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.precache, PrecachePolicy::default());
+        let p: PrecachePolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(p, PrecachePolicy::default());
+    }
+
+    #[test]
+    fn precache_mode_serde_lowercase() {
+        assert_eq!(serde_json::to_string(&PrecacheMode::Plex).unwrap(), "\"plex\"");
+        assert_eq!(serde_json::from_str::<PrecacheMode>("\"files\"").unwrap(), PrecacheMode::Files);
+        assert!(serde_json::from_str::<PrecacheMode>("\"Plex\"").is_err());
+    }
+
+    fn pc_warm_cache() -> (CacheReplication, TierReplication) {
+        let mut c = CacheReplication::default();
+        c.warm = CacheTierConfig { min: 1, max: 1 };
+        c.per_dc = true;
+        (c, TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 })
+    }
+
+    fn pc_plex() -> PrecachePolicy {
+        PrecachePolicy { mode: PrecacheMode::Plex, ..PrecachePolicy::default() }
+    }
+
+    #[test]
+    fn precache_validate_positive() {
+        let (c, m) = pc_warm_cache();
+        assert!(pc_plex().validate(&c, &m).is_ok());
+        let files = PrecachePolicy { mode: PrecacheMode::Files, ..PrecachePolicy::default() };
+        assert!(files.validate(&c, &m).is_ok());
+        // Plex allows both file limits at 0.
+        let p = PrecachePolicy { next_files: 0, next_max_gb: 0, ..pc_plex() };
+        assert!(p.validate(&c, &m).is_ok());
+        // Off is valid with every cache disabled.
+        let none = CacheReplication::default();
+        assert!(PrecachePolicy::default().validate(&none, &m).is_ok());
+    }
+
+    #[test]
+    fn precache_validate_negative() {
+        let (c, m) = pc_warm_cache();
+        let e = pc_plex().validate(&CacheReplication::default(), &m).unwrap_err();
+        assert!(e.contains("cache tier"), "{e}");
+        let mand = TierReplication { hot: 0, warm: 2, cold: 1, tape: 0 };
+        let e = pc_plex().validate(&c, &mand).unwrap_err();
+        assert!(e.contains("cache tier"), "{e}");
+        let mut nodc = c.clone();
+        nodc.per_dc = false;
+        let e = pc_plex().validate(&nodc, &m).unwrap_err();
+        assert!(e.contains("per_dc"), "{e}");
+        let p = PrecachePolicy { series_max_gb: 0, ..pc_plex() };
+        assert!(p.validate(&c, &m).unwrap_err().contains("series_max_gb"));
+        let p = PrecachePolicy { max_series: 0, ..pc_plex() };
+        assert!(p.validate(&c, &m).unwrap_err().contains("max_series"));
+        let p = PrecachePolicy { mode: PrecacheMode::Files, next_files: 0, next_max_gb: 0, ..PrecachePolicy::default() };
+        assert!(p.validate(&c, &m).unwrap_err().contains("next_files"));
     }
 
     /// Removal of the dead `VolumeSchedules` knob deleted the

@@ -322,6 +322,7 @@ fn snapshot_v1_fixture_loads() {
     assert_eq!(snap.audit_log[0].origin_manager, "mgr01");
     assert_eq!(snap.scrub_results_by_level[&7].len(), 2);
     assert_eq!(snap.volumes["default"].anchor.as_ref().unwrap().datacenter, "LELI");
+    assert_eq!(snap.volumes["default"].precache, dtfs_common::types::PrecachePolicy::default());
     assert_eq!(snap.posix_locks["/media/a.mkv"][0].end, 10);
     assert_eq!(snap.write_leases["/media/a.mkv"].lease_id, "l1");
     assert_eq!(snap.pending_scrub.unwrap().id, "s1");

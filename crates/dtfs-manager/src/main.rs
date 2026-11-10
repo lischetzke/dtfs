@@ -807,6 +807,7 @@ fn bootstrap_default_volume(config: &dtfs_common::config::ManagerConfig) -> dtfs
         anchor: None,
         spill: dtfs_common::types::SpillPolicy::default(),
         version: 0,
+        precache: Default::default(),
     }
 }
 
