@@ -14,7 +14,11 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   `.await` or a spawn: clone what you need, drop the guard, then await.
 - A lapsed write lease is re-acquired once under the handle's own
   `lease_owner_id` (`reacquire_write_lease`) before `write()`/`flush()`
-  gives up; only a lease held by another writer aborts.
+  gives up; only a lease held by another writer aborts. A FRESH grant (new
+  lease id: ours was gone) is refused, released and not adopted when the
+  manager's file is not the handle's snapshot (`file_changed_under_lease`:
+  other `created_at_ms`, or with no local commit overlapping the check
+  fetch, a chunk id the snapshot lacks; no snapshot = not compared) (#134).
 - Background prefetch is bounded by `client.chunk_read_timeout_secs`
   like the foreground fetch (`0` = unbounded).
 - `flush()` drops the `lock_owner`'s POSIX locks (kernel close contract).

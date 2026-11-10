@@ -603,6 +603,20 @@ fn seed_snapshot_usable(fetched_after_lease: bool, may_install: bool) -> bool {
     fetched_after_lease && may_install
 }
 
+/// #134: did someone else change the file between `snap` (the handle's) and
+/// `fresh` (fetched after a fresh lease grant)? A different `created_at_ms`
+/// = deleted and re-created or renamed over. With `quiet` (no local commit
+/// overlapped the fetch) also any chunk id the snapshot does not hold at
+/// that index; a local commit in flight could explain those, so not then.
+fn file_changed_under_lease(snap: &FileLocations, fresh: &FileLocations, quiet: bool) -> bool {
+    snap.created_at_ms != fresh.created_at_ms
+        || (quiet
+            && fresh.chunks.iter().any(|c| {
+                c.chunk_index
+                    .is_some_and(|i| snap.chunk_at(i).map(|s| s.chunk_id.as_str()) != Some(c.chunk_id.as_str()))
+            }))
+}
+
 /// read(): a missing chunk entry below the snapshot's size may be a chunk
 /// the snapshot missed (not a hole). Re-fetch once before serving zeros,
 /// unless this snapshot already came from such a re-fetch (`confirmed`).
@@ -831,6 +845,11 @@ pub struct DtfsFilesystem {
     /// Test stand-in for the manager's GetFileLocations.
     #[cfg(test)]
     locations_fetch_hook: std::sync::Mutex<Option<Box<dyn Fn(&str) -> FileLocations + Send>>>,
+    /// Test stand-in for the manager's AcquireWriteLease (re-acquire only).
+    #[cfg(test)]
+    lease_acquire_hook: std::sync::Mutex<
+        Option<Box<dyn Fn() -> dtfs_proto::dtfs::manager::AcquireWriteLeaseResponse + Send>>,
+    >,
     /// Test hook run by open_with_append right before it inserts the handle.
     #[cfg(test)]
     open_race_hook: std::sync::Mutex<Option<Box<dyn FnOnce(&DtfsFilesystem) + Send>>>,
@@ -931,6 +950,8 @@ impl DtfsFilesystem {
             read_race_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             locations_fetch_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            lease_acquire_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
             open_race_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -3602,11 +3623,18 @@ impl DtfsFilesystem {
         let owner_id = owner_id
             .ok_or_else(|| anyhow::anyhow!("no lease owner recorded for fh {fh}"))?;
         let sent = Instant::now();
-        let resp = self
-            .client
-            .acquire_write_lease(path, owner_id, WRITE_LEASE_MS)
-            .await
-            .with_context(|| format!("re-acquire write lease for {path}"))?;
+        #[cfg(test)]
+        let hooked = self.lease_acquire_hook.lock().unwrap().as_ref().map(|h| h());
+        #[cfg(not(test))]
+        let hooked = None;
+        let resp = match hooked {
+            Some(r) => r,
+            None => self
+                .client
+                .acquire_write_lease(path, owner_id, WRITE_LEASE_MS)
+                .await
+                .with_context(|| format!("re-acquire write lease for {path}"))?,
+        };
         if !resp.granted {
             return Err(anyhow::Error::new(LeaseBusy {
                 path: path.to_string(),
@@ -3614,12 +3642,42 @@ impl DtfsFilesystem {
                 expires_at_ms: resp.conflict_expires_at_ms,
             }));
         }
+        // #134: a new lease id means ours was gone (expiry, delete, rename
+        // over the path) and another client may have written in between.
+        // Writing on from this handle's snapshot would overwrite that.
+        let old_id = self.open_files.get(&fh).and_then(|f| f.lease_id.clone());
+        if old_id.as_deref() != Some(resp.lease_id.as_str()) {
+            if let Err(e) = self.check_unchanged_since_snapshot(fh, path).await {
+                if let Err(re) = self.client.release_write_lease(path, &resp.lease_id).await {
+                    debug!(path, error = %re, "releasing the refused re-acquired lease failed; it expires");
+                }
+                return Err(e);
+            }
+        }
         self.adopt_reacquired_lease(owner_id, &resp.lease_id, lease_deadline_from(sent));
         tracing::warn!(
             path = %path,
             owner = %owner_id,
             "FUSE-1: write lease had lapsed; re-acquired under the same owner"
         );
+        Ok(())
+    }
+
+    /// After a fresh lease grant: Err if the file on the manager is not the
+    /// one `fh`'s snapshot shows (`file_changed_under_lease`). No snapshot:
+    /// nothing to compare, Ok.
+    async fn check_unchanged_since_snapshot(&self, fh: u64, path: &str) -> Result<()> {
+        let Some(snap) = self.open_files.get(&fh).and_then(|f| f.locations.clone()) else {
+            debug!(path, fh, "fresh lease grant on a handle without snapshot; not compared");
+            return Ok(());
+        };
+        // Not quiet_fetch: the caller may hold its own commit slot.
+        let fetch = self.commit_tracker.begin_fetch(path);
+        let fresh = self.fetch_file_locations(path).await?;
+        if file_changed_under_lease(&snap, &fresh, fetch.may_install()) {
+            warn!(path, fh, "file changed while the write lease was lost; refusing to write on from a stale snapshot");
+            bail!("{path}: file changed while the write lease was lost; not writing on top of it");
+        }
         Ok(())
     }
 
@@ -8040,6 +8098,50 @@ mod async_commit_fs_tests {
         assert_eq!(fetches.load(Ordering::Relaxed), 2, "one re-fetch per snapshot");
         assert!(fs.read(fh, 0, 10).await.is_err());
         assert_eq!(fetches.load(Ordering::Relaxed), 2, "confirmed snapshot re-fetched again");
+    }
+
+    /// #134: a lapsed lease comes back as a FRESH grant (new id) while
+    /// another client changed or re-created the file: the re-acquire fails
+    /// and the handle keeps its old lease (nothing can commit). Unchanged
+    /// file, or a re-issue of our own id, re-acquires as before.
+    #[tokio::test]
+    async fn reacquire_refuses_a_fresh_grant_on_a_changed_file() {
+        let fs = fs(false);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let fh = open(&fs, "/f", OpenFlags::ReadWrite);
+        set_lease(&fs, fh, "h:1", "old");
+        let grant = |id: &'static str| -> Box<dyn Fn() -> dtfs_proto::dtfs::manager::AcquireWriteLeaseResponse + Send> {
+            Box::new(move || dtfs_proto::dtfs::manager::AcquireWriteLeaseResponse {
+                granted: true,
+                lease_id: id.to_string(),
+                ..Default::default()
+            })
+        };
+        let serve = |l: FileLocations| -> Box<dyn Fn(&str) -> FileLocations + Send> { Box::new(move |_| l.clone()) };
+        let mine = (*one_chunk(&"a".repeat(64), cs)).clone();
+        let mut appended = mine.clone();
+        appended.chunks[0].chunk_id = "b".repeat(64);
+        let mut recreated = mine.clone();
+        recreated.created_at_ms = 7;
+        // A local commit in flight may explain a new chunk id, not a new file.
+        assert!(!file_changed_under_lease(&mine, &appended, false));
+        assert!(file_changed_under_lease(&mine, &recreated, false));
+        assert!(!file_changed_under_lease(&mine, &mine, true));
+        for (other, what) in [(appended, "another client rewrote chunk 0"), (recreated, "file re-created")] {
+            fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(mine.clone()));
+            *fs.lease_acquire_hook.lock().unwrap() = Some(grant("fresh"));
+            *fs.locations_fetch_hook.lock().unwrap() = Some(serve(other.clone()));
+            let err = fs.reacquire_write_lease(fh, "/f", Some("h:1")).await.expect_err(what);
+            assert!(format!("{err:#}").contains("changed while the write lease was lost"), "{what}: {err:#}");
+            assert_eq!(lease_id(&fs, fh).as_deref(), Some("old"), "{what}: fresh lease adopted");
+            // A re-issue of our own id: the lease never lapsed, no check.
+            *fs.lease_acquire_hook.lock().unwrap() = Some(grant("old"));
+            fs.reacquire_write_lease(fh, "/f", Some("h:1")).await.expect("re-issue");
+        }
+        *fs.lease_acquire_hook.lock().unwrap() = Some(grant("fresh"));
+        *fs.locations_fetch_hook.lock().unwrap() = Some(serve(mine.clone()));
+        fs.reacquire_write_lease(fh, "/f", Some("h:1")).await.expect("unchanged file");
+        assert_eq!(lease_id(&fs, fh).as_deref(), Some("fresh"));
     }
 
     /// FUSE-2: fallocate's size floor counts in-flight bytes, also when the
