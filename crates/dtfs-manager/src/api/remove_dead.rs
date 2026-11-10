@@ -7,7 +7,7 @@
 use super::*;
 use dtfs_common::types::AnchorPolicy;
 use dtfs_raft::state_machine::{
-    cluster_understands_named_remove, remove_chunk_location_check, replica_row_is_live,
+    cluster_understands_named_remove, remove_chunk_location_check_rows, replica_row_is_live,
 };
 
 /// One `(file, chunk_index, disk)` row held by the dead node.
@@ -75,8 +75,19 @@ pub(crate) fn plan_remove_dead(
     let mut plan = RemoveDeadPlan::default();
     let named = cluster_understands_named_remove(sm);
     for (path, f) in &sm.files {
+        if !f.chunks.iter().any(|c| c.node_id == nid_str) {
+            continue;
+        }
         let anchor = sm.volumes.get(&f.volume_id).and_then(|v| v.effective_anchor());
+        // Issue #156 — group the file's rows by index once, so each dead row
+        // checks only its own index group (was a rescan of every row).
+        let mut by_idx: std::collections::BTreeMap<u64, Vec<dtfs_raft::ChunkLocationEntry>> =
+            Default::default();
+        for c in &f.chunks {
+            by_idx.entry(c.chunk_index).or_default().push(c.clone());
+        }
         for c in f.chunks.iter().filter(|c| c.node_id == nid_str) {
+            let group = &by_idx[&c.chunk_index];
             let row = DeadRow {
                 path: path.clone(),
                 chunk_index: c.chunk_index,
@@ -84,15 +95,22 @@ pub(crate) fn plan_remove_dead(
                 chunk_hash: named.then(|| c.chunk_hash.clone()),
                 anchor: anchor.clone(),
             };
-            let other_live = f.chunks.iter().any(|o| {
-                o.chunk_index == c.chunk_index
-                    && !(o.node_id == nid_str && o.disk_id == c.disk_id)
-                    && replica_row_is_live(sm, o)
+            let other_live = group.iter().any(|o| {
+                !(o.node_id == nid_str && o.disk_id == c.disk_id) && replica_row_is_live(sm, o)
             });
             if !other_live {
                 plan.data_loss.push(row);
-            } else if remove_chunk_location_check(sm, path, c.chunk_index, &nid_str, c.disk_id, row.chunk_hash.as_deref(), anchor.as_ref())
-                .is_ok()
+            } else if remove_chunk_location_check_rows(
+                sm,
+                path,
+                group,
+                c.chunk_index,
+                &nid_str,
+                c.disk_id,
+                row.chunk_hash.as_deref(),
+                anchor.as_ref(),
+            )
+            .is_ok()
             {
                 plan.removable.push(row);
             } else {
@@ -183,6 +201,58 @@ pub(super) async fn remove_dead_node_endpoint(
         return Ok(Json(out));
     }
 
+    // Issue #156 — one Raft write per row can take minutes: run it detached
+    // (a closed tab no longer aborts it part-way) and report via GET.
+    {
+        let mut job = state.remove_dead_job.lock();
+        if job.as_ref().is_some_and(|j| j["running"] == json!(true)) {
+            warn!(node = nid, "remove-dead refused: a run is already in progress");
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({"error": "a remove-dead run is already in progress"})),
+            ));
+        }
+        let mut running = out.clone();
+        running["running"] = json!(true);
+        *job = Some(running);
+    }
+    let st = state.clone();
+    let (accept, reason, started) = (body.accept_data_loss, body.reason.clone(), out.clone());
+    tokio::spawn(async move {
+        let mut done = execute_remove_dead(&st, nid, &plan, accept, down_ms, &op, &reason, started).await;
+        done["running"] = json!(false);
+        *st.remove_dead_job.lock() = Some(done);
+    });
+    out["running"] = json!(true);
+    Ok(Json(out))
+}
+
+/// `GET /api/v1/nodes/{id}/remove-dead` — the running or last remove-dead
+/// run on this manager for that node (`404` if none).
+pub(super) async fn get_remove_dead(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(node_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, ApiErr> {
+    match state.remove_dead_job.lock().as_ref() {
+        Some(j) if j["node_id"] == json!(node_id) => Ok(Json(j.clone())),
+        _ => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("no remove-dead run for node {node_id} on this manager")})),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_remove_dead(
+    state: &AppState,
+    nid: u64,
+    plan: &RemoveDeadPlan,
+    accept_data_loss: bool,
+    down_ms: u64,
+    op: &str,
+    reason: &str,
+    mut out: Value,
+) -> Value {
     let nid_str = nid.to_string();
     let (mut removed, mut loss_removed, mut failed) = (0usize, 0usize, 0usize);
     for r in &plan.removable {
@@ -203,7 +273,7 @@ pub(super) async fn remove_dead_node_endpoint(
             }
         }
     }
-    if body.accept_data_loss {
+    if accept_data_loss {
         for r in &plan.data_loss {
             let req = ClientRequest::RemoveDeadNodeReplica {
                 path: r.path.clone(),
@@ -271,10 +341,10 @@ pub(super) async fn remove_dead_node_endpoint(
         &format!(
             "node={nid} by={op} removed={removed} data_loss_removed={loss_removed} remaining={remaining} deregistered={deregistered}"
         ),
-        &body.reason,
+        reason,
     );
     info!(node = nid, by = %op, removed, loss_removed, remaining, deregistered, "node remove-dead executed");
-    Ok(Json(out))
+    out
 }
 
 #[cfg(test)]
@@ -451,5 +521,33 @@ mod tests {
         assert_eq!(v["anchor_pending"], 1);
         assert_eq!(v["data_loss_candidates"], 1);
         assert_eq!(v["sample"]["data_loss"][0], "/a#2");
+    }
+
+    /// Issue #156 — one file with many rows: the plan is linear in its rows
+    /// (it rescanned every row per dead row before).
+    #[test]
+    fn issue_156_plan_is_linear_in_file_rows() {
+        let mut s = sm();
+        let n = 20_000u64;
+        let f = s.files.get_mut("/a").unwrap();
+        f.chunks = (0..n).flat_map(|i| [row(i, 1), row(i, 3)]).collect();
+        let t = std::time::Instant::now();
+        let p = plan_remove_dead(&s, 1, 1_000_000, 30_000).unwrap();
+        let took = t.elapsed();
+        assert_eq!(p.removable.len() as u64, n);
+        assert!(took < std::time::Duration::from_millis(500), "planner took {took:?} for {n} dead rows");
+    }
+
+    /// Issue #156 — GET reports the run for the asked node only, 404 otherwise.
+    #[tokio::test]
+    async fn issue_156_get_remove_dead_reports_the_nodes_run() {
+        let h = super::super::test_support::harness().await;
+        let path = |s: &str| axum::extract::Path(s.to_string());
+        let e = get_remove_dead(State(h.state.clone()), path("1")).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+        *h.state.remove_dead_job.lock() = Some(json!({"node_id": "1", "running": true}));
+        assert_eq!(get_remove_dead(State(h.state.clone()), path("1")).await.unwrap().0["running"], true);
+        let e = get_remove_dead(State(h.state.clone()), path("2")).await.unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
     }
 }

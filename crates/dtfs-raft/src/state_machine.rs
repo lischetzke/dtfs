@@ -2688,7 +2688,23 @@ pub fn remove_chunk_location_check(
         // a CrashRestart doesn't spam errors.
         None => return Ok(false),
     };
+    remove_chunk_location_check_rows(sm, path, &file.chunks, chunk_index, node_id, disk_id, chunk_hash, enforce_anchor)
+}
 
+/// [`remove_chunk_location_check`] over `rows`, the file's location rows.
+/// Only rows with `chunk_index` affect the result, so a caller that already
+/// grouped a file's rows by index may pass just that group (issue #156).
+#[allow(clippy::too_many_arguments)]
+pub fn remove_chunk_location_check_rows(
+    sm: &StateMachineData,
+    path: &str,
+    rows: &[ChunkLocationEntry],
+    chunk_index: u64,
+    node_id: &str,
+    disk_id: u32,
+    chunk_hash: Option<&str>,
+    enforce_anchor: Option<&AnchorPolicy>,
+) -> Result<bool, String> {
     // CO-1-1 — replica identity is `(node_id, disk_id)` (A.3.4 / Bug BH).
     // A chunk may legally hold a mandatory replica AND a cache replica on
     // ONE node across DIFFERENT disks/tiers; matching on `node_id` alone
@@ -2704,13 +2720,13 @@ pub fn remove_chunk_location_check(
     };
 
     // Check the entry is even present. Idempotent on absent.
-    let entry_present = file.chunks.iter().any(matches);
+    let entry_present = rows.iter().any(matches);
     if !entry_present {
         // Audit #7 — a row is at (index, node, disk) but with another hash:
         // the file was replaced since the plan. Refuse so the caller keeps
         // the bytes (`client_response_ok`) instead of acting on a no-op.
         if let Some(h) = chunk_hash {
-            if file.chunks.iter().any(|c| {
+            if rows.iter().any(|c| {
                 c.chunk_index == chunk_index
                     && c.node_id == node_id
                     && (legacy_node_wide || c.disk_id == disk_id)
@@ -2728,7 +2744,7 @@ pub fn remove_chunk_location_check(
     // chunk_index and verify the anchor would still be satisfied by
     // at least one remaining replica.
     if let Some(policy) = enforce_anchor {
-        let survives_anchor = file.chunks.iter().any(|c| {
+        let survives_anchor = rows.iter().any(|c| {
             // The entry/entries we're about to drop don't count.
             if matches(c) {
                 return false;
@@ -2816,10 +2832,9 @@ pub fn remove_chunk_location_check(
             })
             .unwrap_or(false)
     };
-    let removing_a_live_replica = file.chunks.iter().any(|c| matches(c) && is_live(c));
+    let removing_a_live_replica = rows.iter().any(|c| matches(c) && is_live(c));
     if removing_a_live_replica {
-        let other_live_survives = file
-            .chunks
+        let other_live_survives = rows
             .iter()
             .any(|c| !matches(c) && c.chunk_index == chunk_index && is_live(c));
         if !other_live_survives {

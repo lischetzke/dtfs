@@ -696,6 +696,18 @@ async fn main() -> anyhow::Result<()> {
             if !status.is_success() {
                 anyhow::bail!("remove-dead node {} failed: HTTP {}", node_id, status);
             }
+            // The run continues on the manager after the POST returns; wait for it.
+            if value["running"] == true {
+                let path = format!("/api/v1/nodes/{}/remove-dead", node_id);
+                let done = loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let v = api.get(&path).await?;
+                    if v["running"] != true {
+                        break v;
+                    }
+                };
+                println!("{}", serde_json::to_string_pretty(&done)?);
+            }
         }
         Commands::Volumes(sub) => match sub {
             VolumesCmd::List => cmd_volumes(&api, &args.format).await?,

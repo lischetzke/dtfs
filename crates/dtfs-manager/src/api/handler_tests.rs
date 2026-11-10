@@ -632,6 +632,7 @@ async fn orphan_reap_without_the_shared_secret_is_401() {
         io_rate: h.state.io_rate.clone(),
         memory: None,
         row_aggregates: Default::default(),
+        remove_dead_job: Default::default(),
     });
     let req = axum::http::Request::builder()
         .method("POST")

@@ -2778,7 +2778,22 @@
             onRemoveDeadInput();
             return;
         }
-        const j = r.json || {};
+        let j = r.json || {};
+        // The run continues on the manager after the POST returns: poll it.
+        const statusUrl = '/api/v1/nodes/' + document.getElementById('rd-node-id').value + '/remove-dead';
+        while (j.running) {
+            await new Promise(res => setTimeout(res, 3000));
+            try {
+                const resp = await fetch(statusUrl);
+                if (resp.ok) j = await resp.json();
+                else if (resp.status === 404) {
+                    result.style.color = 'var(--warning)';
+                    result.textContent = 'Lost track of the run (manager restarted or leader changed). Repeating remove-dead is safe.';
+                    await refreshNodesList();
+                    return;
+                }
+            } catch (_) { /* keep polling */ }
+        }
         const bad = (j.failed || 0) > 0 || (j.remaining_rows || 0) > 0;
         result.style.color = bad ? 'var(--warning)' : 'var(--success)';
         result.textContent = 'Removed ' + (j.removed ?? 0) + ' row(s), ' + (j.data_loss_removed ?? 0)

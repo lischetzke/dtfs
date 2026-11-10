@@ -79,6 +79,8 @@ pub struct AppState {
     pub memory: Option<Arc<dtfs_common::memory::MemoryBudget>>,
     /// Issue #144: shared, TTL-cached chunk-row aggregates for polled reads.
     pub row_aggregates: Arc<cluster::RowAggregatesCache>,
+    /// Issue #156: the running or last remove-dead run (its response JSON).
+    pub remove_dead_job: Arc<parking_lot::Mutex<Option<Value>>>,
 }
 
 /// Bug AL — per-node cumulative-byte snapshots, used to derive a rolling
@@ -152,7 +154,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Operator "remove dead node": clear rows of a Down/Failed node, then deregister.
         .route(
             "/api/v1/nodes/{node_id}/remove-dead",
-            post(remove_dead_node_endpoint),
+            get(get_remove_dead).post(remove_dead_node_endpoint),
         )
         // Files
         .route("/api/v1/files", get(list_files))
@@ -259,6 +261,7 @@ pub async fn run_api_server(
         io_rate: Arc::new(parking_lot::RwLock::new(IoRateTracker::default())),
         memory,
         row_aggregates: Default::default(),
+        remove_dead_job: Default::default(),
     });
 
     let app = build_router(state);

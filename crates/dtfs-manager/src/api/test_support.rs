@@ -57,6 +57,7 @@ pub(crate) async fn harness() -> Harness {
         io_rate: Arc::new(parking_lot::RwLock::new(IoRateTracker::default())),
         memory: None,
         row_aggregates: Default::default(),
+        remove_dead_job: Default::default(),
     });
     Harness { state, _dir: dir }
 }
