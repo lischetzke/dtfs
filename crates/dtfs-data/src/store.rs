@@ -143,7 +143,7 @@ pub struct ChunkStore {
     /// restart.
     chunk_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
     /// Last-read index per disk (position = disk_id); `None` for a cold disk.
-    // shortcut: cold disks are not tracked (shipped configs keep cache tiers off cold), track them if a volume ever caches on cold.
+    // shortcut: cold and tape disks are not tracked (shipped configs keep cache tiers off them), track them if a volume ever caches there.
     last_read: Vec<Option<Arc<LastReadIndex>>>,
 }
 
@@ -167,7 +167,7 @@ impl ChunkStore {
         let last_read = disk_manager
             .all_disks()
             .iter()
-            .map(|d| (d.tier != DiskTier::Cold).then(|| Arc::new(LastReadIndex::new(&d.mount_path))))
+            .map(|d| (!matches!(d.tier, DiskTier::Cold | DiskTier::Tape)).then(|| Arc::new(LastReadIndex::new(&d.mount_path))))
             .collect();
         Self {
             last_read,
