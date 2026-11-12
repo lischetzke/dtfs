@@ -49,13 +49,14 @@ impl std::fmt::Display for IntegrityFaultError {
 
 impl std::error::Error for IntegrityFaultError {}
 
-/// GetChunk request; an untracked read carries no requester DC.
+/// GetChunk request; an untracked read carries no requester DC and is sent as
+/// a scanner read, so it never refreshes the data node's last-read time.
 pub(crate) fn get_chunk_request(chunk_id: &str, dc: &str, host: &str, track: bool, scanner: bool) -> GetChunkRequest {
     GetChunkRequest {
         chunk_id: chunk_id.to_string(),
         requester_dc: if track { dc.to_string() } else { String::new() },
         requester_host: host.to_string(),
-        scanner,
+        scanner: scanner || !track,
     }
 }
 
@@ -1779,6 +1780,7 @@ mod untracked_read_tests {
         let u = get_chunk_request("c", "toro", "h", false, false);
         assert_eq!(u.requester_dc, "", "untracked read must carry no DC");
         assert_eq!(u.chunk_id, "c");
+        assert!(u.scanner, "untracked read must not refresh last-read");
         assert!(!t.scanner);
         assert!(get_chunk_request("c", "toro", "h", true, true).scanner);
     }
