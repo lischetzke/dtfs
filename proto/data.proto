@@ -49,10 +49,16 @@ service DataService {
 
 // `limit` 0 = 4096 (also the cap). `older_than_ms` 0 = no age filter,
 // otherwise only entries with last_read_ms <= older_than_ms.
+// Entries are ordered by (last_read_ms, chunk_id). A non-empty
+// `after_chunk_id` returns only entries strictly after
+// (after_last_read_ms, after_chunk_id); empty starts from the oldest.
+// Old data nodes ignore the cursor and return the first page again.
 message ListOldestChunksRequest {
   uint32 disk_id       = 1;
   uint32 limit         = 2;
   uint64 older_than_ms = 3;
+  uint64 after_last_read_ms = 4;
+  string after_chunk_id     = 5;
 }
 
 message OldestChunk {

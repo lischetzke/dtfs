@@ -149,6 +149,7 @@ A disk at or above `high` lists its least recently read chunks (`ListOldestChunk
 
 * A chunk is evicted only if every location row of that hash on that exact disk is a cache copy that the idle demote could drop too: the tier is a cache tier of the file's volume and not mandatory, a live mandatory replica survives elsewhere, and the anchor stays satisfied by a live replica (anchor-pending chunks are never touched). Removing only some rows would free nothing.
 * Pass 1 skips copies the pre-cache protects; only if that is short does pass 2 also take copies protected by an active pre-cache cursor. Copies under `precache.pins` are never evicted (there is no "evict pins as last resort" option).
+* The manager pages the list (keyset cursor `(last_read_ms, chunk_id)`) up to 8 pages, 32k entries, per disk and round while the plan is short of its target, so a disk full of mandatory copies at the old end still reaches its cache copies. A data node that ignores the cursor returns the first page again; paging then stops.
 * Each copy goes through the idle demote's path: `RemoveChunkLocation` with `enforce_anchor` through Raft first, then the byte delete. Audit `cache.evict_capacity` per copy, one warn line per disk and round.
 
 While the watermarks are set, promotion target selection and pre-cache room never plan a hot/warm disk past `low`, so they do not immediately trigger eviction. A data node too old for `ListOldestChunks`, a cold/tape disk, or a last-read index not seeded yet skips the disk for that round (logged once at info).
@@ -162,6 +163,8 @@ For such volumes the 30 s pre-cache loop visits each hot/warm disk of a node tha
 * every location row of the hash on that disk belongs to a volume with `retention_secs` set that has elapsed since the chunk's last read (`now - last_read >= retention`), and the file was not updated or given a replica within `promote_window_secs` + 180 s;
 * the same per-row safety as capacity eviction: cache tier, live mandatory survivor, anchor kept by a live replica (anchor-pending chunks are never touched);
 * copies protected by the pre-cache (cursors, scheduled copies) and pins are never taken.
+
+Like capacity eviction, the manager pages the list up to 32k entries per disk and visit while fewer than 512 copies are planned.
 
 No leader-tenure or read-window gate applies: the last-read time is persisted on the data node. Each copy goes through `RemoveChunkLocation` with `enforce_anchor` first, then the byte delete; audit `cache.demote` with result `retention_elapsed` and the last-read age.
 

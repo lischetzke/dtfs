@@ -651,6 +651,7 @@ impl TaskScheduler {
         disk_id: u32,
         limit: u32,
         older_than_ms: u64,
+        after: Option<(u64, String)>,
     ) -> Result<Vec<dtfs_proto::dtfs::data::OldestChunk>, tonic::Status> {
         use dtfs_common::crypto::{stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS};
         use dtfs_proto::dtfs::data::ListOldestChunksRequest;
@@ -661,7 +662,13 @@ impl TaskScheduler {
             .await
             .map(DataServiceClient::new)
             .map_err(|e| tonic::Status::unavailable(format!("connect to data node {node_addr}: {e}")))?;
-        let mut req = tonic::Request::new(ListOldestChunksRequest { disk_id, limit, older_than_ms });
+        let mut req = tonic::Request::new(ListOldestChunksRequest {
+            disk_id,
+            limit,
+            older_than_ms,
+            after_last_read_ms: after.as_ref().map_or(0, |a| a.0),
+            after_chunk_id: after.map(|a| a.1).unwrap_or_default(),
+        });
         let secret = self.shared_secret.read().clone();
         if let Some((ts, mac)) = stamp_data_rpc_auth(&secret, "ListOldestChunks", "") {
             if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {

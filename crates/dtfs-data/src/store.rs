@@ -201,12 +201,12 @@ impl ChunkStore {
     }
 
     /// `ListOldestChunks` core: `(chunk id, last_read_ms, size)`, oldest first.
-    pub fn list_oldest(&self, disk_id: u32, limit: usize, older_than_ms: u64) -> Result<Vec<([u8; 32], u64, u64)>, ListOldestError> {
+    pub fn list_oldest(&self, disk_id: u32, limit: usize, older_than_ms: u64, after: Option<(u64, [u8; 32])>) -> Result<Vec<([u8; 32], u64, u64)>, ListOldestError> {
         if self.disk_manager.all_disks().iter().all(|d| d.disk_id != disk_id) {
             return Err(ListOldestError::UnknownDisk);
         }
         let ix = self.last_read.get(disk_id as usize).and_then(|x| x.as_ref()).ok_or(ListOldestError::Untracked)?;
-        ix.oldest(limit, older_than_ms).map_err(|ListError::NotReady| ListOldestError::NotReady)
+        ix.oldest(limit, older_than_ms, after).map_err(|ListError::NotReady| ListOldestError::NotReady)
     }
 
     /// Seed every tracked disk's index from its `.dat` files + persisted file.

@@ -26,6 +26,64 @@ use super::{
 pub(crate) const MAX_EVICTIONS_PER_ROUND: usize = 512;
 /// `ListOldestChunks` limit (also the data node's cap).
 const LIST_LIMIT: u32 = 4096;
+/// Pages (of `LIST_LIMIT`) read per disk per round: 32k entries.
+const MAX_PAGES: usize = 8;
+
+/// Keyset cursor `(last_read_ms, chunk_id)`, exclusive.
+type Cursor = (u64, String);
+
+/// Page one disk's `ListOldestChunks` and plan each page, accumulating into
+/// one plan. Continues only while the plan is short of `target_bytes` and of
+/// `MAX_EVICTIONS_PER_ROUND`, the page was full and fewer than `MAX_PAGES`
+/// were read. A page whose first entry is not strictly after the cursor (an
+/// old data node ignoring it) is dropped and ends paging. A fetch error on
+/// the first page is returned; on a later page it ends paging, keeping the plan.
+async fn plan_paged<F, Fut, P, PFut>(mut fetch: F, mut plan_page: P, target_bytes: u64) -> Result<Vec<CapacityEviction>, tonic::Status>
+where
+    F: FnMut(Option<Cursor>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<OldestChunk>, tonic::Status>>,
+    P: FnMut(Vec<OldestChunk>, u64) -> PFut,
+    PFut: std::future::Future<Output = Vec<CapacityEviction>>,
+{
+    let mut out: Vec<CapacityEviction> = Vec::new();
+    let mut freed = 0u64;
+    let mut cursor: Option<Cursor> = None;
+    for n in 0..MAX_PAGES {
+        let page = match fetch(cursor.clone()).await {
+            Ok(p) => p,
+            Err(e) if n == 0 => return Err(e),
+            Err(e) => {
+                debug!(code = ?e.code(), "ListOldestChunks page failed, paging stopped");
+                break;
+            }
+        };
+        if let (Some(c), Some(f)) = (&cursor, page.first()) {
+            if (f.last_read_ms, &f.chunk_id) <= (c.0, &c.1) {
+                break;
+            }
+        }
+        let full = page.len() >= LIST_LIMIT as usize;
+        let next = page.last().map(|l| (l.last_read_ms, l.chunk_id.clone()));
+        if !page.is_empty() {
+            let ev = plan_page(page, target_bytes.saturating_sub(freed)).await;
+            freed = ev.iter().fold(freed, |a, e| a.saturating_add(e.size_bytes));
+            out.extend(ev);
+        }
+        if !full || freed >= target_bytes || out.len() >= MAX_EVICTIONS_PER_ROUND {
+            break;
+        }
+        cursor = next;
+    }
+    out.truncate(MAX_EVICTIONS_PER_ROUND);
+    Ok(out)
+}
+
+enum PlanKind {
+    /// Bytes still to free.
+    Capacity(u64),
+    /// Now (ms).
+    Retention(u64),
+}
 
 /// One location row an eviction removes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,40 +366,26 @@ impl TieringEngine {
             return;
         }
 
-        let mut lists: Vec<(DiskToEvict, Vec<OldestChunk>)> = Vec::new();
-        for d in disks {
-            let res = self.scheduler.list_oldest_chunks_on_node(&d.addr, d.disk_id, LIST_LIMIT, 0).await;
-            if let Some(c) = note_list_result(&self.evict_skip_logged, "capacity eviction", &d, res) {
-                lists.push((d, c));
-            }
-        }
-        if lists.is_empty() {
-            return;
-        }
-
-        let hashes: HashSet<String> = lists.iter().flat_map(|(_, c)| c.iter().map(|o| o.chunk_id.clone())).collect();
-        let (chunks, volumes, named) = {
-            let sm = self.state_data.read().await;
-            (
-                eviction_chunks(&sm, &hashes),
-                tick_volume_policies(&sm),
-                dtfs_raft::state_machine::cluster_understands_named_remove(&sm),
-            )
-        };
+        let named = dtfs_raft::state_machine::cluster_understands_named_remove(&*self.state_data.read().await);
         let (protected, pinned, scheduled) = {
             let st = self.precache.lock();
             (st.protected.clone(), st.pinned.clone(), st.scheduled.clone())
         };
         let prot = EvictProtection { protected: &protected, scheduled: &scheduled, pinned: &pinned };
-        let mut removed = Vec::new();
-        let plans: Vec<(DiskToEvict, Vec<CapacityEviction>)> = lists
-            .into_iter()
-            .map(|(d, cands)| {
-                let target = bytes_to_free(d.total, d.used, low);
-                let ev = plan_capacity_eviction(d.node_id, d.disk_id, &cands, &chunks, &volumes, &prot, target, &mut removed);
-                (d, ev)
-            })
-            .collect();
+        let removed = parking_lot::Mutex::new(Vec::new());
+        let mut plans: Vec<(DiskToEvict, Vec<CapacityEviction>)> = Vec::new();
+        for d in disks {
+            let target = bytes_to_free(d.total, d.used, low);
+            let res = plan_paged(
+                |cur| self.list_page(&d, 0, cur),
+                |page, remaining| self.plan_page(&d, page, &prot, &removed, PlanKind::Capacity(remaining)),
+                target,
+            )
+            .await;
+            if let Some(ev) = note_list_result(&self.evict_skip_logged, "capacity eviction", &d, res) {
+                plans.push((d, ev));
+            }
+        }
 
         let active_pairs = self.scheduler.active_replication_pairs().await;
         for (d, evictions) in plans {
@@ -405,14 +449,26 @@ impl TieringEngine {
             return;
         }
         let older_than_ms = now_ms.saturating_sub(min_retention_secs.saturating_mul(1000)).max(1);
-        let mut lists: Vec<(DiskToEvict, Vec<OldestChunk>)> = Vec::new();
+        let named = dtfs_raft::state_machine::cluster_understands_named_remove(&*self.state_data.read().await);
+        let (protected, pinned, scheduled) = {
+            let st = self.precache.lock();
+            (st.protected.clone(), st.pinned.clone(), st.scheduled.clone())
+        };
+        let prot = EvictProtection { protected: &protected, scheduled: &scheduled, pinned: &pinned };
+        let removed = parking_lot::Mutex::new(Vec::new());
+        let mut plans: Vec<(DiskToEvict, Vec<CapacityEviction>)> = Vec::new();
         for d in disks {
-            let res = self.scheduler.list_oldest_chunks_on_node(&d.addr, d.disk_id, LIST_LIMIT, older_than_ms).await;
+            let res = plan_paged(
+                |cur| self.list_page(&d, older_than_ms, cur),
+                |page, _| self.plan_page(&d, page, &prot, &removed, PlanKind::Retention(now_ms)),
+                u64::MAX,
+            )
+            .await;
             let key = (d.node_id, d.disk_id);
             match note_list_result(&self.retention_skip_logged, "retention demote", &d, res) {
-                Some(c) => {
+                Some(ev) => {
                     self.retention_capable.lock().insert(key, now_ms);
-                    lists.push((d, c));
+                    plans.push((d, ev));
                 }
                 None => {
                     // The ring-based idle demote takes this disk back.
@@ -420,33 +476,6 @@ impl TieringEngine {
                 }
             }
         }
-        lists.retain(|(_, c)| !c.is_empty());
-        if lists.is_empty() {
-            return;
-        }
-
-        let hashes: HashSet<String> = lists.iter().flat_map(|(_, c)| c.iter().map(|o| o.chunk_id.clone())).collect();
-        let (chunks, volumes, named) = {
-            let sm = self.state_data.read().await;
-            (
-                eviction_chunks(&sm, &hashes),
-                tick_volume_policies(&sm),
-                dtfs_raft::state_machine::cluster_understands_named_remove(&sm),
-            )
-        };
-        let (protected, pinned, scheduled) = {
-            let st = self.precache.lock();
-            (st.protected.clone(), st.pinned.clone(), st.scheduled.clone())
-        };
-        let prot = EvictProtection { protected: &protected, scheduled: &scheduled, pinned: &pinned };
-        let mut removed = Vec::new();
-        let plans: Vec<(DiskToEvict, Vec<CapacityEviction>)> = lists
-            .into_iter()
-            .map(|(d, cands)| {
-                let ev = plan_retention_demotion(d.node_id, d.disk_id, &cands, &chunks, &volumes, &prot, now_ms, &mut removed);
-                (d, ev)
-            })
-            .collect();
 
         let active_pairs = self.scheduler.active_replication_pairs().await;
         for (d, demotions) in plans {
@@ -460,6 +489,31 @@ impl TieringEngine {
             if count > 0 {
                 info!(node_id = d.node_id, disk_id = d.disk_id, demoted = count, bytes, "retention demote: cache copies unread past their volume retention removed");
             }
+        }
+    }
+
+    async fn list_page(&self, d: &DiskToEvict, older_than_ms: u64, cursor: Option<Cursor>) -> Result<Vec<OldestChunk>, tonic::Status> {
+        self.scheduler.list_oldest_chunks_on_node(&d.addr, d.disk_id, LIST_LIMIT, older_than_ms, cursor).await
+    }
+
+    /// Plan one page against a fresh state-machine snapshot.
+    async fn plan_page(
+        &self,
+        d: &DiskToEvict,
+        page: Vec<OldestChunk>,
+        prot: &EvictProtection<'_>,
+        removed: &parking_lot::Mutex<Vec<(String, u64, u64, u32)>>,
+        kind: PlanKind,
+    ) -> Vec<CapacityEviction> {
+        let hashes: HashSet<String> = page.iter().map(|o| o.chunk_id.clone()).collect();
+        let (chunks, volumes) = {
+            let sm = self.state_data.read().await;
+            (eviction_chunks(&sm, &hashes), tick_volume_policies(&sm))
+        };
+        let mut removed = removed.lock();
+        match kind {
+            PlanKind::Capacity(target) => plan_capacity_eviction(d.node_id, d.disk_id, &page, &chunks, &volumes, prot, target, &mut removed),
+            PlanKind::Retention(now_ms) => plan_retention_demotion(d.node_id, d.disk_id, &page, &chunks, &volumes, prot, now_ms, &mut removed),
         }
     }
 
@@ -559,12 +613,12 @@ pub(crate) fn fresh_capable_disks(capable: &HashMap<(u64, u32), u64>, now_ms: u6
 /// `Some(list)` on success (and forget earlier skip logs for the disk); on an
 /// error log once per (disk, code): info for the expected Unimplemented /
 /// FailedPrecondition / Unavailable, warn otherwise.
-fn note_list_result(
+fn note_list_result<T>(
     logged: &parking_lot::Mutex<HashSet<(u64, u32, i32)>>,
     what: &str,
     d: &DiskToEvict,
-    res: Result<Vec<OldestChunk>, tonic::Status>,
-) -> Option<Vec<OldestChunk>> {
+    res: Result<T, tonic::Status>,
+) -> Option<T> {
     match res {
         Ok(c) => {
             logged.lock().retain(|k| (k.0, k.1) != (d.node_id, d.disk_id));
@@ -924,6 +978,81 @@ mod tests {
         let refs: Vec<&str> = hs.iter().map(String::as_str).collect();
         let cands: Vec<OldestChunk> = hs.iter().map(|h| aged(h)).collect();
         assert_eq!(plan_ret(&cands, &std_world(&refs), &Prot::none()).len(), MAX_EVICTIONS_PER_ROUND);
+    }
+
+    /// Emulates the data node: entries sorted by (last_read_ms, id), strictly
+    /// after the cursor, first `LIST_LIMIT`. `honor_cursor=false` = old node.
+    fn serve(all: &[OldestChunk], cur: Option<Cursor>, honor_cursor: bool) -> Vec<OldestChunk> {
+        all.iter()
+            .filter(|c| !honor_cursor || cur.as_ref().is_none_or(|k| (c.last_read_ms, &c.chunk_id) > (k.0, &k.1)))
+            .take(LIST_LIMIT as usize)
+            .cloned()
+            .collect()
+    }
+
+    /// `n_bad` mandatory-only entries (never evictable) then evictable `ok*` ones.
+    fn paged_world(n_bad: usize, n_ok: usize) -> (Vec<OldestChunk>, HashMap<String, Vec<TickChunk>>) {
+        let mut all = Vec::new();
+        let mut chunks = HashMap::new();
+        for i in 0..n_bad + n_ok {
+            let h = if i < n_bad { format!("bad{i:06}") } else { format!("ok{i:06}") };
+            // Volume "m" makes the warm copy mandatory, so it is never evictable.
+            chunks.insert(h.clone(), vec![tc(&h, &format!("/f/{h}"), if i < n_bad { "m" } else { "v" }, std_placements())]);
+            all.push(cand(&h, 1000 + i as u64, 10));
+        }
+        (all, chunks)
+    }
+
+    async fn run_paged(all: &[OldestChunk], chunks: &HashMap<String, Vec<TickChunk>>, honor: bool, target: u64) -> (Vec<CapacityEviction>, usize) {
+        let vs = vols();
+        let fetches = std::cell::Cell::new(0usize);
+        let removed = std::cell::RefCell::new(Vec::new());
+        let prot = Prot::none();
+        let ev = plan_paged(
+            |cur| {
+                fetches.set(fetches.get() + 1);
+                std::future::ready(Ok(serve(all, cur, honor)))
+            },
+            |page, remaining| {
+                std::future::ready(plan_capacity_eviction(N, 0, &page, chunks, &vs, &prot.view(), remaining, &mut removed.borrow_mut()))
+            },
+            target,
+        )
+        .await
+        .unwrap();
+        (ev, fetches.get())
+    }
+
+    #[tokio::test]
+    async fn eviction_reaches_page_two_past_ineligible_entries() {
+        let (all, chunks) = paged_world(LIST_LIMIT as usize, 10);
+        let (ev, fetches) = run_paged(&all, &chunks, true, 50).await;
+        assert_eq!(ev.len(), 5, "evictable entries on page 2 were reached");
+        assert!(ev.iter().all(|e| e.chunk_id.starts_with("ok")));
+        assert_eq!(fetches, 2);
+    }
+
+    #[tokio::test]
+    async fn repeated_page_from_an_old_node_stops_paging() {
+        let (all, chunks) = paged_world(LIST_LIMIT as usize, 10);
+        let (ev, fetches) = run_paged(&all, &chunks, false, 50).await;
+        assert!(ev.is_empty());
+        assert_eq!(fetches, 2, "second page repeats the first: dropped, no third fetch");
+    }
+
+    #[tokio::test]
+    async fn paging_is_capped_at_eight_pages() {
+        let (all, chunks) = paged_world(LIST_LIMIT as usize * 9, 10);
+        let (ev, fetches) = run_paged(&all, &chunks, true, 50).await;
+        assert!(ev.is_empty(), "evictable entries sit beyond the 32k window");
+        assert_eq!(fetches, MAX_PAGES);
+    }
+
+    #[tokio::test]
+    async fn short_page_stops_paging() {
+        let (all, chunks) = paged_world(3, 3);
+        let (_, fetches) = run_paged(&all, &chunks, true, 1_000).await;
+        assert_eq!(fetches, 1);
     }
 
     #[test]

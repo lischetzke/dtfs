@@ -77,7 +77,8 @@ impl LastReadIndex {
 
     /// Entries with `last_read_ms <= older_than_ms` (0 = no filter), oldest
     /// first, at most `min(limit, LIST_MAX)` (limit 0 = LIST_MAX).
-    pub fn oldest(&self, limit: usize, older_than_ms: u64) -> Result<Vec<(Key, u64, u64)>, ListError> {
+    /// Ordered by `(last_read_ms, id)`; `after` = exclusive cursor.
+    pub fn oldest(&self, limit: usize, older_than_ms: u64, after: Option<(u64, Key)>) -> Result<Vec<(Key, u64, u64)>, ListError> {
         if !self.is_ready() {
             return Err(ListError::NotReady);
         }
@@ -87,13 +88,14 @@ impl LastReadIndex {
             .lock()
             .iter()
             .filter(|(_, e)| older_than_ms == 0 || e.0 <= older_than_ms)
+            .filter(|(k, e)| after.is_none_or(|(ms, id)| (e.0, **k) > (ms, id)))
             .map(|(k, e)| (*k, e.0, e.1))
             .collect();
         if v.len() > limit {
-            v.select_nth_unstable_by_key(limit - 1, |x| x.1);
+            v.select_nth_unstable_by_key(limit - 1, |x| (x.1, x.0));
             v.truncate(limit);
         }
-        v.sort_by_key(|x| x.1);
+        v.sort_by_key(|x| (x.1, x.0));
         Ok(v)
     }
 
@@ -239,7 +241,7 @@ mod tests {
         assert!(!ix.dirty.load(Ordering::Acquire));
         assert!(ix.touch(&key(1), 1_000_000 + 10 * MIN, false), ">= 10 min: update");
         assert!(ix.dirty.load(Ordering::Acquire));
-        assert_eq!(ix.oldest(0, 0).unwrap()[0].1, 1_000_000 + 10 * MIN);
+        assert_eq!(ix.oldest(0, 0, None).unwrap()[0].1, 1_000_000 + 10 * MIN);
         assert!(!ix.touch(&key(9), 99 * MIN * 1000, false), "unknown chunk is not inserted");
     }
 
@@ -249,7 +251,7 @@ mod tests {
         let ix = ready_index(t.path());
         ix.insert(key(1), 1_000, 10);
         assert!(!ix.touch(&key(1), 1_000 + 60 * MIN, true));
-        assert_eq!(ix.oldest(0, 0).unwrap()[0].1, 1_000);
+        assert_eq!(ix.oldest(0, 0, None).unwrap()[0].1, 1_000);
     }
 
     #[test]
@@ -257,9 +259,9 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let ix = ready_index(t.path());
         ix.insert(key(1), 5, 10);
-        assert_eq!(ix.oldest(0, 0).unwrap(), vec![(key(1), 5, 10)]);
+        assert_eq!(ix.oldest(0, 0, None).unwrap(), vec![(key(1), 5, 10)]);
         ix.remove(&key(1));
-        assert!(ix.oldest(0, 0).unwrap().is_empty());
+        assert!(ix.oldest(0, 0, None).unwrap().is_empty());
     }
 
     #[test]
@@ -269,12 +271,38 @@ mod tests {
         for i in 0..10u8 {
             ix.insert(key(i), 100 + (9 - i as u64) * 10, 1); // key 9 oldest
         }
-        let v = ix.oldest(3, 0).unwrap();
+        let v = ix.oldest(3, 0, None).unwrap();
         assert_eq!(v.iter().map(|x| x.1).collect::<Vec<_>>(), vec![100, 110, 120]);
         assert_eq!(v[0].0, key(9));
-        let f = ix.oldest(0, 120).unwrap();
+        let f = ix.oldest(0, 120, None).unwrap();
         assert_eq!(f.len(), 3, "older_than is inclusive");
-        assert_eq!(ix.oldest(0, 99).unwrap().len(), 0);
+        assert_eq!(ix.oldest(0, 99, None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn cursor_pages_are_disjoint_ordered_and_split_ties_by_id() {
+        let t = tempfile::tempdir().unwrap();
+        let ix = ready_index(t.path());
+        // 10 entries, 4 distinct times: ties straddle page boundaries of 3.
+        for i in 0..10u8 {
+            ix.insert(key(i), 100 + (i as u64 / 3) * 10, 1);
+        }
+        let all = ix.oldest(0, 0, None).unwrap();
+        assert_eq!(all.len(), 10);
+        assert!(all.windows(2).all(|w| (w[0].1, w[0].0) < (w[1].1, w[1].0)), "total order");
+        let mut got = Vec::new();
+        let mut cur = None;
+        loop {
+            let p = ix.oldest(3, 0, cur).unwrap();
+            if p.is_empty() {
+                break;
+            }
+            cur = p.last().map(|l| (l.1, l.0));
+            got.extend(p);
+        }
+        assert_eq!(got, all, "none lost or duplicated across page boundaries");
+        assert_eq!(ix.oldest(3, 0, None).unwrap(), all[..3], "no cursor = first page");
+        assert!(ix.oldest(3, 0, Some((u64::MAX, key(0)))).unwrap().is_empty());
     }
 
     #[test]
@@ -286,16 +314,16 @@ mod tests {
             k[..4].copy_from_slice(&i.to_be_bytes());
             ix.insert(k, 1000 + i as u64, 1);
         }
-        assert_eq!(ix.oldest(0, 0).unwrap().len(), LIST_MAX);
-        assert_eq!(ix.oldest(1_000_000, 0).unwrap().len(), LIST_MAX);
-        assert_eq!(ix.oldest(7, 0).unwrap().len(), 7);
+        assert_eq!(ix.oldest(0, 0, None).unwrap().len(), LIST_MAX);
+        assert_eq!(ix.oldest(1_000_000, 0, None).unwrap().len(), LIST_MAX);
+        assert_eq!(ix.oldest(7, 0, None).unwrap().len(), 7);
     }
 
     #[test]
     fn not_ready_is_an_error() {
         let t = tempfile::tempdir().unwrap();
         let ix = LastReadIndex::new(t.path());
-        assert_eq!(ix.oldest(0, 0).unwrap_err(), ListError::NotReady);
+        assert_eq!(ix.oldest(0, 0, None).unwrap_err(), ListError::NotReady);
     }
 
     #[test]
@@ -308,7 +336,7 @@ mod tests {
         std::fs::write(t.path().join(".dtfs/last_read.tsv"), text).unwrap();
         let ix = LastReadIndex::new(t.path());
         ix.seed(vec![(key(1), 100, 4), (key(3), 200, 8)]);
-        let v = ix.oldest(0, 0).unwrap();
+        let v = ix.oldest(0, 0, None).unwrap();
         assert_eq!(v, vec![(key(3), 200, 8), (key(1), 777, 4)], "persisted overrides mtime; absent dropped; bad line falls back to mtime");
     }
 
@@ -323,7 +351,7 @@ mod tests {
         assert!(!t.path().join(".dtfs/last_read.tsv.tmp").exists());
         let ix2 = LastReadIndex::new(t.path());
         ix2.seed(vec![(key(1), 1, 9)]);
-        assert_eq!(ix2.oldest(0, 0).unwrap(), vec![(key(1), 42, 9)]);
+        assert_eq!(ix2.oldest(0, 0, None).unwrap(), vec![(key(1), 42, 9)]);
     }
 
     #[test]

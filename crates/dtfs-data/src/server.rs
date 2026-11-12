@@ -694,9 +694,16 @@ impl DataService for DataServiceImpl {
     ) -> Result<Response<ListOldestChunksResponse>, Status> {
         require_data_rpc_auth(&self.config.cluster.shared_secret, "ListOldestChunks", "", request.metadata())?;
         let req = request.into_inner();
+        let after = if req.after_chunk_id.is_empty() {
+            None
+        } else {
+            let mut id = [0u8; 32];
+            hex::decode_to_slice(&req.after_chunk_id, &mut id).map_err(|_| Status::invalid_argument("bad after_chunk_id"))?;
+            Some((req.after_last_read_ms, id))
+        };
         let rows = self
             .store
-            .list_oldest(req.disk_id, req.limit as usize, req.older_than_ms)
+            .list_oldest(req.disk_id, req.limit as usize, req.older_than_ms, after)
             .map_err(|e| match e {
                 ListOldestError::UnknownDisk => Status::invalid_argument(format!("unknown disk_id {}", req.disk_id)),
                 ListOldestError::Untracked => Status::failed_precondition(format!("disk {} does not track last-read times (cold tier)", req.disk_id)),
@@ -1838,7 +1845,7 @@ max_io_percent = 10
     }
 
     fn oldest_req(disk_id: u32) -> Request<ListOldestChunksRequest> {
-        Request::new(ListOldestChunksRequest { disk_id, limit: 0, older_than_ms: 0 })
+        Request::new(ListOldestChunksRequest { disk_id, limit: 0, older_than_ms: 0, after_last_read_ms: 0, after_chunk_id: String::new() })
     }
 
     #[tokio::test]
@@ -1869,7 +1876,7 @@ max_io_percent = 10
         svc.store.seed_last_read().await;
         assert!(svc.list_oldest_chunks(oldest_req(0)).await.unwrap().into_inner().chunks.is_empty());
         assert_eq!(
-            svc.store.list_oldest(1, 0, 0).unwrap_err(),
+            svc.store.list_oldest(1, 0, 0, None).unwrap_err(),
             ListOldestError::Untracked,
             "cold stays untracked after seeding"
         );
