@@ -6,6 +6,7 @@ use tracing_subscriber::EnvFilter;
 
 mod disk;
 mod integrity;
+mod last_read;
 mod memory;
 mod metrics;
 mod replication;
@@ -150,6 +151,20 @@ async fn main() -> anyhow::Result<()> {
                     error = %e,
                     "rescan_existing_chunks failed; bytes_stored counter stays at the live delta"
                 );
+            }
+        });
+    }
+
+    // Last-read index: seed in the background (walks every `.dat`), then
+    // persist dirty indexes every 10 min.
+    {
+        let lr_store = chunk_store.clone();
+        tokio::spawn(async move {
+            lr_store.seed_last_read().await;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+            loop {
+                tick.tick().await;
+                lr_store.persist_last_read().await;
             }
         });
     }

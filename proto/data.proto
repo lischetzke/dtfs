@@ -41,6 +41,29 @@ service DataService {
   // period. Paged so a node with millions of chunks doesn't ship a
   // single multi-MB response.
   rpc ListChunks(ListChunksRequest) returns (ListChunksResponse);
+
+  // Least recently read chunks of one non-cold disk (coarse, persisted
+  // last-read index). Read-only; same HMAC gate as ListChunks.
+  rpc ListOldestChunks(ListOldestChunksRequest) returns (ListOldestChunksResponse);
+}
+
+// `limit` 0 = 4096 (also the cap). `older_than_ms` 0 = no age filter,
+// otherwise only entries with last_read_ms <= older_than_ms.
+message ListOldestChunksRequest {
+  uint32 disk_id       = 1;
+  uint32 limit         = 2;
+  uint64 older_than_ms = 3;
+}
+
+message OldestChunk {
+  string chunk_id     = 1;
+  uint64 last_read_ms = 2;
+  uint64 size_bytes   = 3;
+}
+
+// Oldest first.
+message ListOldestChunksResponse {
+  repeated OldestChunk chunks = 1;
 }
 
 // Bug BC-6 — body for ListChunks. `page_token` is an opaque cursor

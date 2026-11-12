@@ -12,7 +12,7 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::memory::MemoryBudget;
 use crate::metrics::DataMetrics;
 use crate::replication::ReplicationManager;
-use crate::store::ChunkStore;
+use crate::store::{ChunkStore, ListOldestError};
 // REV-4-5 — the last production user of this was the cache-HIT verify
 // path, removed with the phantom ARC cache; the test modules still use it.
 #[cfg(test)]
@@ -687,6 +687,29 @@ impl DataService for DataServiceImpl {
         }))
     }
 
+    /// Least recently read chunks of one disk (cache eviction input).
+    async fn list_oldest_chunks(
+        &self,
+        request: Request<ListOldestChunksRequest>,
+    ) -> Result<Response<ListOldestChunksResponse>, Status> {
+        require_data_rpc_auth(&self.config.cluster.shared_secret, "ListOldestChunks", "", request.metadata())?;
+        let req = request.into_inner();
+        let rows = self
+            .store
+            .list_oldest(req.disk_id, req.limit as usize, req.older_than_ms)
+            .map_err(|e| match e {
+                ListOldestError::UnknownDisk => Status::invalid_argument(format!("unknown disk_id {}", req.disk_id)),
+                ListOldestError::Untracked => Status::failed_precondition(format!("disk {} does not track last-read times (cold tier)", req.disk_id)),
+                ListOldestError::NotReady => Status::unavailable("last-read index still seeding"),
+            })?;
+        Ok(Response::new(ListOldestChunksResponse {
+            chunks: rows
+                .into_iter()
+                .map(|(id, ms, size)| OldestChunk { chunk_id: hex::encode(id), last_read_ms: ms, size_bytes: size })
+                .collect(),
+        }))
+    }
+
     async fn get_chunk(
         &self,
         request: Request<GetChunkRequest>,
@@ -758,6 +781,7 @@ impl DataService for DataServiceImpl {
                     Err(_) if self.store.repair_meta_for_read(&chunk_id, &dat_path, total_size).await => {
                         tracing::warn!(chunk_id = %req.chunk_id, "verify_on_read: .meta missing or unreadable; .dat matches its id, .meta rebuilt");
                         self.metrics.record_read(total_size);
+                        self.store.note_read_on_mount(&disk_mount, &chunk_id, now_ms, req.scanner);
                         return Ok(Response::new(stream_file(dat_path, total_size)));
                     }
                     // Item 10: try the remaining copies before giving up. Only a
@@ -808,6 +832,7 @@ impl DataService for DataServiceImpl {
             // Bug AL — record the read for the manager-side I/O Throughput
             // rolling-rate.
             self.metrics.record_read(total_size);
+            self.store.note_read_on_mount(&disk_mount, &chunk_id, now_ms, req.scanner);
 
             return Ok(Response::new(stream_file(dat_path, total_size)));
         }
@@ -1071,6 +1096,9 @@ impl DataService for DataServiceImpl {
             .as_millis() as u64;
         self.metrics
             .record_demand_read(&req.chunk_id, &req.requester_dc, now_ms, req.scanner);
+        if let Ok(id) = ChunkId::from_hex(&req.chunk_id) {
+            self.store.note_read_all(&id, now_ms, req.scanner);
+        }
         // Bug AL — also count the read for the manager's
         // dashboard rate calculation. The bytes-served estimate
         // is unknown at this layer, so we report 0 bytes; the
@@ -1161,10 +1189,18 @@ max_io_percent = 10
         disk_paths: &[&std::path::Path],
         verify_on_read: bool,
     ) -> DataServiceImpl {
-        let disk_path = disk_paths[0];
-        let disk_configs: Vec<_> = disk_paths
+        let disks: Vec<_> = disk_paths.iter().map(|p| (*p, DiskTier::Hot)).collect();
+        make_service_tiers(&disks, verify_on_read).await
+    }
+
+    async fn make_service_tiers(
+        disks: &[(&std::path::Path, DiskTier)],
+        verify_on_read: bool,
+    ) -> DataServiceImpl {
+        let disk_path = disks[0].0;
+        let disk_configs: Vec<_> = disks
             .iter()
-            .map(|p| dtfs_common::config::DiskConfig { path: p.to_path_buf(), tier: DiskTier::Hot, allow_non_mountpoint: false })
+            .map(|(p, tier)| dtfs_common::config::DiskConfig { path: p.to_path_buf(), tier: *tier, allow_non_mountpoint: false })
             .collect();
         let dm = DiskManager::new(&disk_configs).unwrap();
         let store = Arc::new(ChunkStore::new(dm));
@@ -1799,6 +1835,72 @@ max_io_percent = 10
             .await
             .expect_err("unauthenticated ListChunks must fail");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    fn oldest_req(disk_id: u32) -> Request<ListOldestChunksRequest> {
+        Request::new(ListOldestChunksRequest { disk_id, limit: 0, older_than_ms: 0 })
+    }
+
+    #[tokio::test]
+    async fn list_oldest_chunks_rejects_missing_auth() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = make_service(tmp.path(), true).await;
+        let err = svc.list_oldest_chunks(oldest_req(0)).await.expect_err("must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    // The handler tests below run without a cluster secret.
+    async fn open_service_tiers(disks: &[(&std::path::Path, DiskTier)]) -> DataServiceImpl {
+        let mut svc = make_service_tiers(disks, true).await;
+        svc.config.cluster.shared_secret = String::new();
+        svc
+    }
+
+    #[tokio::test]
+    async fn list_oldest_chunks_error_codes() {
+        let (hot, cold) = (tempfile::TempDir::new().unwrap(), tempfile::TempDir::new().unwrap());
+        let svc = open_service_tiers(&[(hot.path(), DiskTier::Hot), (cold.path(), DiskTier::Cold)]).await;
+        let e = svc.list_oldest_chunks(oldest_req(7)).await.expect_err("unknown disk");
+        assert_eq!(e.code(), tonic::Code::InvalidArgument);
+        let e = svc.list_oldest_chunks(oldest_req(1)).await.expect_err("cold disk");
+        assert_eq!(e.code(), tonic::Code::FailedPrecondition);
+        let e = svc.list_oldest_chunks(oldest_req(0)).await.expect_err("not seeded");
+        assert_eq!(e.code(), tonic::Code::Unavailable);
+        svc.store.seed_last_read().await;
+        assert!(svc.list_oldest_chunks(oldest_req(0)).await.unwrap().into_inner().chunks.is_empty());
+        assert_eq!(
+            svc.store.list_oldest(1, 0, 0).unwrap_err(),
+            ListOldestError::Untracked,
+            "cold stays untracked after seeding"
+        );
+    }
+
+    async fn listed(svc: &DataServiceImpl) -> Vec<OldestChunk> {
+        svc.list_oldest_chunks(oldest_req(0)).await.unwrap().into_inner().chunks
+    }
+
+    #[tokio::test]
+    async fn list_oldest_chunks_tracks_commit_delete_and_quarantine() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let svc = open_service_tiers(&[(tmp.path(), DiskTier::Hot)]).await;
+        svc.store.seed_last_read().await;
+        let mut ids = Vec::new();
+        for n in 0..2u8 {
+            let data = vec![n + 1; 2048];
+            let id = ChunkId::from_bytes(dtfs_common::checksum::compute(&data));
+            svc.store.put_chunk(&id, &data, &VolumeId::new("v".to_string()), DiskTier::Hot).await.unwrap();
+            ids.push(id);
+        }
+        let chunks = listed(&svc).await;
+        assert_eq!(chunks.len(), 2, "commit inserts");
+        assert!(chunks.iter().all(|c| c.size_bytes == 2048 && c.last_read_ms > 0));
+        svc.store.delete_chunk(&ids[0]).await.unwrap();
+        let chunks = listed(&svc).await;
+        assert_eq!(chunks.iter().map(|c| c.chunk_id.clone()).collect::<Vec<_>>(), vec![ids[1].as_hex()], "delete removes");
+        let (dat, _) = svc.store.chunk_file_path(&ids[1]).await.unwrap();
+        std::fs::write(&dat, b"corrupt").unwrap();
+        assert!(svc.store.confirm_and_quarantine(tmp.path(), &ids[1].as_hex(), true).await);
+        assert!(listed(&svc).await.is_empty(), "quarantine removes");
     }
 
     // LIS-83 — unauthenticated VerifyChunk must be PermissionDenied (oracle).

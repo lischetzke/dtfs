@@ -13,6 +13,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::disk::DiskManager;
+use crate::last_read::{LastReadIndex, ListError};
 
 /// Bug BN-1 — load a stable per-disk UUID from `<mount_path>/.dtfs-disk-uuid`,
 /// creating it on first discovery. Previously every data-node boot minted a
@@ -69,6 +70,14 @@ pub struct ChunkStoreStats {
     pub total_chunks: u64,
     /// Approximate total bytes of chunk data stored (sum of chunk sizes written).
     pub total_bytes_stored: u64,
+}
+
+/// Why `ChunkStore::list_oldest` refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ListOldestError {
+    UnknownDisk,
+    Untracked,
+    NotReady,
 }
 
 /// A Write-Ahead Log entry describing a pending chunk write operation.
@@ -133,6 +142,9 @@ pub struct ChunkStore {
     /// the WAL (not the lock) is what makes recovery correct across a
     /// restart.
     chunk_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
+    /// Last-read index per disk (position = disk_id); `None` for a cold disk.
+    // shortcut: cold disks are not tracked (shipped configs keep cache tiers off cold), track them if a volume ever caches on cold.
+    last_read: Vec<Option<Arc<LastReadIndex>>>,
 }
 
 /// Bug BY — a completed scrub result queued for the next heartbeat. The
@@ -152,13 +164,82 @@ pub struct ScrubResultSummary {
 
 impl ChunkStore {
     pub fn new(disk_manager: DiskManager) -> Self {
+        let last_read = disk_manager
+            .all_disks()
+            .iter()
+            .map(|d| (d.tier != DiskTier::Cold).then(|| Arc::new(LastReadIndex::new(&d.mount_path))))
+            .collect();
         Self {
+            last_read,
             disk_manager: Arc::new(disk_manager),
             chunk_count: Arc::new(AtomicU64::new(0)),
             bytes_stored: Arc::new(AtomicU64::new(0)),
             pending_corruption: Arc::new(parking_lot::Mutex::new(Vec::new())),
             pending_scrub_results: Arc::new(parking_lot::Mutex::new(Vec::new())),
             chunk_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
+        }
+    }
+
+    fn last_read_for_mount(&self, mount: &Path) -> Option<&Arc<LastReadIndex>> {
+        let id = self.disk_id_for_path(mount)?;
+        self.last_read.get(id as usize)?.as_ref()
+    }
+
+    /// A client read served from the copy on `mount` (non-scanner refreshes
+    /// the coarse last-read time).
+    pub fn note_read_on_mount(&self, mount: &Path, id: &ChunkId, now_ms: u64, scanner: bool) {
+        if let Some(ix) = self.last_read_for_mount(mount) {
+            ix.touch(&id.0, now_ms, scanner);
+        }
+    }
+
+    /// A client cache hit: refresh every tracked disk of this node holding the chunk.
+    pub fn note_read_all(&self, id: &ChunkId, now_ms: u64, scanner: bool) {
+        for ix in self.last_read.iter().flatten() {
+            ix.touch(&id.0, now_ms, scanner);
+        }
+    }
+
+    /// `ListOldestChunks` core: `(chunk id, last_read_ms, size)`, oldest first.
+    pub fn list_oldest(&self, disk_id: u32, limit: usize, older_than_ms: u64) -> Result<Vec<([u8; 32], u64, u64)>, ListOldestError> {
+        if self.disk_manager.all_disks().iter().all(|d| d.disk_id != disk_id) {
+            return Err(ListOldestError::UnknownDisk);
+        }
+        let ix = self.last_read.get(disk_id as usize).and_then(|x| x.as_ref()).ok_or(ListOldestError::Untracked)?;
+        ix.oldest(limit, older_than_ms).map_err(|ListError::NotReady| ListOldestError::NotReady)
+    }
+
+    /// Seed every tracked disk's index from its `.dat` files + persisted file.
+    pub async fn seed_last_read(&self) {
+        for (d, ix) in self.disk_manager.all_disks().iter().zip(&self.last_read) {
+            let Some(ix) = ix else { continue };
+            let (ix, mount) = (ix.clone(), d.mount_path.clone());
+            let n = tokio::task::spawn_blocking(move || {
+                let walked = crate::last_read::walk_dat_files(&mount);
+                let n = walked.len();
+                ix.seed(walked);
+                n
+            })
+            .await;
+            match n {
+                Ok(n) => tracing::info!(disk_id = d.disk_id, chunks = n, "last-read index seeded"),
+                Err(e) => tracing::warn!(disk_id = d.disk_id, error = %e, "last-read index seeding failed"),
+            }
+        }
+    }
+
+    /// Write every dirty index to its `.dtfs/last_read.tsv` (best-effort).
+    pub async fn persist_last_read(&self) {
+        for (d, ix) in self.disk_manager.all_disks().iter().zip(&self.last_read) {
+            let Some(ix) = ix else { continue };
+            let ix = ix.clone();
+            let r = match tokio::task::spawn_blocking(move || ix.save_if_dirty()).await {
+                Ok(r) => r,
+                Err(e) => Err(std::io::Error::other(e)),
+            };
+            if let Err(e) = r {
+                tracing::warn!(disk_id = d.disk_id, error = %e, "last-read index write failed; will retry");
+            }
         }
     }
 
@@ -593,6 +674,10 @@ impl ChunkStore {
         // no-op (recover_from_wal, PutChunk arm).
         let _ = fs::remove_file(&wal_path).await;
 
+        if let Some(ix) = self.last_read.get(disk_id as usize).and_then(|x| x.as_ref()) {
+            ix.insert(chunk_id.0, now_millis(), size);
+        }
+
         // 5. Counters — skip for a re-upload of an already-complete chunk
         // (CR-4-6 / CO-5-5 parity).
         if !already_present {
@@ -827,6 +912,9 @@ impl ChunkStore {
                 let _ = fs::remove_file(&wal_path).await;
 
                 tracing::debug!("Deleted chunk {} ({} bytes)", chunk_id, file_size);
+                if let Some(ix) = self.last_read.get(disk.disk_id as usize).and_then(|x| x.as_ref()) {
+                    ix.remove(&chunk_id.0);
+                }
 
                 // Update running counters (saturating to avoid underflow).
                 self.chunk_count
@@ -969,6 +1057,8 @@ impl ChunkStore {
         tracing::warn!(chunk = %chunk_hex, disk = %disk_path.display(), "scrub quarantining corrupt chunk (inline, under chunk lock)");
         if let Err(e) = quarantine_chunk_on_disk(disk_path, chunk_hex).await {
             tracing::warn!(chunk = %chunk_hex, error = %e, "quarantine failed (non-fatal; entry still reported)");
+        } else if let Some(ix) = self.last_read_for_mount(disk_path) {
+            ix.remove(&id.0);
         }
         self.enqueue_pending_corruption([(chunk_hex.to_string(), self.disk_id_for_path(disk_path))]);
         true

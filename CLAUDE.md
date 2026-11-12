@@ -99,6 +99,7 @@ Load-bearing ownership only; history per row in `docs/src/internals/invariants.m
 | `dtfs-manager/src/api.rs` + `api/*.rs` | REST router; handlers per resource; decommission refuses while replicas remain; volume delete refuses `default`, entries without `delete_files` and leased files, re-checks for entries before `DeleteVolume` |
 | `dtfs-data/src/server.rs::put_chunk` | Streaming put; HMAC gates all data-plane RPCs |
 | `dtfs-data/src/store.rs::commit_chunk_from_tmp` | Atomic commit (§ A.6) |
+| `dtfs-data/src/last_read.rs` | Per-disk coarse last-read index (`.dtfs/last_read.tsv`), served by `ListOldestChunks`; client non-scanner reads only |
 | `dtfs-fuse/src/filesystem.rs` | FUSE↔cluster bridge; rules in `.claude/rules/fuse.md` |
 | `dtfs-fuse/src/fuse_adapter.rs` | Every op error routes through `cluster_err_to_errno` |
 | `dtfs-cli/src/main.rs` + `updater.rs` | REST client, full webui parity, non-zero exit on failure; updater verifies sha256 (+ minisign), token on first hop only, via curl stdin (`-H @-`), never argv |

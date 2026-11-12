@@ -57,6 +57,8 @@ One table per local disk or mount point. At least one is required.
 
 Disk ids are positions: the first `[[disks]]` entry is disk 0, the next disk 1, and so on. Replica identity is `(node_id, disk_id)`. The id is persisted in `<path>/.dtfs-disk-id` on first start, and **the daemon refuses to start** when a disk now sits at a different position. Therefore never remove or reorder entries in the middle of the list. Append new disks at the end; replace a failed or drained disk in place (same position, same path).
 
+Every non-cold disk keeps a coarse last-read time per chunk in memory and persists it to `<path>/.dtfs/last_read.tsv` (one `chunk_id<TAB>last_read_ms` line per chunk, rewritten atomically every 10 minutes when changed). Client reads and client cache hits refresh it, at most once per 10 minutes per chunk; library-scanner reads, replication/repair copies and scrub never do. At startup it is seeded from the `.dat` mtimes, overridden by the persisted file; a corrupt or missing file only loses precision, it never blocks startup. The manager uses it (via the read-only `ListOldestChunks` RPC) for cache eviction and retention, so the values survive manager leader changes. Memory is about 60 bytes per chunk on the disk (1 TB of 4 MiB chunks is roughly 15 MB); there is no config key. Cold disks are not tracked.
+
 ```toml
 [[disks]]          # disk 0
 path = "/mnt/hdd0"

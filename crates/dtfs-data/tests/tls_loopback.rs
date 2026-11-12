@@ -96,6 +96,13 @@ impl DataService for StubDataService {
     ) -> Result<Response<ListChunksResponse>, Status> {
         Err(Status::unimplemented("stub"))
     }
+
+    async fn list_oldest_chunks(
+        &self,
+        _req: Request<ListOldestChunksRequest>,
+    ) -> Result<Response<ListOldestChunksResponse>, Status> {
+        Err(Status::unimplemented("stub"))
+    }
 }
 
 // ---------------------------------------------------------------------------
