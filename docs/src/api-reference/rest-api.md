@@ -54,7 +54,7 @@ Errors are JSON `{"error": "<message>"}`, sometimes with extra fields (`preserve
 | GET | `/api/v1/cluster/status` | no | any | Cluster summary |
 | GET | `/api/v1/stats` | no | any | Aggregate metrics |
 | GET | `/api/v1/memory` | no | any | Manager memory ladder |
-| GET | `/api/v1/tiering/precache` | no | leader (409) | Pre-cache plan and progress: `is_leader`, `rate_mbps`, `yielded_live_tasks`, `live_tasks` (all scheduler tasks), `inflight_tasks` (pre-cache's own), `last_batch`, `dcs`, `series`, `cursors`, `pins`, `skipped_volumes`. A follower answers `409` with a leader hint |
+| GET | `/api/v1/tiering/precache` | no | leader (409) | Pre-cache plan and progress: `is_leader`, `rate_mbps`, `yielded_live_tasks`, `live_tasks` (all scheduler tasks), `inflight_tasks` (pre-cache's own), `last_batch`, `dcs`, `series`, `cursors`, `pins`, `skipped_volumes`, `link_budget_backlog` (per `[[tiering.links]]` entry: `to_dc`, `max_mbps`, `tokens_bytes`, `skipped_requests`, `skipped_bytes`). A follower answers `409` with a leader hint |
 | GET | `/api/v1/raft/state` | no | any | Raft view of this manager |
 | POST | `/api/v1/raft/add-learner` | yes + body secret | leader (409) | Add learner |
 | POST | `/api/v1/raft/promote` | yes + body secret | leader (409) | Learner to voter |

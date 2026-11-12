@@ -492,6 +492,7 @@ impl TaskScheduler {
         // migration state: report busy so the REST layer answers 503.
         report.busy = outcomes.contains(&ScheduleOutcome::Deferred);
         report.tasks_scheduled = new_task_count(&outcomes);
+        report.link_throttled = outcomes.iter().filter(|o| **o == ScheduleOutcome::Throttled).count();
 
         info!(
             prefix = %path_prefix,
@@ -1672,6 +1673,10 @@ pub struct PathMigrationReport {
     /// the caller should retry (REST: 503).
     #[serde(default)]
     pub busy: bool,
+    /// Chunks not scheduled because the target DC's `[[tiering.links]]`
+    /// budget was spent; re-run the call to pick them up.
+    #[serde(default)]
+    pub link_throttled: usize,
     /// Up to 5 illustrative entries so the operator can see *which* paths
     /// hit `no_source` / `no_target` without dumping the full list.
     pub examples: Vec<PathMigrationExample>,

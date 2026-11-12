@@ -353,6 +353,8 @@ pub(crate) struct PrecacheStatus {
     pub cursors: Vec<GroupStatus>,
     pub pins: Vec<PinStatus>,
     pub skipped_volumes: Vec<SkippedVolume>,
+    /// `[[tiering.links]]` buckets (all copy classes, not only pre-cache).
+    pub link_budget_backlog: Vec<crate::scheduler::link_budget::LinkBacklog>,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -137,6 +137,12 @@ listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
 #precache_max_mbps = 10             # predictive pre-cache copy rate (Mbit/s), must be > 0
 #cache_high_watermark_pct = 0       # capacity eviction of LRU cache copies on hot/warm
 #cache_low_watermark_pct = 0        # disks; both 0 (off) or 0 < low < high <= 99
+#max_promotions_per_tick = 50       # new cache-promotion tasks per tiering tick, must be > 0
+# Link budget: copies INTO to_dc from another DC share max_mbps (120 s burst).
+# None (default) = unlimited. One entry per DC, max_mbps > 0.
+#[[tiering.links]]
+#to_dc = "leli"
+#max_mbps = 30
 
 [monitoring]
 #heartbeat_interval_secs = 5

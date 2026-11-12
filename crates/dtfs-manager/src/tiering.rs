@@ -270,7 +270,10 @@ impl TieringEngine {
                         batch.already += 1;
                         scheduled.insert(pair);
                     }
-                    ScheduleOutcome::Deferred | ScheduleOutcome::Refused => batch.deferred += 1,
+                    // Not in flight, not `scheduled`: re-planned next tick.
+                    ScheduleOutcome::Deferred | ScheduleOutcome::Refused | ScheduleOutcome::Throttled => {
+                        batch.deferred += 1
+                    }
                 }
             }
             if batch.deferred > 0 {
@@ -289,6 +292,7 @@ impl TieringEngine {
         }
         plan.status.inflight_tasks = own_inflight(&prev_scheduled, &view.live_pairs) + batch.new;
         plan.status.last_batch = batch.clone();
+        plan.status.link_budget_backlog = self.scheduler.link_budget_status();
 
         let mut st = self.precache.lock();
         st.tokens = st.tokens.saturating_sub(batch.bytes);
@@ -625,7 +629,8 @@ impl TieringEngine {
                 }
 
                 // Tiering ceiling, not the global one: promotions must not starve repair.
-                self.scheduler
+                let outcome = self
+                    .scheduler
                     .schedule_replications(
                         &[(d.chunk_id.as_str(), d.current_node, target, d.target_tier)],
                         usize::MAX,
@@ -633,6 +638,15 @@ impl TieringEngine {
                         None,
                     )
                     .await;
+                use crate::scheduler::ScheduleOutcome::{AlreadyScheduled, New};
+                if !matches!(outcome.first(), Some(New | AlreadyScheduled)) {
+                    // Deferred, refused or link-throttled: restore the old
+                    // temperature so the next tick re-derives this decision.
+                    if let Some(p) = self.access_stats.write().await.get_mut(&d.chunk_id) {
+                        p.current_temperature = d.old_temp;
+                    }
+                    continue;
+                }
 
                 self.audit.log(
                     "tiering",
@@ -667,6 +681,19 @@ impl TieringEngine {
         }
 
         Ok(())
+    }
+
+    /// Schedule promotions in one batch, at most `max_promotions_per_tick` NEW
+    /// tasks; the rest come back `Deferred` and are re-planned next tick.
+    async fn dispatch_promotions(&self, promotions: &[TickPromotion]) -> Vec<crate::scheduler::ScheduleOutcome> {
+        let max_new = self.config.read().await.max_promotions_per_tick;
+        let reqs: Vec<(&str, u64, u64, DiskTier)> = promotions
+            .iter()
+            .map(|p| (p.chunk_id.as_str(), p.source_node_id, p.target_node_id, p.target_tier))
+            .collect();
+        self.scheduler
+            .schedule_replications(&reqs, max_new, crate::scheduler::TIERING_MAX_LIVE_TASKS, None)
+            .await
     }
 
     /// Bug AV (AV-2-4) — one engine tick for the cache lifecycle.
@@ -759,15 +786,7 @@ impl TieringEngine {
         // -- Dispatch promotions via the scheduler.
         // One migration-state load/save for the whole batch; only NEWLY
         // scheduled tasks count toward the per-tick cap.
-        let reqs: Vec<(&str, u64, u64, DiskTier)> = plan
-            .promotions
-            .iter()
-            .map(|p| (p.chunk_id.as_str(), p.source_node_id, p.target_node_id, p.target_tier))
-            .collect();
-        let outcomes = self
-            .scheduler
-            .schedule_replications(&reqs, MAX_PROMOTIONS_PER_TICK, crate::scheduler::TIERING_MAX_LIVE_TASKS, None)
-            .await;
+        let outcomes = self.dispatch_promotions(&plan.promotions).await;
         let deferred = outcomes.iter().filter(|o| **o == crate::scheduler::ScheduleOutcome::Deferred).count();
         if deferred > 0 || outcomes.contains(&crate::scheduler::ScheduleOutcome::Refused) {
             warn!(deferred, "promotion dispatch capped or scheduler task budget exhausted; remainder re-planned next tick");
@@ -2015,11 +2034,6 @@ pub(crate) struct TickPlan {
     /// CO-1-2 — demotes refused to protect the anchor DC.
     pub anchor_protected: Vec<AnchorProtectedDemote>,
 }
-
-/// A library scan can plan ~10k promotions at once; the dispatcher creates at
-/// most this many NEW tasks per tick (already-scheduled ones do not count) so
-/// anchor/mandatory repair (MAX_LIVE_TASKS) is not starved.
-pub(crate) const MAX_PROMOTIONS_PER_TICK: usize = 50;
 
 /// AV-2-4 — pure planner. Walks every chunk in the snapshot and
 /// emits:
@@ -3898,7 +3912,7 @@ mod audit_co_tests {
             let _ = cap;
             c
         };
-        let n = MAX_PROMOTIONS_PER_TICK + 7;
+        let n = 57; // past the default max_promotions_per_tick (50)
         let snap = TickSnapshot { chunks: (0..n).map(|i| mk(i, n)).collect(), nodes: nodes.clone(), volumes: volumes.clone() };
         let plan = plan_cache_tick(&snap, 1_000, false);
         // The planner no longer truncates: the dispatcher caps NEW tasks.
@@ -4243,6 +4257,29 @@ mod precache_wiring_tests {
         let a = st.activity.get(&("/tv/a.mkv".to_string(), "toro".to_string())).expect("toro activity");
         assert!(a.chunk_ids.contains("c1"));
         assert_eq!(st.activity.len(), 1, "unknown dc is ignored");
+    }
+
+    /// `[tiering] max_promotions_per_tick` caps NEW promotion tasks per tick.
+    #[tokio::test]
+    async fn promotions_per_tick_honour_config() {
+        let h = crate::api::test_support::harness().await;
+        let mut cfg = h.state.config.tiering.clone();
+        cfg.max_promotions_per_tick = 2;
+        let engine = TieringEngine::new(cfg, h.state.scheduler.clone(), h.state.audit_log.clone(), h.state.sm_data.clone());
+        let promos: Vec<TickPromotion> = (0..3)
+            .map(|i| TickPromotion {
+                chunk_id: format!("c{i}"),
+                chunk_index: 0,
+                file_path: "/f".into(),
+                source_node_id: 1,
+                target_node_id: 2,
+                target_dc: "toro".into(),
+                target_tier: DiskTier::Warm,
+                reason: "promote_threshold_met",
+            })
+            .collect();
+        use crate::scheduler::ScheduleOutcome::{Deferred, New};
+        assert_eq!(engine.dispatch_promotions(&promos).await, vec![New, New, Deferred]);
     }
 
     /// A follower tick drops leader memory but keeps the read activity.

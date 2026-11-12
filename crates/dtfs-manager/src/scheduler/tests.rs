@@ -3143,7 +3143,7 @@ mod batch_schedule_tests {
         let ids = ids(5);
         let reqs: Vec<_> = ids.iter().map(|c| (c.as_str(), 1u64, 2u64, DiskTier::Warm)).collect();
         let mut st = MigrationState::default();
-        let out = plan_replication_batch(&mut st, &reqs, usize::MAX, MAX_LIVE_TASKS, 10);
+        let out = plan_replication_batch(&mut st, &reqs, usize::MAX, MAX_LIVE_TASKS, 10, |_| true);
         assert!(out.iter().all(|o| *o == ScheduleOutcome::New));
         assert_eq!(st.tasks.len(), 5);
         assert_eq!(st.next_task_id, 5);
@@ -3156,12 +3156,31 @@ mod batch_schedule_tests {
         let ids = ids(6);
         let mut st = MigrationState::default();
         let first: Vec<_> = ids[..3].iter().map(|c| (c.as_str(), 1u64, 2u64, DiskTier::Warm)).collect();
-        plan_replication_batch(&mut st, &first, usize::MAX, MAX_LIVE_TASKS, 10);
+        plan_replication_batch(&mut st, &first, usize::MAX, MAX_LIVE_TASKS, 10, |_| true);
         let all: Vec<_> = ids.iter().map(|c| (c.as_str(), 1u64, 2u64, DiskTier::Warm)).collect();
-        let out = plan_replication_batch(&mut st, &all, 2, MAX_LIVE_TASKS, 11);
+        let out = plan_replication_batch(&mut st, &all, 2, MAX_LIVE_TASKS, 11, |_| true);
         use ScheduleOutcome::*;
         assert_eq!(out, vec![AlreadyScheduled, AlreadyScheduled, AlreadyScheduled, New, New, Deferred]);
         assert_eq!(st.tasks.len(), 5);
+    }
+
+    /// A link-throttled request creates no task; `admit` is asked only for a
+    /// would-be-new request, so a dedup hit never debits the link budget.
+    #[test]
+    fn throttled_request_records_nothing() {
+        use ScheduleOutcome::*;
+        let mut st = MigrationState::default();
+        plan_replication_batch(&mut st, &[("dup", 1, 2, DiskTier::Warm)], usize::MAX, MAX_LIVE_TASKS, 1, |_| true);
+        let reqs = [("dup", 1u64, 2u64, DiskTier::Warm), ("big", 1, 2, DiskTier::Warm), ("small", 1, 2, DiskTier::Warm)];
+        let mut asked = Vec::new();
+        let out = plan_replication_batch(&mut st, &reqs, usize::MAX, MAX_LIVE_TASKS, 2, |i| {
+            asked.push(i);
+            i != 1
+        });
+        assert_eq!(out, vec![AlreadyScheduled, Throttled, New]);
+        assert_eq!(asked, vec![1, 2]);
+        assert_eq!(st.tasks.len(), 2);
+        assert!(!st.tasks.values().any(|t| t.chunk_id == "big"));
     }
 
     /// Live-task budget refusal is kept.
@@ -3170,8 +3189,8 @@ mod batch_schedule_tests {
         let mut st = MigrationState::default();
         let big = ids(MAX_LIVE_TASKS);
         let reqs: Vec<_> = big.iter().map(|c| (c.as_str(), 1u64, 2u64, DiskTier::Warm)).collect();
-        plan_replication_batch(&mut st, &reqs, usize::MAX, MAX_LIVE_TASKS, 1);
-        let out = plan_replication_batch(&mut st, &[("extra", 1, 2, DiskTier::Warm)], usize::MAX, MAX_LIVE_TASKS, 2);
+        plan_replication_batch(&mut st, &reqs, usize::MAX, MAX_LIVE_TASKS, 1, |_| true);
+        let out = plan_replication_batch(&mut st, &[("extra", 1, 2, DiskTier::Warm)], usize::MAX, MAX_LIVE_TASKS, 2, |_| true);
         assert_eq!(out, vec![ScheduleOutcome::Refused]);
     }
     fn task(id: &str, status: MigrationStatus) -> ReplicationTask {
@@ -3201,10 +3220,10 @@ mod batch_schedule_tests {
         let t = task("p", MigrationStatus::Pending);
         st.tasks.insert(t.task_id.clone(), t);
         assert_eq!(live_task_count(&st), 1);
-        let out = plan_replication_batch(&mut st, &[("new", 1, 2, DiskTier::Warm)], usize::MAX, MAX_LIVE_TASKS, 5);
+        let out = plan_replication_batch(&mut st, &[("new", 1, 2, DiskTier::Warm)], usize::MAX, MAX_LIVE_TASKS, 5, |_| true);
         assert_eq!(out, vec![ScheduleOutcome::New]);
         // A Failed task still dedups the same (chunk, target).
-        let out = plan_replication_batch(&mut st, &[("c-f0", 1, 2, DiskTier::Warm)], usize::MAX, MAX_LIVE_TASKS, 6);
+        let out = plan_replication_batch(&mut st, &[("c-f0", 1, 2, DiskTier::Warm)], usize::MAX, MAX_LIVE_TASKS, 6, |_| true);
         assert_eq!(out, vec![ScheduleOutcome::AlreadyScheduled]);
     }
 
@@ -3219,9 +3238,9 @@ mod batch_schedule_tests {
             st.tasks.insert(t.task_id.clone(), t);
         }
         let req = [("new", 1u64, 2u64, DiskTier::Warm)];
-        let out = plan_replication_batch(&mut st, &req, usize::MAX, TIERING_MAX_LIVE_TASKS, 1);
+        let out = plan_replication_batch(&mut st, &req, usize::MAX, TIERING_MAX_LIVE_TASKS, 1, |_| true);
         assert_eq!(out, vec![ScheduleOutcome::Refused], "promotions refused at their ceiling");
-        let out = plan_replication_batch(&mut st, &req, usize::MAX, MAX_LIVE_TASKS, 2);
+        let out = plan_replication_batch(&mut st, &req, usize::MAX, MAX_LIVE_TASKS, 2, |_| true);
         assert_eq!(out, vec![ScheduleOutcome::New], "repair still has headroom");
     }
 
@@ -3273,7 +3292,7 @@ mod batch_schedule_tests {
         assert!(pairs.contains(&("c-d".to_string(), 2)), "Failed pair blocks a re-queue");
         assert!(!pairs.contains(&("c-c".to_string(), 2)), "Done pair does not");
         let reqs = [("c-d", 1u64, 2u64, DiskTier::Warm), ("c-c", 1, 2, DiskTier::Warm)];
-        let out = plan_replication_batch(&mut st, &reqs, usize::MAX, MAX_LIVE_TASKS, 9);
+        let out = plan_replication_batch(&mut st, &reqs, usize::MAX, MAX_LIVE_TASKS, 9, |_| true);
         assert_eq!(out, vec![ScheduleOutcome::AlreadyScheduled, ScheduleOutcome::New]);
     }
 
@@ -3289,7 +3308,7 @@ mod batch_schedule_tests {
         }
         let reqs = [("n1", 1u64, 2u64, DiskTier::Warm), ("n2", 1, 2, DiskTier::Warm), ("n3", 1, 2, DiskTier::Warm)];
         let max_new = crate::precache::precache_max_new(live_task_count(&st));
-        let out = plan_replication_batch(&mut st, &reqs, max_new, crate::precache::PRECACHE_YIELD_LIVE_TASKS, 3);
+        let out = plan_replication_batch(&mut st, &reqs, max_new, crate::precache::PRECACHE_YIELD_LIVE_TASKS, 3, |_| true);
         assert_eq!(out, vec![ScheduleOutcome::New, ScheduleOutcome::Deferred, ScheduleOutcome::Deferred]);
         assert_eq!(crate::precache::precache_max_new(crate::precache::PRECACHE_YIELD_LIVE_TASKS + 5), 0);
     }
@@ -3466,5 +3485,126 @@ mod schedule_replications_wait_tests {
     #[tokio::test]
     async fn bounded_wait_shorter_than_hold_defers() {
         assert_eq!(run(Some(Duration::from_secs(1))).await, vec![ScheduleOutcome::Deferred]);
+    }
+}
+
+#[cfg(test)]
+mod link_budget_wiring_tests {
+    use super::*;
+    use dtfs_common::config::TieringLink;
+    use dtfs_common::types::DiskInfo;
+
+    const MB10: u64 = 10_000_000;
+
+    fn node(dc: &str, tier: DiskTier) -> dtfs_raft::NodeInfo {
+        dtfs_raft::NodeInfo {
+            role: NodeRole::Data,
+            hostname: "d".into(),
+            grpc_addr: "d:9500".into(),
+            location: dtfs_common::topology::Location::new("", dc, "", ""),
+            disks: vec![DiskInfo {
+                disk_id: 0,
+                uuid: "u".into(),
+                mount_path: "/mnt/d".into(),
+                tier,
+                total_bytes: 0,
+                used_bytes: 0,
+                status: DiskStatus::Healthy,
+            }],
+            total_capacity: 0,
+            used_capacity: 0,
+            health: HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    fn file(path: &str, chunks: &[(&str, u64)]) -> dtfs_raft::state_machine::FileMetadata {
+        dtfs_raft::state_machine::FileMetadata {
+            path: path.to_string(),
+            volume_id: "default".to_string(),
+            chunk_size: MB10,
+            chunks: chunks
+                .iter()
+                .enumerate()
+                .map(|(i, (h, n))| ChunkLocationEntry {
+                    chunk_index: i as u64,
+                    chunk_hash: (*h).to_string(),
+                    node_id: n.to_string(),
+                    disk_id: 0,
+                    size_bytes: MB10,
+                })
+                .collect(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: std::collections::BTreeMap::new(),
+            ever_committed: None,
+            replica_added_at_ms: 0,
+        }
+    }
+
+    fn toro_link(s: &TaskScheduler) {
+        // 1 Mbps: 15 MB burst, so one 10 MB chunk fits and the second does not.
+        s.set_links(vec![TieringLink { to_dc: "TORO".into(), max_mbps: 1 }]);
+    }
+
+    /// Cross-DC copies into a linked DC are debited by the chunk's size_bytes;
+    /// a copy inside the DC is never metered.
+    #[tokio::test]
+    async fn schedule_replications_throttles_cross_dc_only() {
+        let h = crate::api::test_support::harness().await;
+        let s = &h.state.scheduler;
+        {
+            let mut sm = h.state.sm_data.write().await;
+            sm.nodes.insert(1, node("leli", DiskTier::Cold));
+            sm.nodes.insert(2, node("toro", DiskTier::Warm));
+            sm.nodes.insert(3, node("toro", DiskTier::Warm));
+            sm.files.insert("/f".into(), file("/f", &[("c1", 1), ("c2", 2)]));
+        }
+        toro_link(s);
+        let reqs = [
+            ("c1", 1u64, 2u64, DiskTier::Warm),
+            ("c1", 1, 3, DiskTier::Warm),
+            ("c2", 2, 3, DiskTier::Warm),
+        ];
+        let out = s.schedule_replications(&reqs, 10, 10, None).await;
+        use ScheduleOutcome::*;
+        assert_eq!(out, vec![New, Throttled, New]);
+        let st = &s.link_budget_status()[0];
+        assert_eq!((st.skipped_requests, st.skipped_bytes), (1, MB10));
+    }
+
+    /// A repair copy skipped for the link budget records nothing and is
+    /// scheduled by the next round once the budget allows it.
+    #[tokio::test]
+    async fn throttled_repair_is_replanned_next_round() {
+        let h = crate::api::test_support::harness().await;
+        let s = &h.state.scheduler;
+        {
+            let mut sm = h.state.sm_data.write().await;
+            sm.nodes.insert(1, node("leli", DiskTier::Cold));
+            sm.nodes.insert(2, node("toro", DiskTier::Hot));
+            sm.files.insert("/f".into(), file("/f", &[("c1", 1)]));
+        }
+        toro_link(s);
+        // Drain the bucket to well below one chunk.
+        assert!(s.link_budget.lock().admit("leli", "toro", 15_000_000, now_millis()));
+        let mut ms = MigrationState::default();
+        s.check_under_replicated(&mut ms).await;
+        assert!(ms.tasks.is_empty(), "throttled: no task recorded");
+        assert_eq!(s.link_budget_status()[0].skipped_requests, 1);
+
+        s.link_budget.lock().reset(); // budget available again
+        s.check_under_replicated(&mut ms).await;
+        let tasks: Vec<_> = ms.tasks.values().map(|t| (t.chunk_id.as_str(), t.source_node, t.target_node)).collect();
+        assert_eq!(tasks, vec![("c1", 1, 2)]);
     }
 }

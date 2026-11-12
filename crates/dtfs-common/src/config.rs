@@ -764,10 +764,30 @@ pub struct TieringConfig {
     /// while watermarks are set. 0 (default) = off.
     #[serde(default)]
     pub cache_low_watermark_pct: u8,
+    /// Most NEW cache-promotion tasks one tiering tick creates. Must be > 0.
+    #[serde(default = "default_max_promotions_per_tick")]
+    pub max_promotions_per_tick: usize,
+    /// Per-DC copy budgets: every replication copy into `to_dc` from another
+    /// DC (repair, anchor-lag, migration, promotion, pre-cache) shares one
+    /// token bucket. Empty (default) = unlimited. Kept last: TOML tables
+    /// follow plain values.
+    #[serde(default)]
+    pub links: Vec<TieringLink>,
+}
+
+/// One metered link, see `TieringConfig::links`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TieringLink {
+    pub to_dc: String,
+    pub max_mbps: u64,
 }
 
 fn default_precache_max_mbps() -> u64 {
     10
+}
+
+fn default_max_promotions_per_tick() -> usize {
+    50
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -790,6 +810,19 @@ impl TieringConfig {
             return Err(format!(
                 "[tiering] cache_low_watermark_pct ({low}) and cache_high_watermark_pct ({high}) must both be 0 or satisfy 0 < low < high <= 99"
             ));
+        }
+        nonzero("[tiering] max_promotions_per_tick", self.max_promotions_per_tick as u64)?;
+        let mut seen = std::collections::HashSet::new();
+        for l in &self.links {
+            if l.to_dc.is_empty() {
+                return Err("[tiering] links: to_dc must not be empty".into());
+            }
+            if l.max_mbps == 0 {
+                return Err(format!("[tiering] links: max_mbps for to_dc \"{}\" must be > 0", l.to_dc));
+            }
+            if !seen.insert(l.to_dc.to_ascii_lowercase()) {
+                return Err(format!("[tiering] links: duplicate to_dc \"{}\" (compared case-insensitively)", l.to_dc));
+            }
         }
         Ok(())
     }
@@ -1933,6 +1966,39 @@ mod tests {
         assert!(c.prune_interval_secs > 0);
         c.prune_interval_secs = 0;
         assert_eq!(nonzero("[cache] prune_interval_secs", c.prune_interval_secs).unwrap_err(), "[cache] prune_interval_secs must be > 0");
+    }
+
+    #[test]
+    fn tiering_links_and_promotion_cap_validate() {
+        let t: TieringConfig = toml::from_str("").unwrap();
+        assert!(t.links.is_empty(), "no links = unlimited");
+        assert_eq!(t.max_promotions_per_tick, 50);
+        let t: TieringConfig = toml::from_str(
+            "max_promotions_per_tick = 7\n[[links]]\nto_dc = \"leli\"\nmax_mbps = 30\n[[links]]\nto_dc = \"toro\"\nmax_mbps = 1\n",
+        )
+        .unwrap();
+        assert!(t.validate().is_ok());
+        assert_eq!(t.max_promotions_per_tick, 7);
+        assert_eq!(t.links[1], TieringLink { to_dc: "toro".into(), max_mbps: 1 });
+
+        let check = |links: Vec<(&str, u64)>, promos: usize| {
+            let mut t: TieringConfig = toml::from_str("").unwrap();
+            t.links = links.into_iter().map(|(d, m)| TieringLink { to_dc: d.into(), max_mbps: m }).collect();
+            t.max_promotions_per_tick = promos;
+            t.validate()
+        };
+        assert_eq!(check(vec![], 0).unwrap_err(), "[tiering] max_promotions_per_tick must be > 0");
+        assert!(check(vec![("leli", 1)], 1).is_ok());
+        assert_eq!(
+            check(vec![("leli", 0)], 1).unwrap_err(),
+            "[tiering] links: max_mbps for to_dc \"leli\" must be > 0"
+        );
+        assert_eq!(check(vec![("", 5)], 1).unwrap_err(), "[tiering] links: to_dc must not be empty");
+        assert_eq!(
+            check(vec![("leli", 5), ("LELI", 6)], 1).unwrap_err(),
+            "[tiering] links: duplicate to_dc \"LELI\" (compared case-insensitively)"
+        );
+        assert!(check(vec![("leli", 5), ("toro", 6)], 1).is_ok());
     }
 
     /// CR-6-1 (CMN-8) — `PlacementConfig::validate` rejects a `min_free_pct`

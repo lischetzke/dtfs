@@ -340,6 +340,8 @@ async fn main() -> anyhow::Result<()> {
     task_scheduler.set_memory_budget(memory_budget.clone());
     // LIS-19 — stamp DeleteChunk RPCs (flush / orphan reap) with the cluster secret.
     task_scheduler.set_shared_secret(config.cluster.shared_secret.clone());
+    // C5 — per-target-DC copy budget for every replication task.
+    task_scheduler.set_links(config.tiering.links.clone());
 
     let scheduler_ref = task_scheduler.clone();
     let scheduler_handle = tokio::spawn(async move {

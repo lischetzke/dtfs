@@ -23,6 +23,7 @@ use tracing::{debug, error, info, warn};
 use crate::audit::AuditLog;
 
 mod flush;
+pub(crate) mod link_budget;
 mod migration;
 mod orphan;
 mod repair;
@@ -204,6 +205,10 @@ pub struct TaskScheduler {
     /// Issue #157 — the `default` volume this manager's config describes;
     /// the leader tick creates it when missing (`set_default_volume`).
     default_volume: parking_lot::RwLock<Option<dtfs_common::types::VolumeConfig>>,
+    /// `[[tiering.links]]` buckets, debited when a cross-DC copy task is
+    /// created (`schedule_replications`, repair, anchor-lag). Never held
+    /// across an await.
+    link_budget: parking_lot::Mutex<link_budget::LinkBudget>,
 }
 
 /// Issue #157 — the create-if-missing proposal for the `default` volume, or
@@ -273,7 +278,36 @@ impl TaskScheduler {
             orphan_run: Arc::new(tokio::sync::Mutex::new(())),
             orphan_last_run: parking_lot::Mutex::new(None),
             default_volume: parking_lot::RwLock::new(None),
+            link_budget: parking_lot::Mutex::new(Default::default()),
         }
+    }
+
+    /// `[[tiering.links]]` from the startup config (main.rs).
+    pub fn set_links(&self, links: Vec<dtfs_common::config::TieringLink>) {
+        *self.link_budget.lock() = link_budget::LinkBudget::new(links);
+    }
+
+    pub(crate) fn link_budget_status(&self) -> Vec<link_budget::LinkBacklog> {
+        self.link_budget.lock().status()
+    }
+
+    /// Debit the link budget for a copy of `chunk_id` (`bytes`) from `source`
+    /// to `target`; `false` = skip it this round, nothing recorded, re-planned
+    /// next tick.
+    pub(super) fn link_admit(
+        &self,
+        sm: &StateMachineData,
+        chunk_id: &str,
+        bytes: u64,
+        source: u64,
+        target: u64,
+    ) -> bool {
+        let dc = |n: u64| sm.nodes.get(&n).map_or("", |i| i.location.datacenter.as_str());
+        let ok = self.link_budget.lock().admit(dc(source), dc(target), bytes, now_millis());
+        if !ok {
+            debug!(chunk_id, source, target, bytes, "link budget: copy skipped this round");
+        }
+        ok
     }
 
     /// Issue #157 — wire the `default` volume from `[defaults]` (main.rs).
@@ -477,6 +511,7 @@ impl TaskScheduler {
         // REV-1-1: shared with every other background loop via `is_leader()`.
         if !self.is_leader() {
             tracing::trace!("Scheduler tick skipped: not leader");
+            self.link_budget.lock().reset();
             return Ok(());
         }
 

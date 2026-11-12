@@ -41,8 +41,16 @@ impl TaskScheduler {
             }
             return vec![ScheduleOutcome::Deferred; reqs.len()];
         };
+        let costs = self.link_costs(reqs).await;
         let mut state = self.load_migration_state().await;
-        let outcomes = plan_replication_batch(&mut state, reqs, max_new, max_live, now_millis());
+        let now = now_millis();
+        let outcomes = {
+            let mut lb = self.link_budget.lock();
+            plan_replication_batch(&mut state, reqs, max_new, max_live, now, |i| {
+                let (src, dst, bytes) = &costs[i];
+                lb.admit(src, dst, *bytes, now)
+            })
+        };
         let mut created = 0usize;
         for (r, o) in reqs.iter().zip(&outcomes) {
             match o {
@@ -61,6 +69,12 @@ impl TaskScheduler {
                     max_live,
                     "replication task refused: live task budget exhausted"
                 ),
+                ScheduleOutcome::Throttled => debug!(
+                    chunk_id = %r.0,
+                    source = r.1,
+                    target = r.2,
+                    "link budget: copy skipped this round"
+                ),
                 _ => {}
             }
         }
@@ -68,6 +82,41 @@ impl TaskScheduler {
             self.save_migration_state(&state).await;
         }
         outcomes
+    }
+
+    /// `(source DC, target DC, bytes)` per request. Bytes are looked up only
+    /// for metered copies, from the chunk's `size_bytes` replica row (one
+    /// namespace walk, stopped once every metered hash is found). A hash no
+    /// file references costs 0: there is nothing to copy.
+    async fn link_costs(&self, reqs: &[(&str, u64, u64, DiskTier)]) -> Vec<(String, String, u64)> {
+        let sm = self.state_data.read().await;
+        let dc = |n: u64| sm.nodes.get(&n).map_or(String::new(), |i| i.location.datacenter.clone());
+        let mut out: Vec<(String, String, u64)> = reqs.iter().map(|r| (dc(r.1), dc(r.2), 0)).collect();
+        let mut want: HashMap<&str, Vec<usize>> = HashMap::new();
+        {
+            let lb = self.link_budget.lock();
+            for (i, (r, c)) in reqs.iter().zip(&out).enumerate() {
+                if lb.is_metered(&c.0, &c.1) {
+                    want.entry(r.0).or_default().push(i);
+                }
+            }
+        }
+        'walk: for f in sm.files.values() {
+            if want.is_empty() {
+                break;
+            }
+            for c in &f.chunks {
+                if let Some(ix) = want.remove(c.chunk_hash.as_str()) {
+                    for i in ix {
+                        out[i].2 = c.size_bytes;
+                    }
+                    if want.is_empty() {
+                        break 'walk;
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// AV-5-5 — `(chunk_id, target_node)` pairs with a replication task
@@ -237,6 +286,11 @@ impl TaskScheduler {
                              remaining deficits resume next tick"
                         );
                         return;
+                    }
+                    // Link budget spent: nothing recorded, re-planned next tick.
+                    let bytes = entries.first().map_or(0, |e| e.size_bytes);
+                    if !self.link_admit(&sm, &chunk_hash, bytes, source_node_id, target) {
+                        continue;
                     }
 
                     let now_ms = now_millis();
@@ -641,6 +695,11 @@ impl TaskScheduler {
                         );
                         break 'files;
                     }
+                    // Link budget spent: nothing recorded, re-planned next tick.
+                    let bytes = entries.first().map_or(0, |e| e.size_bytes);
+                    if !self.link_admit(&sm, &chunk_id, bytes, action.source_node, action.target_node) {
+                        continue;
+                    }
                     // Source picks a healthy existing replica (any
                     // tier); the dispatcher tolerates cross-tier
                     // copies.
@@ -783,22 +842,28 @@ pub(crate) enum ScheduleOutcome {
     Refused,
     /// Not processed: `max_new` new tasks already created this batch.
     Deferred,
+    /// Not scheduled: the target DC's `[[tiering.links]]` budget is spent.
+    /// Nothing recorded; the caller re-plans next tick.
+    Throttled,
 }
 
 /// Pure batch planner behind `schedule_replications`: dedups per
 /// (chunk, target) via `task_blocks_requeue`, enforces the live-task budget,
-/// and counts only NEW tasks toward `max_new`.
+/// and counts only NEW tasks toward `max_new`. `admit(i)` is asked last,
+/// only for a request that would become a new task (it debits the link
+/// budget); `false` = `Throttled`.
 pub(crate) fn plan_replication_batch(
     state: &mut MigrationState,
     reqs: &[(&str, u64, u64, DiskTier)],
     max_new: usize,
     max_live: usize,
     now_ms: u64,
+    mut admit: impl FnMut(usize) -> bool,
 ) -> Vec<ScheduleOutcome> {
     let mut live = live_task_count(state);
     let mut out = Vec::with_capacity(reqs.len());
     let mut new = 0usize;
-    for &(chunk_id, source_node, target_node, tier) in reqs {
+    for (i, &(chunk_id, source_node, target_node, tier)) in reqs.iter().enumerate() {
         let dup = state.tasks.values().any(|t| {
             t.chunk_id == chunk_id && t.target_node == target_node && task_blocks_requeue(t.status)
         });
@@ -812,6 +877,10 @@ pub(crate) fn plan_replication_batch(
         }
         if live >= max_live {
             out.push(ScheduleOutcome::Refused);
+            continue;
+        }
+        if !admit(i) {
+            out.push(ScheduleOutcome::Throttled);
             continue;
         }
         let task_id = format!("repl-{}", state.next_task_id);
