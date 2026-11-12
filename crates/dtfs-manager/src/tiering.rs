@@ -827,21 +827,19 @@ impl TieringEngine {
         let grace_ms = promote_window_max
             .saturating_add(180)
             .saturating_mul(1_000);
-        let idle_window = idle_gate_window_secs(&plan.demotions, &snapshot.volumes);
-        if !plan.demotions.is_empty()
-            && !idle_demote_allowed(
-                now_ms,
-                self.leader_since_ms.load(std::sync::atomic::Ordering::Relaxed),
-                self.evicted_newest_sample_ms.load(std::sync::atomic::Ordering::Relaxed),
-                idle_window,
-            )
-        {
+        let deferred = retain_idle_allowed(
+            &mut plan.demotions,
+            &snapshot.volumes,
+            now_ms,
+            self.leader_since_ms.load(std::sync::atomic::Ordering::Relaxed),
+            self.evicted_newest_sample_ms.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if deferred > 0 {
             info!(
-                demotions = plan.demotions.len(),
-                window_secs = idle_window,
-                "idle demotions deferred: leader tenure or read-window history shorter than the idle window"
+                deferred,
+                remaining = plan.demotions.len(),
+                "idle demotions deferred: leader tenure or read-window history shorter than their volume's idle window"
             );
-            return Ok(());
         }
         // Load the migration state ONCE per tick, not once per demotion.
         let active_pairs = self.scheduler.active_replication_pairs().await;
@@ -1441,15 +1439,22 @@ pub(crate) fn drop_retention_handled(
     before - demotions.len()
 }
 
-/// Window `idle_demote_allowed` must cover for `demotions`: the longest
-/// effective retention among their volumes.
-pub(crate) fn idle_gate_window_secs(demotions: &[TickDemotion], volumes: &HashMap<String, TickVolumePolicy>) -> u64 {
-    demotions
-        .iter()
-        .filter_map(|d| volumes.get(&d.volume_id))
-        .map(|p| p.cache.effective_retention_secs())
-        .max()
-        .unwrap_or(0)
+/// Keep only the demotions `idle_demote_allowed` passes for their own
+/// volume's effective retention window (0 for an unknown volume). Returns
+/// how many were deferred.
+pub(crate) fn retain_idle_allowed(
+    demotions: &mut Vec<TickDemotion>,
+    volumes: &HashMap<String, TickVolumePolicy>,
+    now_ms: u64,
+    leader_since_ms: u64,
+    evicted_ms: u64,
+) -> usize {
+    let n = demotions.len();
+    demotions.retain(|d| {
+        let window = volumes.get(&d.volume_id).map_or(0, |p| p.cache.effective_retention_secs());
+        idle_demote_allowed(now_ms, leader_since_ms, evicted_ms, window)
+    });
+    n - demotions.len()
 }
 
 /// Returns the newest sample ts among the rings evicted at the key cap
@@ -3122,9 +3127,29 @@ mod bug_av_tiering_tick_tests {
         assert_eq!(drop_retention_handled(&mut ds, &volumes, &capable), 1);
         let left: Vec<(&str, u64, u32)> = ds.iter().map(|d| (d.volume_id.as_str(), d.node_id, d.disk_id)).collect();
         assert_eq!(left, [("ret", 11, 1), ("ret", 12, 0), ("plain", 11, 0)]);
-        // The gate window is the longest effective retention among what is left.
-        assert_eq!(idle_gate_window_secs(&ds, &volumes), 1_209_600);
-        assert_eq!(idle_gate_window_secs(&ds[2..], &volumes), 14_400);
+    }
+
+    /// MGR-1: the idle gate is per demotion. Five hours into a tenure, a 4 h
+    /// window volume's demotion proceeds while a 14 d retention volume's
+    /// demotion in the same plan is deferred; at 14 d of tenure both go.
+    #[test]
+    fn idle_gate_defers_only_demotions_whose_window_is_not_covered() {
+        let mut ret = plex_policy();
+        ret.cache.retention_secs = 1_209_600;
+        let volumes: HashMap<String, TickVolumePolicy> =
+            [("ret".to_string(), ret), ("plain".to_string(), plex_policy())].into();
+        let now = 10_000_000_000u64;
+        let mut ds = vec![demotion("ret", 11, 0), demotion("plain", 12, 0)];
+        assert_eq!(retain_idle_allowed(&mut ds, &volumes, now, now - 5 * 3_600_000, 0), 1);
+        let left: Vec<&str> = ds.iter().map(|d| d.volume_id.as_str()).collect();
+        assert_eq!(left, ["plain"]);
+        // Boundary: exactly 4 h of tenure covers the 4 h window, 1 ms less does not.
+        let mut ds = vec![demotion("plain", 12, 0)];
+        assert_eq!(retain_idle_allowed(&mut ds, &volumes, now, now - 14_400_000 + 1, 0), 1);
+        assert!(ds.is_empty());
+        let mut ds = vec![demotion("ret", 11, 0), demotion("plain", 12, 0)];
+        assert_eq!(retain_idle_allowed(&mut ds, &volumes, now, now - 1_209_600_000, 0), 0);
+        assert_eq!(ds.len(), 2);
     }
 
     /// #119 — a new leader's read windows are empty; idle demotion waits for
