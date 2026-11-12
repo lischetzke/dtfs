@@ -135,6 +135,8 @@ listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
 #enable_cache_redundancy_escalation = false  # Bug AV-4-5: ramp cache replicas
                                              # toward max on hot chunks
 #precache_max_mbps = 10             # predictive pre-cache copy rate (Mbit/s), must be > 0
+#cache_high_watermark_pct = 0       # capacity eviction of LRU cache copies on hot/warm
+#cache_low_watermark_pct = 0        # disks; both 0 (off) or 0 < low < high <= 99
 
 [monitoring]
 #heartbeat_interval_secs = 5

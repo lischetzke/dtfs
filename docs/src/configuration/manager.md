@@ -146,6 +146,8 @@ A replication count creates replicas only if something maintains them: the volum
 | `evaluation_interval_secs` | u64 | `3600` | **Validated**: > 0. | cluster |
 | `enable_cache_redundancy_escalation` | bool | `false` | `true`: the cache planner may raise a chunk's cache replicas from `min` toward `max` once reads reach 2 x `promote_reads`. | cluster |
 | `precache_max_mbps` | u64 | `10` | **Validated**: > 0. Average Mbit/s at which predictive pre-caching starts copies (token bucket, 120 s burst). Per-volume policy: [pre-caching](../storage/tiering.md#pre-caching). | cluster |
+| `cache_high_watermark_pct` | u8 | `0` | **Validated** with `cache_low_watermark_pct`: both 0 (off) or `0 < low < high <= 99`. A hot/warm disk at or above this filesystem usage has its least recently read cache copies evicted, see [capacity eviction](../storage/tiering.md#capacity-eviction). | cluster |
+| `cache_low_watermark_pct` | u8 | `0` | Eviction stops once the disk is back at this usage; while set, promotions and pre-cache never plan a hot/warm disk past it. | cluster |
 
 ## `[monitoring]`
 

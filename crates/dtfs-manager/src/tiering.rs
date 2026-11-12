@@ -21,6 +21,8 @@ use tracing::{debug, info, warn};
 use crate::audit::AuditLog;
 use crate::scheduler::TaskScheduler;
 
+mod evict;
+
 /// Per-chunk access profile used for tiering decisions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkAccessProfile {
@@ -109,6 +111,8 @@ pub struct TieringEngine {
     evicted_newest_sample_ms: std::sync::atomic::AtomicU64,
     /// Predictive pre-cache leader memory. Never held across an await.
     precache: parking_lot::Mutex<crate::precache::PrecacheState>,
+    /// (node, disk, tonic code) a capacity-eviction skip was already logged for.
+    evict_skip_logged: parking_lot::Mutex<std::collections::HashSet<(u64, u32, i32)>>,
 }
 
 impl TieringEngine {
@@ -129,6 +133,7 @@ impl TieringEngine {
             leader_since_ms: std::sync::atomic::AtomicU64::new(0),
             evicted_newest_sample_ms: std::sync::atomic::AtomicU64::new(0),
             precache: parking_lot::Mutex::new(Default::default()),
+            evict_skip_logged: parking_lot::Mutex::new(Default::default()),
         }
     }
 
@@ -148,6 +153,7 @@ impl TieringEngine {
     }
 
     /// Pre-cache loop: every `PRECACHE_TICK_SECS`, leader only. Spawned from main.rs.
+    /// Each tick then runs capacity eviction, against the protected set just planned.
     pub async fn run_precache(&self) {
         let phase = Duration::from_secs(crate::precache::PRECACHE_PHASE_SECS);
         let mut interval = tokio::time::interval_at(
@@ -158,15 +164,16 @@ impl TieringEngine {
         loop {
             interval.tick().await;
             self.precache_tick().await;
+            self.capacity_evict_tick().await;
         }
     }
 
     async fn precache_tick(&self) {
         use crate::precache::*;
         use crate::scheduler::ScheduleOutcome;
-        let (enabled, rate_mbps) = {
+        let (enabled, rate_mbps, low_pct) = {
             let c = self.config.read().await;
-            (c.enabled, c.precache_max_mbps)
+            (c.enabled, c.precache_max_mbps, c.cache_low_watermark_pct)
         };
         if !enabled {
             return;
@@ -183,7 +190,7 @@ impl TieringEngine {
         };
         let mut plan = {
             let sm = self.state_data.read().await;
-            plan_precache(&sm, &snap, now_ms, self.scheduler.placement_cfg())
+            plan_precache(&sm, &snap, now_ms, self.scheduler.placement_cfg(), low_pct)
         };
         let view = self.scheduler.replication_task_view().await;
         plan.status.is_leader = true;
@@ -191,6 +198,7 @@ impl TieringEngine {
         plan.status.live_tasks = view.live_count as u64;
 
         let protected = std::mem::take(&mut plan.protected);
+        let pinned = std::mem::take(&mut plan.pinned);
         let prev_scheduled = self.precache.lock().scheduled.clone();
         let mut scheduled: std::collections::HashSet<(String, u64)> = Default::default();
         let mut batch = LastBatch::default();
@@ -271,6 +279,7 @@ impl TieringEngine {
             warn!(volume = %s.volume, detail = %s.detail, "precache: volume policy no longer valid, skipped");
         }
         st.protected = protected;
+        st.pinned = pinned;
         st.scheduled = scheduled;
         st.series_lru = plan.series_lru;
         st.status = plan.status;
@@ -962,6 +971,7 @@ impl TieringEngine {
         &self,
         now_ms: u64,
     ) -> TickSnapshot {
+        let low_pct = self.config.read().await.cache_low_watermark_pct;
         // Materialise the lookup tables once.
         let sm = self.state_data.read().await;
 
@@ -981,36 +991,14 @@ impl TieringEngine {
                 if !seen_tiers.insert(disk.tier) {
                     continue;
                 }
-                let view = node_selection_view(*id, info, disk.tier, self.scheduler.placement_cfg());
+                let view = node_selection_view(*id, info, disk.tier, self.scheduler.placement_cfg(), low_pct);
                 if view.has_target_tier_disk {
                     node_views.push(view);
                 }
             }
         }
 
-        // Convert volumes to TickVolumePolicy.
-        let mut volumes: HashMap<String, TickVolumePolicy> = HashMap::new();
-        for (vid, vcfg) in sm.volumes.iter() {
-            // Only emit volumes with a real cache policy; everything
-            // else gets the legacy temperature path.
-            let mandatory = vcfg.effective_mandatory_replicas().clone();
-            let cache = vcfg.cache_replicas.clone();
-            // Skip when cache disabled entirely (every tier max=0
-            // AND no promote_window).
-            let any_cache_tier =
-                cache.hot.max > 0 || cache.warm.max > 0 || cache.cold.max > 0 || cache.tape.max > 0;
-            if !any_cache_tier || cache.promote_window_secs == 0 {
-                continue;
-            }
-            volumes.insert(
-                vid.clone(),
-                TickVolumePolicy {
-                    mandatory,
-                    cache,
-                    anchor: vcfg.effective_anchor(),
-                },
-            );
-        }
+        let volumes = tick_volume_policies(&sm);
         if volumes.is_empty() {
             // No AV-style volumes → empty snapshot, planner returns
             // an empty plan and we early-return upstream.
@@ -1055,30 +1043,7 @@ impl TieringEngine {
                     if chunk_id_opt.is_none() {
                         chunk_id_opt = Some(e.chunk_hash.clone());
                     }
-                    let nid = match e.node_id.parse::<u64>() {
-                        Ok(n) => n,
-                        Err(_) => continue,
-                    };
-                    let dc = match id_to_dc.get(&nid) {
-                        Some(d) => d.clone(),
-                        None => continue,
-                    };
-                    // CNF-1 — stable disk_id key, never Vec index.
-                    let node_info = sm.nodes.get(&nid);
-                    let tier = node_info.and_then(|n| n.disk(e.disk_id)).map(|d| d.tier);
-                    let Some(t) = tier else { continue };
-                    // CR-3-1/MGR-2 — resolve liveness through the shared
-                    // helper so Down/Failed nodes and Failed/Removed
-                    // disks never count as a surviving replica. #114 —
-                    // nor Maintenance/Quarantined nodes (never marked Down).
-                    let live = crate::scheduler::survivor_replica_tier(node_info, e.disk_id).is_some();
-                    placements.push(TickPlacement {
-                        node_id: nid,
-                        disk_id: e.disk_id,
-                        dc,
-                        tier: t,
-                        live,
-                    });
+                    placements.extend(tick_placement(&sm, e));
                 }
                 let Some(chunk_id) = chunk_id_opt else { continue };
 
@@ -1239,6 +1204,7 @@ impl TieringEngine {
         exclude_node: u64,
         reads_by_dc: &HashMap<String, u32>,
     ) -> Option<u64> {
+        let low_pct = self.config.read().await.cache_low_watermark_pct;
         let sm = self.state_data.read().await;
 
         // Score each candidate node: prefer nodes in DCs where the chunk is
@@ -1249,7 +1215,10 @@ impl TieringEngine {
             .filter(|(id, info)| {
                 **id != exclude_node
                     && info.health == dtfs_common::types::HealthStatus::Healthy
-                    && info.disks.iter().any(|d| d.tier == target_tier)
+                    && info.disks.iter().any(|d| {
+                        d.tier == target_tier
+                            && room_below_low_watermark(d.tier, d.total_bytes, d.used_bytes, low_pct).map_or(true, |r| r > 0)
+                    })
             })
             .max_by_key(|(_, info)| {
                 let dc_reads = reads_by_dc
@@ -1699,12 +1668,14 @@ pub(crate) fn node_selection_view(
     info: &dtfs_raft::NodeInfo,
     target_tier: DiskTier,
     cfg: &dtfs_common::config::PlacementConfig,
+    low_watermark_pct: u8,
 ) -> NodeSelectionView {
     use dtfs_common::types::{DiskStatus, HealthStatus};
     let has_target_tier_disk = info.disks.iter().any(|d| {
         d.tier == target_tier
             && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed)
             && cfg.has_room(d.total_bytes, d.used_bytes)
+            && room_below_low_watermark(d.tier, d.total_bytes, d.used_bytes, low_watermark_pct).map_or(true, |r| r > 0)
     });
     // Any health state that means "don't place a new replica here".
     // `draining` is the selector's catch-all exclusion flag.
@@ -1724,6 +1695,53 @@ pub(crate) fn node_selection_view(
         draining: excluded,
         already_holds_chunk: false,
     }
+}
+
+/// Bytes a cache copy may still add to a hot/warm disk before its usage reaches
+/// `[tiering] cache_low_watermark_pct` (saturating). `None` = no watermark limit:
+/// watermarks off, a cold/tape disk, or capacity not reported yet.
+pub(crate) fn room_below_low_watermark(tier: DiskTier, total_bytes: u64, used_bytes: u64, low_pct: u8) -> Option<u64> {
+    if low_pct == 0 || total_bytes == 0 || !matches!(tier, DiskTier::Hot | DiskTier::Warm) {
+        return None;
+    }
+    let ceiling = (total_bytes as u128 * low_pct as u128 / 100) as u64;
+    Some(ceiling.saturating_sub(used_bytes))
+}
+
+/// One planner placement for a location row; `None` when the row names an
+/// unknown node or disk.
+pub(crate) fn tick_placement(sm: &StateMachineData, e: &dtfs_raft::ChunkLocationEntry) -> Option<TickPlacement> {
+    let nid = e.node_id.parse::<u64>().ok()?;
+    let node_info = sm.nodes.get(&nid)?;
+    // CNF-1 — stable disk_id key, never Vec index.
+    let tier = node_info.disk(e.disk_id)?.tier;
+    // CR-3-1/MGR-2 — resolve liveness through the shared helper so Down/Failed
+    // nodes and Failed/Removed disks never count as a surviving replica. #114 —
+    // nor Maintenance/Quarantined nodes (never marked Down).
+    let live = crate::scheduler::survivor_replica_tier(Some(node_info), e.disk_id).is_some();
+    Some(TickPlacement { node_id: nid, disk_id: e.disk_id, dc: node_info.location.datacenter.clone(), tier, live })
+}
+
+/// Cache policy of every volume that has one (any cache tier max > 0 and a
+/// promote window); the rest stay on the legacy temperature path.
+pub(crate) fn tick_volume_policies(sm: &StateMachineData) -> HashMap<String, TickVolumePolicy> {
+    let mut volumes = HashMap::new();
+    for (vid, vcfg) in sm.volumes.iter() {
+        let cache = vcfg.cache_replicas.clone();
+        let any_cache_tier = cache.hot.max > 0 || cache.warm.max > 0 || cache.cold.max > 0 || cache.tape.max > 0;
+        if !any_cache_tier || cache.promote_window_secs == 0 {
+            continue;
+        }
+        volumes.insert(
+            vid.clone(),
+            TickVolumePolicy {
+                mandatory: vcfg.effective_mandatory_replicas().clone(),
+                cache,
+                anchor: vcfg.effective_anchor(),
+            },
+        );
+    }
+    volumes
 }
 
 /// AV-2-3 pure kernel — pick the best cache-promotion target in
@@ -2168,6 +2186,30 @@ pub(crate) fn demote_preserves_anchor(
     })
 }
 
+/// The tier holds cache replicas of the volume (`cache_replicas.<tier>.max > 0`)
+/// and is not one of its mandatory tiers.
+pub(crate) fn is_cache_tier(policy: &TickVolumePolicy, t: DiskTier) -> bool {
+    let cfg = match t {
+        DiskTier::Hot => &policy.cache.hot,
+        DiskTier::Warm => &policy.cache.warm,
+        DiskTier::Cold => &policy.cache.cold,
+        DiskTier::Tape => &policy.cache.tape,
+    };
+    cfg.max > 0 && policy.mandatory.for_tier(t) == 0
+}
+
+/// Mandatory survives dropping `placement` iff at least one OTHER, LIVE
+/// placement is on a mandatory tier (CR-3-1/MGR-2: a replica on a
+/// Down/Failed node or Failed/Removed disk cannot serve reads and
+/// must not be treated as the surviving copy).
+pub(crate) fn mandatory_survives(chunk: &TickChunk, placement: &TickPlacement, policy: &TickVolumePolicy) -> bool {
+    chunk.placements.iter().any(|p| {
+        (p.node_id != placement.node_id || p.tier != placement.tier)
+            && p.live
+            && policy.mandatory.for_tier(p.tier) > 0
+    })
+}
+
 /// AV-2-4 helper — demotion decisions for one chunk.
 ///
 /// A placement is demoted when ALL of:
@@ -2210,23 +2252,12 @@ fn plan_chunk_demotions(
     {
         return;
     }
-    // Build a quick is-cache-tier predicate.
-    let is_cache_tier = |t: DiskTier| -> bool {
-        let cfg = match t {
-            DiskTier::Hot => &policy.cache.hot,
-            DiskTier::Warm => &policy.cache.warm,
-            DiskTier::Cold => &policy.cache.cold,
-            DiskTier::Tape => &policy.cache.tape,
-        };
-        cfg.max > 0 && policy.mandatory.for_tier(t) == 0
-    };
-
     // A demotion candidate is a placement on a cache tier with 0
     // reads in its DC and at least one mandatory replica surviving
     // after the drop.
     let mut chosen: Vec<(u64, u32)> = Vec::new();
     for placement in &chunk.placements {
-        if !is_cache_tier(placement.tier) {
+        if !is_cache_tier(policy, placement.tier) {
             continue;
         }
         let dc_reads = chunk
@@ -2237,16 +2268,7 @@ fn plan_chunk_demotions(
         if dc_reads > 0 {
             continue;
         }
-        // Mandatory survives the drop iff at least one OTHER, LIVE
-        // placement is on a mandatory tier (CR-3-1/MGR-2: a replica on a
-        // Down/Failed node or Failed/Removed disk cannot serve reads and
-        // must not be treated as the surviving copy).
-        let mandatory_still_present = chunk.placements.iter().any(|p| {
-            (p.node_id != placement.node_id || p.tier != placement.tier)
-                && p.live
-                && policy.mandatory.for_tier(p.tier) > 0
-        });
-        if !mandatory_still_present {
+        if !mandatory_survives(chunk, placement, policy) {
             continue;
         }
         // CO-1-2 [HIGH anchor] — never strand the LELI cold anchor. The
@@ -3388,8 +3410,8 @@ mod audit_co_tests {
             HealthStatus::Healthy,
             vec![disk(0, DiskTier::Warm, DiskStatus::Healthy)],
         );
-        let va = node_selection_view(10, &a, DiskTier::Warm, &no_headroom());
-        let vb = node_selection_view(11, &b, DiskTier::Warm, &no_headroom());
+        let va = node_selection_view(10, &a, DiskTier::Warm, &no_headroom(), 0);
+        let vb = node_selection_view(11, &b, DiskTier::Warm, &no_headroom(), 0);
         assert!(
             !va.has_target_tier_disk,
             "cold-only node must not advertise a warm target disk"
@@ -3406,9 +3428,32 @@ mod audit_co_tests {
         let mut d = disk(0, DiskTier::Warm, DiskStatus::Healthy);
         d.used_bytes = d.total_bytes;
         let full = node(10, "toro", HealthStatus::Healthy, vec![d]);
-        assert!(!node_selection_view(10, &full, DiskTier::Warm, &no_headroom()).has_target_tier_disk);
+        assert!(!node_selection_view(10, &full, DiskTier::Warm, &no_headroom(), 0).has_target_tier_disk);
         let roomy = node(11, "toro", HealthStatus::Healthy, vec![disk(0, DiskTier::Warm, DiskStatus::Healthy)]);
-        assert!(node_selection_view(11, &roomy, DiskTier::Warm, &no_headroom()).has_target_tier_disk);
+        assert!(node_selection_view(11, &roomy, DiskTier::Warm, &no_headroom(), 0).has_target_tier_disk);
+    }
+
+    /// With watermarks set, a warm disk at the low watermark is no promotion
+    /// target; one byte below it is. Off (0) or a cold disk: unchanged.
+    #[test]
+    fn low_watermark_limits_promotion_target() {
+        let at = |tier: DiskTier, used: u64| {
+            let mut d = disk(0, tier, DiskStatus::Healthy);
+            d.used_bytes = used;
+            node(10, "toro", HealthStatus::Healthy, vec![d])
+        };
+        // total 1000, low 80% -> ceiling 800.
+        let v = node_selection_view(10, &at(DiskTier::Warm, 799), DiskTier::Warm, &no_headroom(), 80);
+        assert!(v.has_target_tier_disk, "room below low accepted");
+        assert_eq!(select_promotion_target(&[v], "toro"), Some(10));
+        let v = node_selection_view(10, &at(DiskTier::Warm, 800), DiskTier::Warm, &no_headroom(), 80);
+        assert!(!v.has_target_tier_disk, "would cross low");
+        assert_eq!(select_promotion_target(&[v], "toro"), None);
+        assert!(node_selection_view(10, &at(DiskTier::Warm, 800), DiskTier::Warm, &no_headroom(), 0).has_target_tier_disk);
+        assert!(node_selection_view(10, &at(DiskTier::Cold, 800), DiskTier::Cold, &no_headroom(), 80).has_target_tier_disk);
+        assert_eq!(room_below_low_watermark(DiskTier::Hot, 1_000, 900, 80), Some(0));
+        assert_eq!(room_below_low_watermark(DiskTier::Hot, 1_000, 100, 80), Some(700));
+        assert_eq!(room_below_low_watermark(DiskTier::Tape, 1_000, 100, 80), None);
     }
 
     /// CO-4-5 — a Failed/Removed disk of the target tier doesn't count.
@@ -3420,14 +3465,14 @@ mod audit_co_tests {
             HealthStatus::Healthy,
             vec![disk(0, DiskTier::Warm, DiskStatus::Failed)],
         );
-        assert!(!node_selection_view(10, &n, DiskTier::Warm, &no_headroom()).has_target_tier_disk);
+        assert!(!node_selection_view(10, &n, DiskTier::Warm, &no_headroom(), 0).has_target_tier_disk);
         let n2 = node(
             10,
             "toro",
             HealthStatus::Healthy,
             vec![disk(0, DiskTier::Warm, DiskStatus::Removed)],
         );
-        assert!(!node_selection_view(10, &n2, DiskTier::Warm, &no_headroom()).has_target_tier_disk);
+        assert!(!node_selection_view(10, &n2, DiskTier::Warm, &no_headroom(), 0).has_target_tier_disk);
     }
 
     /// CO-4-5 — Down/Failed/Quarantined nodes are excluded
@@ -3447,7 +3492,7 @@ mod audit_co_tests {
                 bad,
                 vec![disk(0, DiskTier::Warm, DiskStatus::Healthy)],
             );
-            let v = node_selection_view(10, &n, DiskTier::Warm, &no_headroom());
+            let v = node_selection_view(10, &n, DiskTier::Warm, &no_headroom(), 0);
             assert!(v.draining, "{bad:?} node must be flagged excluded");
             assert_eq!(
                 select_promotion_target(&[v], "toro"),

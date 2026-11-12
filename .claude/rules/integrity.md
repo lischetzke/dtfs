@@ -98,7 +98,9 @@ text there.
   the under-replication scheduler never backfills them. Pre-cache copies
   (`precache.rs`, driven by `TieringEngine::run_precache`) are cache replicas
   made via `schedule_replications`; pre-cache never removes them, only the
-  idle demote does (skipping protected ones; `flush_cache` overrides).
+  idle demote does (skipping protected ones; `flush_cache` overrides) and
+  capacity eviction (`tiering/evict.rs`: cursor-protected only in its second
+  pass, pins never).
 - `register_replica_location` adds the new row to every file that references
   the hash, so a copy can count as mandatory in another volume that shares the
   chunk (pre-existing for all cache promotions).

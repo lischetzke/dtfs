@@ -137,6 +137,18 @@ mandatory floor for demotion decisions.
 
 Promotions are planned for every chunk and then dispatched as one batch. At most 50 NEW tasks are scheduled per tick (tasks already in flight do not count) so anchor and mandatory repair, which share the scheduler's task budget, are never starved. The rest are re-planned on the next tick. Target selection is a pure function: a healthy, non-draining node in the reading datacenter with a serviceable disk of the cache tier that does not already hold the chunk, highest free capacity first, lowest node id as the tie-break. A promotion is an additive copy, so the source replica is not subtracted in the anchor check.
 
+### Capacity eviction
+
+Idle demotion is time-based; a cache disk can still fill, after which promotions and pre-cache stop (`capacity_limited`). With `[tiering] cache_high_watermark_pct` and `cache_low_watermark_pct` set (both 0 = off, otherwise `0 < low < high <= 99`), the leader checks every 30 s (in the pre-cache loop) each hot/warm disk of a node that is not Down, Failed, Maintenance or Quarantined. Usage is the heartbeat's filesystem usage, so non-DTFS data on the disk counts too.
+
+A disk at or above `high` lists its least recently read chunks (`ListOldestChunks`, data nodes track a per-chunk last-read time; library-scan reads do not count) and evicts cache copies oldest first until `used - low% of total` bytes are freed, at most 512 per disk and round:
+
+* A chunk is evicted only if every location row of that hash on that exact disk is a cache copy that the idle demote could drop too: the tier is a cache tier of the file's volume and not mandatory, a live mandatory replica survives elsewhere, and the anchor stays satisfied by a live replica (anchor-pending chunks are never touched). Removing only some rows would free nothing.
+* Pass 1 skips copies the pre-cache protects; only if that is short does pass 2 also take copies protected by an active pre-cache cursor. Copies under `precache.pins` are never evicted (there is no "evict pins as last resort" option).
+* Each copy goes through the idle demote's path: `RemoveChunkLocation` with `enforce_anchor` through Raft first, then the byte delete. Audit `cache.evict_capacity` per copy, one warn line per disk and round.
+
+While the watermarks are set, promotion target selection and pre-cache room never plan a hot/warm disk past `low`, so they do not immediately trigger eviction. A data node too old for `ListOldestChunks`, a cold/tape disk, or a last-read index not seeded yet skips the disk for that round (logged once at info).
+
 ### Worked example — `/movies/Wicked.mkv` lifecycle
 
 Volume: cold mandatory, warm cache per-DC with `min=1, max=1`,

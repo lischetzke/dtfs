@@ -755,6 +755,15 @@ pub struct TieringConfig {
     /// at; a token bucket in the manager's pre-cache loop. Must be > 0.
     #[serde(default = "default_precache_max_mbps")]
     pub precache_max_mbps: u64,
+    /// Capacity eviction: a hot/warm disk at or above this filesystem usage
+    /// (percent) has its least recently read cache copies evicted down to
+    /// `cache_low_watermark_pct`. 0 (default) = off.
+    #[serde(default)]
+    pub cache_high_watermark_pct: u8,
+    /// Eviction target, and the ceiling promotions and pre-cache plan against
+    /// while watermarks are set. 0 (default) = off.
+    #[serde(default)]
+    pub cache_low_watermark_pct: u8,
 }
 
 fn default_precache_max_mbps() -> u64 {
@@ -775,7 +784,14 @@ impl TieringConfig {
     /// `tokio::time::interval(ZERO)` panics inside the spawned tiering task.
     pub fn validate(&self) -> Result<(), String> {
         nonzero("[tiering] evaluation_interval_secs", self.evaluation_interval_secs)?;
-        nonzero("[tiering] precache_max_mbps", self.precache_max_mbps)
+        nonzero("[tiering] precache_max_mbps", self.precache_max_mbps)?;
+        let (low, high) = (self.cache_low_watermark_pct, self.cache_high_watermark_pct);
+        if (low, high) != (0, 0) && !(0 < low && low < high && high <= 99) {
+            return Err(format!(
+                "[tiering] cache_low_watermark_pct ({low}) and cache_high_watermark_pct ({high}) must both be 0 or satisfy 0 < low < high <= 99"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1866,6 +1882,31 @@ mod tests {
         assert_eq!(t.evaluation_interval_secs, 7);
         let back = toml::to_string(&t).unwrap();
         assert!(!back.contains("migration_bandwidth_limit_mbps"), "{back}");
+    }
+
+    #[test]
+    fn cache_watermarks_validate() {
+        let t: TieringConfig = toml::from_str("").unwrap();
+        assert_eq!((t.cache_low_watermark_pct, t.cache_high_watermark_pct), (0, 0));
+        assert!(t.validate().is_ok());
+        let check = |low: u8, high: u8| {
+            let mut t: TieringConfig = toml::from_str("").unwrap();
+            t.cache_low_watermark_pct = low;
+            t.cache_high_watermark_pct = high;
+            t.validate()
+        };
+        assert!(check(80, 90).is_ok());
+        assert!(check(1, 2).is_ok());
+        assert!(check(98, 99).is_ok());
+        let err = |low: u8, high: u8| {
+            format!(
+                "[tiering] cache_low_watermark_pct ({low}) and cache_high_watermark_pct ({high}) must both be 0 or satisfy 0 < low < high <= 99"
+            )
+        };
+        // low only, high only, low == high, low > high, high past 99.
+        for (low, high) in [(80, 0), (0, 90), (90, 90), (91, 90), (90, 100), (99, 255)] {
+            assert_eq!(check(low, high).unwrap_err(), err(low, high), "low={low} high={high}");
+        }
     }
 
     #[test]

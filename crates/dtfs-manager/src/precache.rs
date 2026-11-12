@@ -361,6 +361,9 @@ pub(crate) struct PrecachePlan {
     pub copies: Vec<PrecacheCopy>,
     /// (chunk_id, node_id, disk_id) existing cache copies the idle demote must leave alone.
     pub protected: HashSet<(String, u64, u32)>,
+    /// The subset of `protected` held by a `precache.pins` subtree: capacity
+    /// eviction never takes these, cursor-only protection it takes last.
+    pub pinned: HashSet<(String, u64, u32)>,
     pub series_lru: BTreeMap<(String, String, String), SeriesEntry>,
     pub status: PrecacheStatus,
 }
@@ -479,18 +482,22 @@ fn following<'a>(
 
 /// Room pre-caching may use on one node's tier: (pooled free bytes minus the
 /// reserve share of the tier total, free bytes of the largest single disk).
-/// Both over serviceable, non-draining disks, minus headroom.
-fn node_room(info: &dtfs_raft::NodeInfo, tier: DiskTier, cfg: &PlacementConfig) -> (u64, u64) {
+/// Both over serviceable, non-draining disks, minus headroom. A disk under the
+/// `[tiering]` low watermark is capped at the room below it instead of the reserve.
+fn node_room(info: &dtfs_raft::NodeInfo, tier: DiskTier, cfg: &PlacementConfig, low_pct: u8) -> (u64, u64) {
     let (mut avail, mut total, mut biggest) = (0u64, 0u64, 0u64);
     for d in info.disks.iter().filter(|d| {
         d.tier == tier
             && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed | DiskStatus::Draining)
     }) {
-        total = total.saturating_add(d.total_bytes);
-        let free = d
+        let mut free = d
             .total_bytes
             .saturating_sub(d.used_bytes)
             .saturating_sub(cfg.headroom_bytes(d.total_bytes));
+        match crate::tiering::room_below_low_watermark(d.tier, d.total_bytes, d.used_bytes, low_pct) {
+            Some(r) => free = free.min(r),
+            None => total = total.saturating_add(d.total_bytes),
+        }
         avail = avail.saturating_add(free);
         biggest = biggest.max(free);
     }
@@ -501,11 +508,13 @@ struct Ctx<'a> {
     sm: &'a StateMachineData,
     now_ms: u64,
     placement: &'a PlacementConfig,
+    low_pct: u8,
     room: HashMap<(u64, DiskTier), (u64, u64)>,
     seen: HashSet<(String, String)>,
     stopped: HashSet<String>,
     copies: Vec<PrecacheCopy>,
     protected: HashSet<(String, u64, u32)>,
+    pinned: HashSet<(String, u64, u32)>,
     dcs: BTreeMap<String, DcStatus>,
     /// Chunk entries walked so far this pass (see `MAX_PLAN_CHUNK_VISITS`).
     visits: usize,
@@ -516,9 +525,9 @@ const PIN_POS: u32 = u32::MAX;
 
 impl Ctx<'_> {
     fn room(&mut self, nid: u64, tier: DiskTier) -> u64 {
-        let (sm, cfg) = (self.sm, self.placement);
+        let (sm, cfg, low_pct) = (self.sm, self.placement, self.low_pct);
         let (pooled, biggest) = *self.room.entry((nid, tier)).or_insert_with(|| {
-            sm.nodes.get(&nid).map_or((0, 0), |n| node_room(n, tier, cfg))
+            sm.nodes.get(&nid).map_or((0, 0), |n| node_room(n, tier, cfg, low_pct))
         });
         pooled.min(biggest)
     }
@@ -559,13 +568,13 @@ fn ensure_dc(ctx: &mut Ctx, elig: &[DiskTier], dc: &str) {
     if ctx.dcs.contains_key(dc) {
         return;
     }
-    let (sm, placement) = (ctx.sm, ctx.placement);
+    let (sm, placement, low_pct) = (ctx.sm, ctx.placement, ctx.low_pct);
     let tier = elig
         .iter()
         .copied()
         .find(|t| {
             sm.nodes.iter().any(|(id, n)| {
-                let v = node_selection_view(*id, n, *t, placement);
+                let v = node_selection_view(*id, n, *t, placement, low_pct);
                 v.datacenter.eq_ignore_ascii_case(dc) && v.has_target_tier_disk && !v.draining
             })
         })
@@ -664,6 +673,9 @@ fn plan_file(
             fs.cached_bytes += bytes;
             ctx.dcs.get_mut(dc).expect("dc status").cached_bytes += bytes;
             for (n, disk) in cached {
+                if pos == PIN_POS {
+                    ctx.pinned.insert((chunk_id.clone(), n, disk));
+                }
                 ctx.protected.insert((chunk_id.clone(), n, disk));
             }
             continue;
@@ -683,7 +695,7 @@ fn plan_file(
                 if !info.location.datacenter.eq_ignore_ascii_case(dc) {
                     continue;
                 }
-                let mut v = node_selection_view(*nid, info, tier, ctx.placement);
+                let mut v = node_selection_view(*nid, info, tier, ctx.placement, ctx.low_pct);
                 // Same rule as `survivor_replica_tier`: such a copy would not count as cached.
                 if info.quarantine.is_some() || info.health == dtfs_common::types::HealthStatus::Maintenance {
                     v.draining = true;
@@ -744,8 +756,9 @@ pub(crate) fn plan_precache(
     snap: &PrecacheSnapshot,
     now_ms: u64,
     placement: &PlacementConfig,
+    low_watermark_pct: u8,
 ) -> PrecachePlan {
-    plan_precache_budget(sm, snap, now_ms, placement, MAX_PLAN_CHUNK_VISITS)
+    plan_precache_budget(sm, snap, now_ms, placement, low_watermark_pct, MAX_PLAN_CHUNK_VISITS)
 }
 
 fn plan_precache_budget(
@@ -753,6 +766,7 @@ fn plan_precache_budget(
     snap: &PrecacheSnapshot,
     now_ms: u64,
     placement: &PlacementConfig,
+    low_pct: u8,
     budget: usize,
 ) -> PrecachePlan {
     let mut plan = PrecachePlan::default();
@@ -884,11 +898,13 @@ fn plan_precache_budget(
         sm,
         now_ms,
         placement,
+        low_pct,
         room: HashMap::new(),
         seen: HashSet::new(),
         stopped: HashSet::new(),
         copies: Vec::new(),
         protected: HashSet::new(),
+        pinned: HashSet::new(),
         dcs: BTreeMap::new(),
         visits: 0,
     };
@@ -1002,6 +1018,7 @@ fn plan_precache_budget(
     }
     plan.status.dcs = dcs;
     plan.protected = ctx.protected;
+    plan.pinned = ctx.pinned;
     plan.copies = ctx.copies;
     plan.copies.sort_by(|a, b| {
         a.rank
@@ -1034,6 +1051,8 @@ pub(crate) struct PrecacheState {
     pub series_lru: BTreeMap<(String, String, String), SeriesEntry>,
     /// (chunk_id, node_id, disk_id) existing cache copies the idle demote must leave alone.
     pub protected: HashSet<(String, u64, u32)>,
+    /// Pin-protected subset of `protected` (see `PrecachePlan::pinned`).
+    pub pinned: HashSet<(String, u64, u32)>,
     /// (chunk_id, target node) pairs this loop has a live task for (also protected from
     /// idle demote: the target holds no copy yet, so any disk of it is covered).
     pub scheduled: HashSet<(String, u64)>,
@@ -1049,6 +1068,7 @@ impl PrecacheState {
     /// Leadership lost: drop everything derived from leader tenure; activity stays.
     pub(crate) fn reset_leader_state(&mut self) {
         self.protected.clear();
+        self.pinned.clear();
         self.scheduled.clear();
         self.series_lru.clear();
         self.invalid_logged.clear();
@@ -1400,6 +1420,9 @@ mod planner_tests {
             d.used_bytes = used;
         }
         fn plan(&self, reads: &[(&str, &str)]) -> PrecachePlan {
+            self.plan_low(reads, 0)
+        }
+        fn plan_low(&self, reads: &[(&str, &str)], low_pct: u8) -> PrecachePlan {
             let mut snap = PrecacheSnapshot::default();
             for (path, dc) in reads {
                 let a = FileActivity {
@@ -1409,7 +1432,7 @@ mod planner_tests {
                 };
                 snap.activity.insert((path.to_string(), dc.to_string()), a);
             }
-            plan_precache(&self.sm, &snap, NOW, &cfg())
+            plan_precache(&self.sm, &snap, NOW, &cfg(), low_pct)
         }
     }
 
@@ -1492,7 +1515,7 @@ mod planner_tests {
                 SeriesEntry { cursor: format!("/tv/{s}/E01.mkv"), last_read_ms: i as u64 + 1 },
             );
         }
-        let p = plan_precache(&w.sm, &snap, NOW, &cfg());
+        let p = plan_precache(&w.sm, &snap, NOW, &cfg(), 0);
         let roots: Vec<&str> = p.series_lru.keys().map(|k| k.2.as_str()).collect();
         assert_eq!(roots, ["/tv/B", "/tv/C"]);
         let sroots: BTreeSet<_> = p.status.series.iter().filter_map(|s| s.root.clone()).collect();
@@ -1661,7 +1684,7 @@ mod planner_tests {
             overflow: false,
         };
         snap.activity.insert(("/tv/Show/Season 01/E01.mkv".into(), "toro".into()), a);
-        let p = plan_precache_budget(&w.sm, &snap, NOW, &cfg(), 350);
+        let p = plan_precache_budget(&w.sm, &snap, NOW, &cfg(), 0, 350);
         let ps = &p.status.pins[0];
         assert!(ps.truncated, "budget exhausted mid-pin");
         let pinned = p.copies.iter().filter(|c| c.file_path.starts_with("/tv/Bluey")).count();
@@ -1669,7 +1692,7 @@ mod planner_tests {
         assert!(p.copies.iter().any(|c| c.file_path.starts_with("/tv/Show")), "cursor copies still planned");
         assert!(p.copies[0].file_path.starts_with("/tv/Show"), "cursor copies rank first");
         // Plenty of budget: nothing truncated.
-        let p = plan_precache_budget(&w.sm, &snap, NOW, &cfg(), 1_000_000);
+        let p = plan_precache_budget(&w.sm, &snap, NOW, &cfg(), 0, 1_000_000);
         assert!(!p.status.pins[0].truncated);
         assert_eq!(p.copies.iter().filter(|c| c.file_path.starts_with("/tv/Bluey")).count(), 80);
     }
@@ -1683,7 +1706,7 @@ mod planner_tests {
         w.file("/b/y.mkv", 4, &[1]);
         pin(&mut w, "/a", "toro");
         pin(&mut w, "/b", "toro");
-        let p = plan_precache_budget(&w.sm, &PrecacheSnapshot::default(), NOW, &cfg(), 4);
+        let p = plan_precache_budget(&w.sm, &PrecacheSnapshot::default(), NOW, &cfg(), 0, 4);
         assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), ["/a/x.mkv"]);
         assert_eq!(p.status.pins.len(), 2);
         assert!(!p.status.pins[0].truncated && p.status.pins[1].truncated);
@@ -1701,7 +1724,7 @@ mod planner_tests {
         }
         pin(&mut w, "/big", "toro");
         let budget = 20 * 75;
-        let p = plan_precache_budget(&w.sm, &PrecacheSnapshot::default(), NOW, &cfg(), budget);
+        let p = plan_precache_budget(&w.sm, &PrecacheSnapshot::default(), NOW, &cfg(), 0, budget);
         assert!(p.status.dcs[0].capacity_limited);
         assert_eq!(p.copies.len(), 225);
         // Files after the one that hit the limit are not walked: desired stops near the room.
@@ -1719,6 +1742,40 @@ mod planner_tests {
         let toro = p.status.dcs.iter().find(|d| d.dc == "toro").unwrap();
         assert!(toro.capacity_limited);
         assert!(!toro.no_target);
+    }
+
+    #[test]
+    fn low_watermark_caps_room_instead_of_reserve() {
+        let mut w = show5();
+        // total 1000 MiB, low 50% => ceiling 500 MiB. used 300 MiB => room 200 MiB = 50 chunks.
+        w.set_disk(2, 1000 * MIB, 300 * MIB);
+        let p = w.plan_low(&[("/tv/Show/Season 01/E01.mkv", "toro")], 50);
+        assert_eq!(p.copies.len(), 50);
+        assert!(p.status.dcs.iter().find(|d| d.dc == "toro").unwrap().capacity_limited);
+        // Exactly one chunk below low: one copy.
+        w.set_disk(2, 1000 * MIB, 500 * MIB - CHUNK);
+        assert_eq!(w.plan_low(&[("/tv/Show/Season 01/E01.mkv", "toro")], 50).copies.len(), 1);
+        // A copy would cross low: nothing, capacity_limited.
+        w.set_disk(2, 1000 * MIB, 500 * MIB - CHUNK + 1);
+        let p = w.plan_low(&[("/tv/Show/Season 01/E01.mkv", "toro")], 50);
+        assert!(p.copies.is_empty());
+        assert!(p.status.dcs.iter().find(|d| d.dc == "toro").unwrap().capacity_limited);
+    }
+
+    #[test]
+    fn pinned_set_holds_only_pin_protection() {
+        let mut w = world();
+        w.file("/tv/S/.plexmatch", 0, &[]);
+        w.file("/tv/S/E01.mkv", 75, &[1]);
+        w.file("/tv/S/E02.mkv", 75, &[1, 2]);
+        w.file("/tv/Bluey/a.mkv", 75, &[1, 2]);
+        pin(&mut w, "/tv/Bluey", "toro");
+        let p = w.plan(&[("/tv/S/E01.mkv", "toro")]);
+        let cursor = ("/tv/S/E02.mkv#0".to_string(), 2, 0);
+        let pinned = ("/tv/Bluey/a.mkv#0".to_string(), 2, 0);
+        assert!(p.protected.contains(&cursor) && p.protected.contains(&pinned));
+        assert!(p.pinned.contains(&pinned));
+        assert!(!p.pinned.contains(&cursor), "cursor protection is not a pin");
     }
 
     #[test]
@@ -1754,7 +1811,7 @@ mod planner_tests {
             (path.into(), "toro".into()),
             FileActivity { last_read_ms: NOW, chunk_ids: ids, overflow: false },
         );
-        let p = plan_precache(&w.sm, &snap, NOW, &cfg());
+        let p = plan_precache(&w.sm, &snap, NOW, &cfg(), 0);
         assert!(p.copies.is_empty());
         assert!(p.status.series.is_empty() && p.status.cursors.is_empty());
     }
@@ -1993,7 +2050,7 @@ mod planner_tests {
                     FileActivity { last_read_ms: NOW, chunk_ids: HashSet::new(), overflow: true },
                 );
             }
-            let p = plan_precache(&w.sm, &snap, NOW, &cfg());
+            let p = plan_precache(&w.sm, &snap, NOW, &cfg(), 0);
             let dcs: BTreeSet<&str> = reads.iter().map(|(_, d)| d.as_str()).collect();
             let mut planned: BTreeMap<u64, u64> = BTreeMap::new();
             let mut seen = HashSet::new();

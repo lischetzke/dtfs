@@ -641,6 +641,34 @@ impl TaskScheduler {
         }
         Ok(out)
     }
+
+    /// Read-only `ListOldestChunks` on one data disk (capacity eviction), oldest
+    /// first. A connect failure maps to `Unavailable`.
+    pub(crate) async fn list_oldest_chunks_on_node(
+        &self,
+        node_addr: &str,
+        disk_id: u32,
+        limit: u32,
+    ) -> Result<Vec<dtfs_proto::dtfs::data::OldestChunk>, tonic::Status> {
+        use dtfs_common::crypto::{stamp_data_rpc_auth, DATA_RPC_AUTH_MAC, DATA_RPC_AUTH_TS};
+        use dtfs_proto::dtfs::data::ListOldestChunksRequest;
+        let endpoint = normalize_endpoint(node_addr);
+        let mut client = self
+            .tls
+            .connect(&endpoint)
+            .await
+            .map(DataServiceClient::new)
+            .map_err(|e| tonic::Status::unavailable(format!("connect to data node {node_addr}: {e}")))?;
+        let mut req = tonic::Request::new(ListOldestChunksRequest { disk_id, limit, older_than_ms: 0 });
+        let secret = self.shared_secret.read().clone();
+        if let Some((ts, mac)) = stamp_data_rpc_auth(&secret, "ListOldestChunks", "") {
+            if let (Ok(ts_v), Ok(mac_v)) = (ts.parse(), mac.parse()) {
+                req.metadata_mut().insert(DATA_RPC_AUTH_TS, ts_v);
+                req.metadata_mut().insert(DATA_RPC_AUTH_MAC, mac_v);
+            }
+        }
+        Ok(client.list_oldest_chunks(req).await?.into_inner().chunks)
+    }
 }
 
 /// Get current time in milliseconds since UNIX epoch.
