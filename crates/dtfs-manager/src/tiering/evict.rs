@@ -131,20 +131,28 @@ pub(crate) fn bytes_to_free(total_bytes: u64, used_bytes: u64, low_pct: u8) -> u
 /// How long a disk whose usage report has not changed since its last eviction
 /// round is left alone (covers a truly unchanged disk, e.g. failed byte deletes).
 pub(crate) const EVICT_STALE_REPORT_MS: u64 = 5 * 60 * 1000;
+/// Any report this soon after a disk's dispatch ended may predate its last
+/// deletes: 3x the data node's 5 s usage report (heartbeat) interval.
+pub(crate) const EVICT_SETTLE_MS: u64 = 3 * 5_000;
 
 /// A disk's last round that evicted something.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EvictRecord {
     /// `DiskInfo.used_bytes` that round planned against.
     pub used_at_round: u64,
+    /// When that round's dispatch to the disk ended.
     pub evicted_at_ms: u64,
 }
 
-/// True while the disk's usage report predates the last eviction round: the
-/// heartbeat has not applied the freed bytes yet, so planning again would
-/// evict the same amount a second time.
+/// True while the disk's usage report may predate the last eviction round's
+/// deletes: unchanged within `EVICT_STALE_REPORT_MS`, or any report within
+/// `EVICT_SETTLE_MS` of the dispatch end (`evicted_at_ms`). Planning again
+/// would evict the same amount a second time.
 pub(crate) fn eviction_report_stale(rec: Option<&EvictRecord>, used_now: u64, now_ms: u64) -> bool {
-    rec.is_some_and(|r| r.used_at_round == used_now && now_ms.saturating_sub(r.evicted_at_ms) < EVICT_STALE_REPORT_MS)
+    rec.is_some_and(|r| {
+        let age = now_ms.saturating_sub(r.evicted_at_ms);
+        (r.used_at_round == used_now && age < EVICT_STALE_REPORT_MS) || age < EVICT_SETTLE_MS
+    })
 }
 
 /// Every (file, chunk_index) whose rows carry one of `hashes`, keyed by hash.
@@ -405,12 +413,12 @@ impl TieringEngine {
             if !self.scheduler.is_leader() {
                 return;
             }
-            let now_ms = now_millis();
             let (count, bytes) = self.dispatch_removals(&d, &evictions, &active_pairs, named, ("cache.evict_capacity", "evicted")).await;
             if count > 0 {
+                // Stamped at dispatch end: reports sent mid-round miss the later deletes.
                 self.evict_records
                     .lock()
-                    .insert((d.node_id, d.disk_id), EvictRecord { used_at_round: d.used, evicted_at_ms: now_ms });
+                    .insert((d.node_id, d.disk_id), EvictRecord { used_at_round: d.used, evicted_at_ms: now_millis() });
                 let used_pct = d.used as u128 * 100 / d.total.max(1) as u128;
                 warn!(node_id = d.node_id, disk_id = d.disk_id, used_pct = used_pct as u64, evicted = count, bytes, "capacity eviction: cache copies evicted above high watermark");
             }
@@ -755,13 +763,24 @@ mod tests {
     fn report_stale_until_usage_changes_or_five_minutes() {
         let rec = EvictRecord { used_at_round: 900, evicted_at_ms: 1_000 };
         assert!(!eviction_report_stale(None, 900, 1_000), "no record");
-        assert!(!eviction_report_stale(Some(&rec), 899, 1_001), "fresh report");
-        assert!(!eviction_report_stale(Some(&rec), 901, 1_001), "fresh report, grew");
+        assert!(!eviction_report_stale(Some(&rec), 899, 1_000 + EVICT_SETTLE_MS), "fresh report");
+        assert!(!eviction_report_stale(Some(&rec), 901, 1_000 + EVICT_SETTLE_MS), "fresh report, grew");
         assert!(eviction_report_stale(Some(&rec), 900, 1_000), "same report, same instant");
         assert!(eviction_report_stale(Some(&rec), 900, 1_000 + EVICT_STALE_REPORT_MS - 1), "same report within 5 min");
         assert!(!eviction_report_stale(Some(&rec), 900, 1_000 + EVICT_STALE_REPORT_MS), "5 min elapsed");
         // Clock stepped back: still stale (saturating), not a fresh round.
         assert!(eviction_report_stale(Some(&rec), 900, 0));
+    }
+
+    /// MGR-3: a report sent while the round's deletes were still running
+    /// differs from `used_at_round` but misses later deletes; it is stale until
+    /// `EVICT_SETTLE_MS` after the dispatch ended.
+    #[test]
+    fn changed_report_is_stale_until_settle_after_dispatch_end() {
+        let rec = EvictRecord { used_at_round: 900, evicted_at_ms: 1_000 };
+        assert_eq!(EVICT_SETTLE_MS, 15_000);
+        assert!(eviction_report_stale(Some(&rec), 899, 1_000 + EVICT_SETTLE_MS - 1), "changed, within 15 s");
+        assert!(!eviction_report_stale(Some(&rec), 899, 1_000 + EVICT_SETTLE_MS), "changed, 15 s elapsed");
     }
 
     #[test]
