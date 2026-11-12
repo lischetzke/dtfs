@@ -788,7 +788,7 @@ impl DataService for DataServiceImpl {
                     Err(_) if self.store.repair_meta_for_read(&chunk_id, &dat_path, total_size).await => {
                         tracing::warn!(chunk_id = %req.chunk_id, "verify_on_read: .meta missing or unreadable; .dat matches its id, .meta rebuilt");
                         self.metrics.record_read(total_size);
-                        self.store.note_read_on_mount(&disk_mount, &chunk_id, now_ms, req.scanner);
+                        self.store.note_read_on_mount(&disk_mount, &chunk_id, now_ms, req.scanner, total_size);
                         return Ok(Response::new(stream_file(dat_path, total_size)));
                     }
                     // Item 10: try the remaining copies before giving up. Only a
@@ -839,7 +839,7 @@ impl DataService for DataServiceImpl {
             // Bug AL — record the read for the manager-side I/O Throughput
             // rolling-rate.
             self.metrics.record_read(total_size);
-            self.store.note_read_on_mount(&disk_mount, &chunk_id, now_ms, req.scanner);
+            self.store.note_read_on_mount(&disk_mount, &chunk_id, now_ms, req.scanner, total_size);
 
             return Ok(Response::new(stream_file(dat_path, total_size)));
         }

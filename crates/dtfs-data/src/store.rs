@@ -186,17 +186,17 @@ impl ChunkStore {
     }
 
     /// A client read served from the copy on `mount` (non-scanner refreshes
-    /// the coarse last-read time).
-    pub fn note_read_on_mount(&self, mount: &Path, id: &ChunkId, now_ms: u64, scanner: bool) {
+    /// the coarse last-read time). `size`: the served `.dat` size.
+    pub fn note_read_on_mount(&self, mount: &Path, id: &ChunkId, now_ms: u64, scanner: bool, size: u64) {
         if let Some(ix) = self.last_read_for_mount(mount) {
-            ix.touch(&id.0, now_ms, scanner);
+            ix.touch(&id.0, now_ms, scanner, Some(size));
         }
     }
 
     /// A client cache hit: refresh every tracked disk of this node holding the chunk.
     pub fn note_read_all(&self, id: &ChunkId, now_ms: u64, scanner: bool) {
         for ix in self.last_read.iter().flatten() {
-            ix.touch(&id.0, now_ms, scanner);
+            ix.touch(&id.0, now_ms, scanner, None);
         }
     }
 
@@ -217,7 +217,7 @@ impl ChunkStore {
             let n = tokio::task::spawn_blocking(move || {
                 let walked = crate::last_read::walk_dat_files(&mount);
                 let n = walked.len();
-                ix.seed(walked);
+                ix.seed(walked, now_millis());
                 n
             })
             .await;

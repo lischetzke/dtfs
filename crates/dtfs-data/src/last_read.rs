@@ -46,20 +46,32 @@ impl LastReadIndex {
     }
 
     /// A client (non-scanner) read: refresh only an existing entry whose value
-    /// is >= 10 min older than `now_ms`. Returns true when it refreshed.
-    pub fn touch(&self, id: &Key, now_ms: u64, scanner: bool) -> bool {
+    /// is >= 10 min older than `now_ms`. Before seeding finished, a read known
+    /// to be served from this disk (`on_disk_size` = its `.dat` size) inserts
+    /// the missing entry so seeding keeps it. Returns true when it changed.
+    pub fn touch(&self, id: &Key, now_ms: u64, scanner: bool, on_disk_size: Option<u64>) -> bool {
         if scanner {
             return false;
         }
         let mut m = self.map.lock();
-        match m.get_mut(id) {
+        let changed = match m.get_mut(id) {
             Some(e) if now_ms.saturating_sub(e.0) >= REFRESH_GRANULARITY_MS => {
                 e.0 = now_ms;
-                self.dirty.store(true, Ordering::Release);
                 true
             }
-            _ => false,
+            Some(_) => false,
+            None => match on_disk_size {
+                Some(size) if !self.is_ready() => {
+                    m.insert(*id, (now_ms, size));
+                    true
+                }
+                _ => false,
+            },
+        };
+        if changed {
+            self.dirty.store(true, Ordering::Release);
         }
+        changed
     }
 
     /// A commit: the chunk starts at `now_ms`.
@@ -101,14 +113,16 @@ impl LastReadIndex {
 
     /// Seed from the on-disk chunk walk (`walked`: id, `.dat` mtime, size) and
     /// the persisted file: persisted value wins for chunks still present,
-    /// persisted entries for absent chunks are dropped. A chunk committed
-    /// while the walk ran keeps its live entry.
-    pub fn seed(&self, walked: Vec<(Key, u64, u64)>) {
+    /// persisted entries for absent chunks are dropped. A chunk with no
+    /// persisted entry counts as just read: `max(mtime, seed_now_ms)` (the
+    /// mtime is the copy's creation, not a read). A chunk committed or read
+    /// while the walk ran keeps its live entry if newer.
+    pub fn seed(&self, walked: Vec<(Key, u64, u64)>, seed_now_ms: u64) {
         let persisted = self.load_file();
         let mut m = self.map.lock();
         for (id, mtime, size) in walked {
-            let ms = persisted.get(&id).copied().unwrap_or(mtime);
-            m.entry(id).or_insert((ms, size));
+            let ms = persisted.get(&id).copied().unwrap_or(mtime.max(seed_now_ms));
+            m.entry(id).and_modify(|e| e.0 = e.0.max(ms)).or_insert((ms, size));
         }
         drop(m);
         self.dirty.store(true, Ordering::Release);
@@ -121,7 +135,7 @@ impl LastReadIndex {
             Ok(t) => t,
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %self.file.display(), error = %e, "last_read index unreadable; seeding from .dat mtimes");
+                    tracing::warn!(path = %self.file.display(), error = %e, "last_read index unreadable; seeding every chunk as just read");
                 }
                 return out;
             }
@@ -226,7 +240,7 @@ mod tests {
     fn ready_index(dir: &Path) -> LastReadIndex {
         std::fs::create_dir_all(dir.join(".dtfs")).unwrap();
         let ix = LastReadIndex::new(dir);
-        ix.seed(vec![]);
+        ix.seed(vec![], 0);
         ix.dirty.store(false, Ordering::Release);
         ix
     }
@@ -237,12 +251,12 @@ mod tests {
         let ix = ready_index(t.path());
         ix.insert(key(1), 1_000_000, 10);
         ix.dirty.store(false, Ordering::Release);
-        assert!(!ix.touch(&key(1), 1_000_000 + 10 * MIN - 1, false), "< 10 min: no update");
+        assert!(!ix.touch(&key(1), 1_000_000 + 10 * MIN - 1, false, Some(10)), "< 10 min: no update");
         assert!(!ix.dirty.load(Ordering::Acquire));
-        assert!(ix.touch(&key(1), 1_000_000 + 10 * MIN, false), ">= 10 min: update");
+        assert!(ix.touch(&key(1), 1_000_000 + 10 * MIN, false, None), ">= 10 min: update");
         assert!(ix.dirty.load(Ordering::Acquire));
         assert_eq!(ix.oldest(0, 0, None).unwrap()[0].1, 1_000_000 + 10 * MIN);
-        assert!(!ix.touch(&key(9), 99 * MIN * 1000, false), "unknown chunk is not inserted");
+        assert!(!ix.touch(&key(9), 99 * MIN * 1000, false, Some(10)), "ready: unknown chunk is not inserted");
     }
 
     #[test]
@@ -250,7 +264,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let ix = ready_index(t.path());
         ix.insert(key(1), 1_000, 10);
-        assert!(!ix.touch(&key(1), 1_000 + 60 * MIN, true));
+        assert!(!ix.touch(&key(1), 1_000 + 60 * MIN, true, Some(10)));
         assert_eq!(ix.oldest(0, 0, None).unwrap()[0].1, 1_000);
     }
 
@@ -335,7 +349,7 @@ mod tests {
         let text = format!("{present}\t777\ngarbage\n{absent}\t5\nzz\t1\n{}\tnotnum\n", hex::encode(key(3)));
         std::fs::write(t.path().join(".dtfs/last_read.tsv"), text).unwrap();
         let ix = LastReadIndex::new(t.path());
-        ix.seed(vec![(key(1), 100, 4), (key(3), 200, 8)]);
+        ix.seed(vec![(key(1), 100, 4), (key(3), 200, 8)], 150);
         let v = ix.oldest(0, 0, None).unwrap();
         assert_eq!(v, vec![(key(3), 200, 8), (key(1), 777, 4)], "persisted overrides mtime; absent dropped; bad line falls back to mtime");
     }
@@ -350,8 +364,39 @@ mod tests {
         ix.save_if_dirty().unwrap();
         assert!(!t.path().join(".dtfs/last_read.tsv.tmp").exists());
         let ix2 = LastReadIndex::new(t.path());
-        ix2.seed(vec![(key(1), 1, 9)]);
+        ix2.seed(vec![(key(1), 1, 9)], 1_000);
         assert_eq!(ix2.oldest(0, 0, None).unwrap(), vec![(key(1), 42, 9)]);
+    }
+
+    /// DATA-1: no persisted entry (upgrade, lost or corrupt file) means "just
+    /// read": seeded at the seed time, not the `.dat` mtime; a persisted
+    /// entry still wins, and an mtime after the seed time is kept.
+    #[test]
+    fn unknown_chunk_seeds_at_seed_time_and_persisted_wins() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t.path().join(".dtfs")).unwrap();
+        std::fs::write(t.path().join(".dtfs/last_read.tsv"), format!("{}\t42\n", hex::encode(key(1)))).unwrap();
+        let ix = LastReadIndex::new(t.path());
+        ix.seed(vec![(key(1), 5, 1), (key(2), 5, 1), (key(3), 9_000, 1)], 1_000);
+        let v = ix.oldest(0, 0, None).unwrap();
+        assert_eq!(v, vec![(key(1), 42, 1), (key(2), 1_000, 1), (key(3), 9_000, 1)]);
+    }
+
+    /// DATA-1: a client read served from this disk before seeding finished is
+    /// kept (and beats the persisted value); a read not known to be on this
+    /// disk (`None`, the cache-hit path) inserts nothing.
+    #[test]
+    fn read_during_seeding_is_kept_only_when_on_disk() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(t.path().join(".dtfs")).unwrap();
+        std::fs::write(t.path().join(".dtfs/last_read.tsv"), format!("{}\t42\n", hex::encode(key(1)))).unwrap();
+        let ix = LastReadIndex::new(t.path());
+        assert!(ix.touch(&key(1), 500, false, Some(7)));
+        assert!(!ix.touch(&key(2), 500, false, None));
+        assert!(!ix.touch(&key(3), 500, true, Some(7)), "scanner read");
+        ix.seed(vec![(key(1), 5, 7), (key(2), 5, 7), (key(3), 5, 7)], 1_000);
+        let v = ix.oldest(0, 0, None).unwrap();
+        assert_eq!(v, vec![(key(1), 500, 7), (key(2), 1_000, 7), (key(3), 1_000, 7)]);
     }
 
     #[test]
