@@ -234,6 +234,13 @@ pub(crate) fn tgid_from_status(status: &str) -> Option<u32> {
     status.lines().find_map(|l| l.strip_prefix("Tgid:"))?.trim().parse().ok()
 }
 
+/// Per-fh only (no mount-wide readahead term): scanner reads are reported to
+/// the data node as `scanner = true` and not counted as cache demand.
+/// `bytes_on_fh` is the fh total BEFORE the current read.
+pub(crate) fn report_as_scanner(bytes_on_fh: u64) -> bool {
+    bytes_on_fh < crate::local_cache::ATIME_UPDATE_MIN_BYTES as u64
+}
+
 /// CR2-8-3 (FUSE-11) — decide whether a read looks like a viewer
 /// (playback) rather than a scanner (stat + header read) for the disk
 /// cache's atime hint.
@@ -250,13 +257,6 @@ pub(crate) fn tgid_from_status(status: &str) -> Option<u32> {
 /// actively prefetching for this mount (a scanner's stat+header access
 /// never drives sequential prefetch, so an active readahead engine is
 /// itself a viewer signal).
-/// Per-fh only (no mount-wide readahead term): scanner reads are reported to
-/// the data node as `scanner = true` and not counted as cache demand.
-/// `bytes_on_fh` is the fh total BEFORE the current read.
-pub(crate) fn report_as_scanner(bytes_on_fh: u64) -> bool {
-    bytes_on_fh < crate::local_cache::ATIME_UPDATE_MIN_BYTES as u64
-}
-
 pub(crate) fn is_viewer_read(bytes_on_fh: u64, readahead_active: bool) -> bool {
     bytes_on_fh >= crate::local_cache::ATIME_UPDATE_MIN_BYTES as u64 || readahead_active
 }
