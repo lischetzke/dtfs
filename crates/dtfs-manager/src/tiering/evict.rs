@@ -17,6 +17,8 @@ use dtfs_proto::dtfs::data::OldestChunk;
 use dtfs_raft::state_machine::StateMachineData;
 use tracing::{debug, info, warn};
 
+use crate::scheduler::path_matches_prefix;
+
 use super::{
     demote_preserves_anchor, is_cache_tier, mandatory_survives, now_millis, tick_placement,
     tick_volume_policies, TickChunk, TickVolumePolicy, TieringEngine,
@@ -201,6 +203,14 @@ fn evictable(
         for p in tc.placements.iter().filter(|p| p.node_id == node_id && p.disk_id == disk_id) {
             let policy = volumes.get(&tc.volume_id)?;
             if !is_cache_tier(policy, p.tier) || !mandatory_survives(tc, p, policy) {
+                return None;
+            }
+            // A pin protects its DC's copies even when the pre-cache walk did not reach them.
+            if policy
+                .pins
+                .iter()
+                .any(|pin| pin.datacenter.eq_ignore_ascii_case(&p.dc) && path_matches_prefix(&tc.file_path, &pin.prefix))
+            {
                 return None;
             }
             if retention_at.is_some_and(|(now, last)| !retention_elapsed(tc, policy, now, last)) {
@@ -669,6 +679,7 @@ mod tests {
             },
             // Any-tier anchor: a leli warm cache copy can be the only anchor copy.
             anchor: Some(AnchorPolicy { datacenter: "LELI".into(), required_tier: None }),
+            pins: Vec::new(),
         }
     }
 
@@ -848,6 +859,33 @@ mod tests {
         prot.protected.insert(("x".into(), N, 0));
         prot.pinned.insert(("x".into(), N, 0));
         assert_skipped(std_world(&["x"]), &prot);
+    }
+
+    fn with_pins(mut vs: HashMap<String, TickVolumePolicy>, pins: &[(&str, &str)]) -> HashMap<String, TickVolumePolicy> {
+        vs.get_mut("v").unwrap().pins =
+            pins.iter().map(|(p, dc)| dtfs_common::types::PrecachePin { prefix: p.to_string(), datacenter: dc.to_string() }).collect();
+        vs
+    }
+
+    /// MGR-2: a copy under a volume pin for the node's DC is never evicted or
+    /// retention-demoted, even when this tick's pre-cache walk did not reach
+    /// it (`prot.pinned` empty). DC compare is case-insensitive, the prefix
+    /// matches on a path component boundary ("/f/ok" does not pin "/f/ok1").
+    #[test]
+    fn policy_pin_protects_copies_the_precache_walk_missed() {
+        let chunks = std_world(&["ok1", "x", "ok2"]);
+        let cands = [cand("ok1", 1, 10), cand("x", 2, 10), cand("ok2", 3, 10)];
+        let pins = [("/f/x/", "TORO"), ("/f/ok", "toro")];
+        let cap = |vs: &HashMap<String, TickVolumePolicy>| {
+            plan_capacity_eviction(N, 0, &cands, &chunks, vs, &Prot::none().view(), u64::MAX, &mut Vec::new())
+        };
+        assert_eq!(ids(&cap(&with_pins(vols(), &pins))), ["ok1", "ok2"]);
+        let ret_cands = [aged("ok1"), aged("x"), aged("ok2")];
+        assert_eq!(ids(&plan_ret_with(&ret_cands, &chunks, &with_pins(ret_vols(), &pins), &Prot::none())), ["ok1", "ok2"]);
+        // Negative: the same path pinned for another DC does not protect the toro copy.
+        let other = [("/f/x", "leli")];
+        assert_eq!(ids(&cap(&with_pins(vols(), &other))), ["ok1", "x", "ok2"]);
+        assert_eq!(ids(&plan_ret_with(&ret_cands, &chunks, &with_pins(ret_vols(), &other), &Prot::none())), ["ok1", "x", "ok2"]);
     }
 
     #[test]
@@ -1160,6 +1198,12 @@ mod tests {
                     1 => Some(AnchorPolicy { datacenter: "leli".into(), required_tier: None }),
                     _ => Some(AnchorPolicy { datacenter: "Leli".into(), required_tier: Some(DiskTier::Cold) }),
                 };
+                for _ in 0..r.next(3) {
+                    p.pins.push(dtfs_common::types::PrecachePin {
+                        prefix: format!("/{v}/{}", r.next(12)),
+                        datacenter: ["LELI", "toro", "nrb"][r.next(3) as usize].into(),
+                    });
+                }
                 vols.insert(v.to_string(), p);
             }
             // Nodes 1..=6, fixed dc/tier per node; disk 0 only.
@@ -1219,6 +1263,14 @@ mod tests {
                 }
                 for e in ev {
                     assert!(!prot.pinned.contains(&(e.chunk_id.clone(), n, 0)), "seed {seed}: pin evicted");
+                    for row in &e.rows {
+                        let vol = row.file_path.split('/').nth(1).unwrap();
+                        let pinned = vols[vol].pins.iter().any(|pin| {
+                            pin.datacenter.eq_ignore_ascii_case(node_dc[n as usize])
+                                && crate::scheduler::path_matches_prefix(&row.file_path, &pin.prefix)
+                        });
+                        assert!(!pinned, "seed {seed}: policy-pinned copy {} removed", row.file_path);
+                    }
                     if retention_mode {
                         assert!(!prot.protected.contains(&(e.chunk_id.clone(), n, 0)), "seed {seed}: protected copy demoted");
                         for row in &e.rows {

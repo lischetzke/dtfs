@@ -1822,6 +1822,7 @@ pub(crate) fn tick_volume_policies(sm: &StateMachineData) -> HashMap<String, Tic
                 mandatory: vcfg.effective_mandatory_replicas().clone(),
                 cache,
                 anchor: vcfg.effective_anchor(),
+                pins: vcfg.precache.pins.clone(),
             },
         );
     }
@@ -1881,6 +1882,9 @@ pub(crate) struct TickVolumePolicy {
     pub mandatory: dtfs_common::types::TierReplication,
     pub cache: dtfs_common::types::CacheReplication,
     pub anchor: Option<dtfs_common::types::AnchorPolicy>,
+    /// `precache.pins`: capacity eviction and retention never remove a copy
+    /// under one of these in the pin's DC.
+    pub pins: Vec<dtfs_common::types::PrecachePin>,
 }
 
 /// AV-2-4 — one chunk's view as the planner needs it.
@@ -2993,6 +2997,7 @@ mod bug_av_tiering_tick_tests {
                 datacenter: "leli".to_string(),
                 required_tier: Some(DiskTier::Cold),
             }),
+            pins: Vec::new(),
         }
     }
 
@@ -3849,6 +3854,7 @@ mod audit_co_tests {
             mandatory: dtfs_common::types::TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
             cache: policy_cache,
             anchor: Some(AnchorPolicy { datacenter: "leli".into(), required_tier: None }),
+            pins: Vec::new(),
         };
         let chunk = chunk_with(vec![
             placement(10, 1, "leli", DiskTier::Warm),
@@ -3879,6 +3885,7 @@ mod audit_co_tests {
             mandatory: dtfs_common::types::TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
             cache,
             anchor: None,
+            pins: Vec::new(),
         });
         let nodes = vec![NodeSelectionView {
             node_id: 5, datacenter: "toro".into(), tier: DiskTier::Warm,
@@ -3955,6 +3962,7 @@ mod audit_co_tests {
             mandatory: TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 },
             cache,
             anchor: None,
+            pins: Vec::new(),
         };
         let warm_cache = placement(10, 1, "toro", DiskTier::Warm);
         let dead_cold = dead_placement(11, 0, "leli", DiskTier::Cold);
@@ -3993,6 +4001,7 @@ mod audit_co_tests {
             mandatory,
             cache,
             anchor: Some(AnchorPolicy { datacenter: "leli".into(), required_tier: None }),
+            pins: Vec::new(),
         };
         let mut volumes = HashMap::new();
         volumes.insert("v1".to_string(), policy);
