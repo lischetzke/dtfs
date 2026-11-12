@@ -113,6 +113,8 @@ pub struct TieringEngine {
     precache: parking_lot::Mutex<crate::precache::PrecacheState>,
     /// (node, disk, tonic code) a capacity-eviction skip was already logged for.
     evict_skip_logged: parking_lot::Mutex<std::collections::HashSet<(u64, u32, i32)>>,
+    /// (node, disk) -> last capacity-eviction round that evicted something.
+    evict_records: parking_lot::Mutex<HashMap<(u64, u32), evict::EvictRecord>>,
 }
 
 impl TieringEngine {
@@ -134,6 +136,7 @@ impl TieringEngine {
             evicted_newest_sample_ms: std::sync::atomic::AtomicU64::new(0),
             precache: parking_lot::Mutex::new(Default::default()),
             evict_skip_logged: parking_lot::Mutex::new(Default::default()),
+            evict_records: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -181,6 +184,7 @@ impl TieringEngine {
         // In-flight tasks are Raft state and finish on their own; only leader memory is dropped.
         if !self.scheduler.is_leader() {
             self.precache.lock().reset_leader_state();
+            self.evict_records.lock().clear();
             return;
         }
         let now_ms = now_millis();
