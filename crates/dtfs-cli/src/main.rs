@@ -288,6 +288,11 @@ enum VolumesCmd {
         /// (0 = promote_window_secs; non-zero needs every manager on v0.1.16).
         #[arg(long)]
         retention_secs: Option<u64>,
+        /// When a reading DC gets its cache copy: on_promote (after
+        /// promote_reads reads) or on_read (the FUSE reader copies the chunk
+        /// it fetched; needs every manager on v0.1.16).
+        #[arg(long, value_parser = ["on_promote", "on_read"])]
+        fill: Option<String>,
     },
     /// Set the volume's predictive pre-caching policy (needs every manager
     /// on v0.1.16 or later). Omitted flags keep the current value.
@@ -804,12 +809,12 @@ async fn main() -> anyhow::Result<()> {
             VolumesCmd::SetCache {
                 volume_id,
                 warm_min, warm_max, hot_min, hot_max,
-                per_dc, promote_reads, promote_window_secs, cooldown_secs, retention_secs,
+                per_dc, promote_reads, promote_window_secs, cooldown_secs, retention_secs, fill,
             } => {
                 cmd_volumes_set_cache(
                     &api, &args.format, &volume_id,
                     warm_min, warm_max, hot_min, hot_max,
-                    per_dc, promote_reads, promote_window_secs, cooldown_secs, retention_secs,
+                    per_dc, promote_reads, promote_window_secs, cooldown_secs, retention_secs, fill,
                 ).await?
             }
             VolumesCmd::SetPrecache {
@@ -1229,6 +1234,7 @@ async fn cmd_volumes_show(
             println!("  promote_window_secs:  {}", c["promote_window_secs"].as_u64().unwrap_or(14_400));
             println!("  cooldown_secs:        {}", c["cooldown_secs"].as_u64().unwrap_or(300));
             println!("  retention_secs:       {} (effective {})", c["retention_secs"].as_u64().unwrap_or(0), c["effective_retention_secs"].as_u64().unwrap_or(0));
+            println!("  fill:                 {}", c["fill"].as_str().unwrap_or("on_promote"));
             if v["anchor"].is_null() {
                 println!("Anchor:  (none)");
             } else {
@@ -1348,6 +1354,7 @@ async fn cmd_volumes_set_cache(
     promote_window_secs: Option<u64>,
     cooldown_secs: Option<u64>,
     retention_secs: Option<u64>,
+    fill: Option<String>,
 ) -> anyhow::Result<()> {
     let mut body = serde_json::Map::new();
     if let Some(v) = warm_min { body.insert("warm_min".into(), v.into()); }
@@ -1363,6 +1370,8 @@ async fn cmd_volumes_set_cache(
         { body.insert("cooldown_secs".into(), v.into()); }
     if let Some(v) = retention_secs
         { body.insert("retention_secs".into(), v.into()); }
+    if let Some(v) = fill
+        { body.insert("fill".into(), v.into()); }
     let body = serde_json::Value::Object(body);
 
     let url = format!("/api/v1/volumes/{}/set-cache", volume_id);
@@ -1392,6 +1401,7 @@ async fn cmd_volumes_set_cache(
             println!("  promote_window_secs:  {}", c["promote_window_secs"].as_u64().unwrap_or(14_400));
             println!("  cooldown_secs:        {}", c["cooldown_secs"].as_u64().unwrap_or(300));
             println!("  retention_secs:       {} (effective {})", c["retention_secs"].as_u64().unwrap_or(0), c["effective_retention_secs"].as_u64().unwrap_or(0));
+            println!("  fill:                 {}", c["fill"].as_str().unwrap_or("on_promote"));
         }
     }
     Ok(())
@@ -2670,6 +2680,13 @@ mod audit_co_tests {
 
         let a = Args::try_parse_from(["dtfs-cli", "volumes", "delete", "media", "--yes", "--confirm", "media"]).unwrap();
         assert!(matches!(a.command, Commands::Volumes(VolumesCmd::Delete { yes: true, confirm: Some(ref c), .. }) if c == "media"));
+    }
+
+    #[test]
+    fn set_cache_fill_accepts_only_on_promote_or_on_read() {
+        let a = Args::try_parse_from(["dtfs-cli", "volumes", "set-cache", "v", "--fill", "on_read"]).unwrap();
+        assert!(matches!(a.command, Commands::Volumes(VolumesCmd::SetCache { fill: Some(ref f), .. }) if f == "on_read"));
+        assert!(Args::try_parse_from(["dtfs-cli", "volumes", "set-cache", "v", "--fill", "always"]).is_err());
     }
 
     #[test]

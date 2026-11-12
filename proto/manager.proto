@@ -86,7 +86,25 @@ service ManagerService {
   // dtfs_raft::ClientRequest / ClientResponse (both already serde types),
   // so this RPC is agnostic to the ClientRequest enum shape.
   rpc ForwardClientWrite(ForwardWriteRequest) returns (ForwardWriteResponse);
+
+  // Fill on read: register the cache copy a FUSE reader put on the
+  // GetFileLocationsResponse fill target (volume cache_replicas.fill =
+  // on_read). Lease-less, union-only; refused unless the row is a valid cache
+  // copy in the reader's DC. Mutating: dtfs-mgr-rpc HMAC, binding
+  // path\nchunk_index\nchunk_id\nnode_id\ndisk_id.
+  rpc CommitCacheFill(CommitCacheFillRequest) returns (CommitCacheFillResponse);
 }
+
+message CommitCacheFillRequest {
+  string path = 1;
+  uint64 chunk_index = 2;
+  string chunk_id = 3;
+  uint64 node_id = 4;
+  uint32 disk_id = 5;
+  string client_dc = 6;
+}
+
+message CommitCacheFillResponse {}
 
 // --- Manager-to-manager forwarding (Bug BL) ---
 
@@ -238,6 +256,10 @@ message GetFileLocationsRequest {
   // #135 — attributes only (size, times, kind, volume): the response
   // carries no chunks. An older manager ignores it and sends them.
   bool omit_chunks = 2;
+  // The reader's [location].datacenter. With a volume on
+  // cache_replicas.fill = on_read the manager answers a fill target in this
+  // DC. Empty or an older manager: no target.
+  string client_dc = 3;
 }
 
 message ChunkLocationInfo {
@@ -299,6 +321,13 @@ message GetFileLocationsResponse {
   string volume_id = 8;
   // Path is a symlink (FileMetadata.symlink_target is set). Old managers send false.
   bool is_symlink = 9;
+  // Fill on read: the data node in client_dc the reader copies a chunk it
+  // fetched from another DC to (PutChunk with fill_tier, then
+  // CommitCacheFill). Empty = no fill (volume on_promote, no client_dc, no
+  // eligible node, older manager).
+  string fill_node_addr = 10;
+  string fill_tier = 11; // lowercase
+  uint64 fill_node_id = 12;
 }
 
 // --- DeleteFile ---

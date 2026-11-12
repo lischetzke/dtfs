@@ -57,6 +57,18 @@ pub struct FileLocations {
     pub is_directory: bool,
     /// Path is a symlink (manager `is_symlink`; false from old managers).
     pub is_symlink: bool,
+    /// Fill on read: where this client copies a chunk it fetched from
+    /// another DC (manager `fill_node_*`). None = no fill.
+    pub fill: Option<FillTarget>,
+}
+
+/// GetFileLocations fill-on-read target: a data node in this client's DC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FillTarget {
+    pub node_id: u64,
+    pub addr: String,
+    /// Lowercase tier for PutChunk.
+    pub tier: String,
 }
 
 impl FileLocations {
@@ -204,6 +216,55 @@ pub const CACHE_HIT_NOTIFY_MAX_INFLIGHT: usize = 8;
 /// Bound on background disk-cache puts after foreground misses; each holds
 /// one chunk's `Bytes` (refcounted, usually shared with the readahead cache).
 pub const LOCAL_CACHE_PUT_MAX_INFLIGHT: usize = 2;
+
+/// Bound on background fill-on-read copies (PutChunk + CommitCacheFill);
+/// each holds one chunk's `Bytes`. Full = the fill is dropped.
+pub const CACHE_FILL_MAX_INFLIGHT: usize = 2;
+
+/// Chunk ids remembered as filled (or tried), so a re-read does not refill.
+const RECENTLY_FILLED_MAX: usize = 4096;
+
+/// Fill on read: a viewer transition (tracked, not scanner) of a chunk with a
+/// fill target, no replica in this client's DC, not filled recently.
+fn fill_wanted(viewer: bool, has_target: bool, any_replica_in_dc: bool, recently_filled: bool) -> bool {
+    viewer && has_target && !any_replica_in_dc && !recently_filled
+}
+
+/// Bounded set of chunk ids, oldest evicted first.
+#[derive(Default)]
+struct RecentIds {
+    set: std::collections::HashSet<String>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl RecentIds {
+    fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
+
+    /// Insert; at `cap` the oldest id is dropped.
+    fn insert(&mut self, id: &str, cap: usize) {
+        if !self.set.insert(id.to_string()) {
+            return;
+        }
+        self.order.push_back(id.to_string());
+        while self.order.len() > cap {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+    }
+}
+
+/// At most one warn per fill failure kind per minute (`last` = epoch secs).
+fn fill_warn_due(last: &AtomicU64, now_secs: u64) -> bool {
+    let prev = last.load(Ordering::Relaxed);
+    now_secs >= prev.saturating_add(60)
+        && last.compare_exchange(prev, now_secs, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+}
+
+static FILL_PUT_WARNED: AtomicU64 = AtomicU64::new(0);
+static FILL_COMMIT_WARNED: AtomicU64 = AtomicU64::new(0);
 
 /// CR-6-6 (FUSE-8 / FUSE-10) — true iff `current` is a genuinely new
 /// chunk index for this fh (never seen, or different from the last one),
@@ -881,6 +942,10 @@ pub struct DtfsFilesystem {
     /// Bounds background disk-cache puts after a foreground miss
     /// (`LOCAL_CACHE_PUT_MAX_INFLIGHT`); a put without a permit is dropped.
     cache_put_permits: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Bounds background fill-on-read copies (`CACHE_FILL_MAX_INFLIGHT`).
+    cache_fill_permits: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Chunks filled (or tried) recently (`RECENTLY_FILLED_MAX`).
+    recently_filled: parking_lot::Mutex<RecentIds>,
     /// CR-6-6 (FUSE-9) — single-flights foreground chunk-miss fetches by
     /// chunk_id (content-addressed, so any candidate node's fetch is
     /// interchangeable). The first reader to miss becomes the Owner and
@@ -1021,6 +1086,8 @@ impl DtfsFilesystem {
             cache_put_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 LOCAL_CACHE_PUT_MAX_INFLIGHT,
             )),
+            cache_fill_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(CACHE_FILL_MAX_INFLIGHT)),
+            recently_filled: parking_lot::Mutex::new(RecentIds::default()),
             foreground_inflight: DashMap::new(),
             known_locations: DashMap::new(),
             failed_replicas: DashMap::new(),
@@ -1439,6 +1506,67 @@ impl DtfsFilesystem {
             }
             debug!(fh, offset, pass, "handle snapshot changed during read; reading again");
             pass += 1;
+        }
+    }
+
+    /// Fill on read: copy a viewer's verified chunk bytes to the snapshot's
+    /// fill target when no replica is in this client's DC, then register the
+    /// copy (`CommitCacheFill`). Background, bounded, dropped when full; never
+    /// awaited on the read path. A refused commit leaves an orphan for the reaper.
+    fn maybe_fill_on_read(&self, locations: &FileLocations, chunk: &ChunkInfo, chunk_index: u64, path: &str, bytes: &Bytes, viewer: bool) {
+        let dc = &self.client_location.datacenter;
+        let any_in_dc = chunk.node_addresses.iter().any(|a| {
+            self.known_locations
+                .get(a)
+                .is_some_and(|l| l.datacenter.eq_ignore_ascii_case(dc))
+        });
+        // Check and mark under one lock so two readers of a chunk fill it once.
+        let wanted = {
+            let mut recent = self.recently_filled.lock();
+            let w = fill_wanted(viewer, locations.fill.is_some() && !dc.is_empty(), any_in_dc, recent.contains(&chunk.chunk_id));
+            if w {
+                recent.insert(&chunk.chunk_id, RECENTLY_FILLED_MAX);
+            }
+            w
+        };
+        if !wanted {
+            return;
+        }
+        let Some(target) = locations.fill.clone() else { return };
+        let client = self.client.clone();
+        let (chunk_id, volume_id, path, client_dc, bytes) =
+            (chunk.chunk_id.clone(), locations.volume_id.clone(), path.to_string(), dc.clone(), bytes.clone());
+        let spawned = spawn_bounded(&self.cache_fill_permits, async move {
+            let now = || SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let put = match client.write_chunk_bytes(&target.addr, &chunk_id, &volume_id, &target.tier, bytes).await {
+                Ok(p) => p,
+                Err(e) => {
+                    if fill_warn_due(&FILL_PUT_WARNED, now()) {
+                        warn!(chunk_id = %chunk_id, node = %target.addr, error = %format!("{e:#}"), "cache fill put failed (further failures this minute at debug)");
+                    } else {
+                        debug!(chunk_id = %chunk_id, node = %target.addr, error = %format!("{e:#}"), "cache fill put failed");
+                    }
+                    return;
+                }
+            };
+            let req = dtfs_proto::dtfs::manager::CommitCacheFillRequest {
+                path,
+                chunk_index,
+                chunk_id: chunk_id.clone(),
+                node_id: target.node_id,
+                disk_id: put.disk_id,
+                client_dc,
+            };
+            match client.commit_cache_fill(req).await {
+                Ok(()) => debug!(chunk_id = %chunk_id, node = %target.addr, "cache fill registered"),
+                Err(e) if fill_warn_due(&FILL_COMMIT_WARNED, now()) => {
+                    warn!(chunk_id = %chunk_id, node = %target.addr, error = %format!("{e:#}"), "cache fill commit failed (further failures this minute at debug)")
+                }
+                Err(e) => debug!(chunk_id = %chunk_id, node = %target.addr, error = %format!("{e:#}"), "cache fill commit failed"),
+            }
+        });
+        if !spawned {
+            debug!(chunk_id = %chunk.chunk_id, "cache fill skipped, bound full");
         }
     }
 
@@ -1866,6 +1994,7 @@ impl DtfsFilesystem {
                     &chunk_locs,
                     !untracked,
                 );
+                self.maybe_fill_on_read(&locations, chunk, chunk_idx as u64, &file_path, &chunk_data, !report_scanner && !untracked);
             }
 
             // Extract the relevant byte range from this chunk.
@@ -3219,6 +3348,7 @@ impl DtfsFilesystem {
             modified_at_ms: 0,
             is_directory: false,
             is_symlink: false,
+            fill: None,
         });
         self.open_files.insert(
             fh,
@@ -3705,6 +3835,11 @@ impl DtfsFilesystem {
             modified_at_ms: response.modified_at_ms,
             is_directory: response.is_directory,
             is_symlink: response.is_symlink,
+            fill: (!response.fill_node_addr.is_empty() && !response.fill_tier.is_empty()).then(|| FillTarget {
+                node_id: response.fill_node_id,
+                addr: response.fill_node_addr,
+                tier: response.fill_tier,
+            }),
         })
     }
 
@@ -4623,6 +4758,7 @@ fn without_chunks(l: &FileLocations) -> FileLocations {
         modified_at_ms: l.modified_at_ms,
         is_directory: l.is_directory,
         is_symlink: l.is_symlink,
+        fill: None,
     }
 }
 
@@ -5272,6 +5408,44 @@ where
 }
 
 #[cfg(test)]
+mod fill_on_read_tests {
+    use super::*;
+
+    /// Fill only a viewer read with a target, no local replica, not filled yet.
+    #[test]
+    fn fill_wanted_needs_viewer_target_no_local_replica_not_recent() {
+        assert!(fill_wanted(true, true, false, false));
+        assert!(!fill_wanted(false, true, false, false), "scanner / untracked read");
+        assert!(!fill_wanted(true, false, false, false), "no fill target");
+        assert!(!fill_wanted(true, true, true, false), "a replica is already in the DC");
+        assert!(!fill_wanted(true, true, false, true), "filled recently");
+    }
+
+    /// The recently-filled set holds at most `cap` ids, dropping the oldest.
+    #[test]
+    fn recent_ids_bounded_oldest_evicted() {
+        let mut r = RecentIds::default();
+        for i in 0..5 {
+            r.insert(&format!("c{i}"), 3);
+        }
+        assert_eq!((r.set.len(), r.order.len()), (3, 3));
+        assert!(!r.contains("c1") && r.contains("c2") && r.contains("c4"));
+        r.insert("c4", 3); // repeat: no growth, no eviction
+        assert_eq!(r.order.len(), 3);
+        assert!(r.contains("c2"));
+    }
+
+    /// One warn per kind per minute: due at 60 s after the last, not before.
+    #[test]
+    fn fill_warn_due_once_per_minute() {
+        let last = AtomicU64::new(0);
+        assert!(fill_warn_due(&last, 1_000));
+        assert!(!fill_warn_due(&last, 1_059));
+        assert!(fill_warn_due(&last, 1_060));
+    }
+}
+
+#[cfg(test)]
 mod commit_outcome_tests {
     use super::*;
 
@@ -5710,6 +5884,7 @@ mod cr_6_5_metadata_cache_bound_tests {
             modified_at_ms: 0,
             is_directory: false,
             is_symlink: false,
+            fill: None,
         }
     }
 
@@ -6059,6 +6234,7 @@ mod rev_2_1_chunk_index_tests {
             modified_at_ms: 0,
             is_directory: false,
             is_symlink: false,
+            fill: None,
         }
     }
 
@@ -6327,6 +6503,7 @@ mod tests {
             modified_at_ms: 0,
             is_directory: false,
             is_symlink: false,
+            fill: None,
         };
         let attr = file_attr_from_locations(&loc);
         assert_eq!(attr.size, 42);
@@ -6351,6 +6528,7 @@ mod tests {
             modified_at_ms: 1,
             is_directory: true,
             is_symlink: false,
+            fill: None,
         };
         let attr = file_attr_from_locations(&loc);
         assert!(attr.is_directory, "directory bit must round-trip into FileAttr");
@@ -6884,6 +7062,7 @@ mod commit_tracker_tests {
             modified_at_ms: 0,
             is_directory: false,
             is_symlink: false,
+            fill: None,
         });
         let fetch = t.begin_fetch("/f");
         drop(t.begin("/f")); // writer's commit lands, merge loop runs
@@ -7105,6 +7284,7 @@ mod async_commit_fs_tests {
             modified_at_ms: 0,
             is_directory: false,
             is_symlink: false,
+            fill: None,
         }
     }
 

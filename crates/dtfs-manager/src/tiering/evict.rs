@@ -684,6 +684,7 @@ mod tests {
                 promote_window_secs: 14_400,
                 cooldown_secs: 300,
                 retention_secs: 0,
+                fill: Default::default(),
             },
             // Any-tier anchor: a leli warm cache copy can be the only anchor copy.
             anchor: Some(AnchorPolicy { datacenter: "LELI".into(), required_tier: None }),

@@ -22,6 +22,7 @@ Shape returned by `GET /api/v1/volumes/{id}` ([REST API](../api-reference/rest-a
 | `cache_replicas.promote_window_secs` | u64 | `14400` (4 h) | `set-cache` |
 | `cache_replicas.cooldown_secs` | u64 | `300` | `set-cache` |
 | `cache_replicas.retention_secs` | u64 | `0` (= `promote_window_secs`) | `set-cache`; non-zero needs every manager on v0.1.16 (409). Idle time before a cache copy is demoted, read from the data node's last-read index ([Tiering](../storage/tiering.md#retention-demotion)) |
+| `cache_replicas.fill` | `"on_promote"` \| `"on_read"` | `"on_promote"` | `set-cache`; `on_read` needs every manager on v0.1.16 (409). `on_read`: a FUSE reader copies a chunk it fetched from another DC to a cache node in its own DC ([Tiering](../storage/tiering.md#fill-on-read)) |
 | `anchor.datacenter` | string | request `anchor_datacenter`; none if omitted (`[defaults].anchor_datacenter` applies only to the auto-created `default` volume) | create, `set-anchor` |
 | `anchor.required_tier` | `hot`/`warm`/`cold`/`tape` or null | null (any tier in the anchor DC) | `set-anchor` |
 | `write_safety.min_replicas_before_ack` | u32 | `[defaults.write_safety]` (2) | `set-write-safety` |

@@ -426,6 +426,23 @@ fn v1_fixtures_default_retention_and_cursor_ttl() {
     assert_eq!((cfg.cache_replicas.retention_secs, cfg.precache.cursor_ttl_secs), (0, 0));
 }
 
+/// The v1 fixtures predate `cache_replicas.fill`: it loads as on_promote.
+#[test]
+fn v1_fixtures_default_cache_fill_on_promote() {
+    use dtfs_common::types::CacheFill;
+    let snap = deserialize_snapshot(io::Cursor::new(SNAPSHOT_V1.as_bytes().to_vec())).unwrap();
+    assert_eq!(snap.volumes["default"].cache_replicas.fill, CacheFill::OnPromote);
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V1).unwrap();
+    let cfg = reqs
+        .iter()
+        .find_map(|r| match r {
+            ClientRequest::UpsertVolume { config, .. } => Some(config),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(cfg.cache_replicas.fill, CacheFill::OnPromote);
+}
+
 /// The v1 fixture predates the audit `now_ms` on these variants: it must
 /// default to 0 (apply then falls back to `log_id.index`).
 #[test]

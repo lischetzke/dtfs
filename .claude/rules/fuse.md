@@ -436,6 +436,14 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
 - A foreground miss writes the disk cache in the background via
   `spawn_bounded` (`LOCAL_CACHE_PUT_MAX_INFLIGHT`, 2); a put without a
   permit is dropped, never queued or awaited on the read path.
+- Fill on read (`maybe_fill_on_read`): on a viewer transition (tracked,
+  `!report_scanner`) of a chunk with a snapshot `fill` target, no replica
+  in this client's DC (`known_locations`) and not in `recently_filled`
+  (4096, marked under the same lock as the check), the transition's
+  verified `Bytes` go to the target via `spawn_bounded`
+  (`CACHE_FILL_MAX_INFLIGHT`, 2; dropped when full, never awaited), then
+  `commit_cache_fill`. Failures at debug, one warn per kind per minute.
+  `without_chunks` drops the target; write paths never fill.
 - Client `read_chunk` verifies the streamed bytes against the 64-hex
   chunk id (IntegrityFaultError on mismatch).
 - Disk cache: viewer-read atime hint comes from `OpenFile.bytes_read_on_fh`

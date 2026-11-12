@@ -180,6 +180,15 @@ No leader-tenure or read-window gate applies: the last-read time is persisted on
 
 A disk whose index answered within the last 30 min is "capable": the ring-based idle demote skips copies of retention volumes there. A disk that answers Unimplemented (old data node), FailedPrecondition (cold/tape) or Unavailable (index not seeded, node unreachable) is not, and keeps the ring-based idle demote with `retention_secs` as the idle window and its leader-tenure gate.
 
+### Fill on read
+
+With promotion, a first playback in a remote DC pulls every chunk over the WAN and the later promotion copies the same chunks over the WAN again. A volume with `cache_replicas.fill = "on_read"` (default `"on_promote"`; `on_read` needs every manager on v0.1.16, otherwise the REST call is refused with 409) lets the FUSE reader keep the copy it already fetched:
+
+* The FUSE client sends its `[location].datacenter` with `GetFileLocations`. The manager answers a fill target when the volume is `on_read`, has a cache tier (cache `max > 0`, not mandatory; hottest first) and some node in that DC (case-insensitive) is eligible like a promotion target: survivor, not draining, a tier disk with room and below `cache_low_watermark_pct` when set; most free, then lowest node id. An older manager ignores the DC: no target, no fill.
+* On a viewer chunk transition (a tracked process past the first 1 MiB of the handle, not `untracked_read_processes`) of a chunk that has no replica in the client's DC and was not filled recently (4096 ids), the client puts the verified bytes on the target (`PutChunk` with the fill tier, at most 2 in flight, dropped when full, never awaited by the read) and calls `CommitCacheFill`.
+* `CommitCacheFill` (HMAC-stamped like every mutating manager RPC) refuses: unknown file `NotFound`; volume not `on_read`, no row with that hash at that index, unknown or non-survivor node or a node outside `client_dc`, or the DC already holding `cache_replicas.<tier>.max` live copies on the tier (per DC when `per_dc`, else global) `FailedPrecondition`; a disk not on the node or not on a cache tier of the volume `InvalidArgument`. A row already on that (node, disk) is success. It registers the row through the lease-less union-only `UpdateChunkLocations` (forwarded to the leader from a follower) and audits `cache.fill`.
+* A refused or failed commit leaves an unregistered copy that the orphan reaper removes after its grace. The copy is an ordinary cache copy afterwards: retention, idle demote and capacity eviction apply.
+
 ### Worked example — `/movies/Wicked.mkv` lifecycle
 
 Volume: cold mandatory, warm cache per-DC with `min=1, max=1`,

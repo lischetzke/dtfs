@@ -235,7 +235,7 @@ Volume ids are lowercase names with spaces replaced by `-`. The field reference 
     "hot":  { "min": 0, "max": 0 }, "warm": { "min": 1, "max": 1 },
     "cold": { "min": 0, "max": 0 }, "tape": { "min": 0, "max": 0 },
     "per_dc": true, "promote_reads": 2, "promote_window_secs": 14400, "cooldown_secs": 300,
-    "retention_secs": 0, "effective_retention_secs": 14400
+    "retention_secs": 0, "effective_retention_secs": 14400, "fill": "on_promote"
   },
   "anchor": { "datacenter": "leli", "required_tier": "cold" },
   "write_safety": { "min_replicas_before_ack": 2, "write_timeout_secs": 30 },
@@ -265,11 +265,11 @@ Response `{"volume_id", "name", "status": "created"}`. `409` if the id exists, i
 
 ### Volume edit endpoints
 
-All take a JSON body in which omitted fields keep their value, and answer `{"volume_id", "changed": <bool>, "config": <volume projection>}` (`changed:false` is a no-op). Common errors: `404` unknown volume, `400` validation message, `409` when a concurrent update of the same volume wins (re-read with `GET /api/v1/volumes/{id}`, reapply, retry), `503` Raft failure. Every edit endpoint (and `migrate-policy`) answers `409` with `min_version` `v0.1.16` when the resulting config carries a non-zero `cache_replicas.retention_secs` or `precache.cursor_ttl_secs` while any manager is below v0.1.16 (an older manager would drop the fields).
+All take a JSON body in which omitted fields keep their value, and answer `{"volume_id", "changed": <bool>, "config": <volume projection>}` (`changed:false` is a no-op). Common errors: `404` unknown volume, `400` validation message, `409` when a concurrent update of the same volume wins (re-read with `GET /api/v1/volumes/{id}`, reapply, retry), `503` Raft failure. Every edit endpoint (and `migrate-policy`) answers `409` with `min_version` `v0.1.16` when the resulting config carries a non-zero `cache_replicas.retention_secs` or `precache.cursor_ttl_secs`, or `cache_replicas.fill = "on_read"`, while any manager is below v0.1.16 (an older manager would drop the fields).
 
 | Endpoint | Body fields | `400` cases |
 |---|---|---|
-| `set-cache` | `warm_min`, `warm_max`, `hot_min`, `hot_max`, `cold_min`, `cold_max`, `tape_min`, `tape_max` (u32); `per_dc` (bool); `promote_reads` (u32); `promote_window_secs`, `cooldown_secs`, `retention_secs` (u64) | `max < min` for any tier |
+| `set-cache` | `warm_min`, `warm_max`, `hot_min`, `hot_max`, `cold_min`, `cold_max`, `tape_min`, `tape_max` (u32); `per_dc` (bool); `promote_reads` (u32); `promote_window_secs`, `cooldown_secs`, `retention_secs` (u64); `fill` (`"on_promote"`/`"on_read"`, [fill on read](../storage/tiering.md#fill-on-read)) | `max < min` for any tier; another `fill` value (422) |
 | `set-precache` | `mode` (`off`/`files`/`plex`); `next_files`, `next_max_gb`, `series_max_gb`, `max_series` (u32); `pins` (array of `{prefix, datacenter}`, replaces the whole list, `[]` clears); `cursor_ttl_secs` (u64) | a mode other than `off` without a cache tier (`cache_replicas.<tier>.max > 0` and mandatory 0), without `per_dc`; plex with `series_max_gb` or `max_series` 0; files with `next_files` and `next_max_gb` both 0; a pin prefix that is empty, not absolute or `/`; more than 32 pins; a pin datacenter that matches no registered node (400). A change while any manager is below v0.1.16 answers `409` with `min_version` `v0.1.16`; a body that changes nothing is a no-op at any version |
 | `set-mandatory` | `hot_replicas`, `warm_replicas`, `cold_replicas`, `tape_replicas` (u32); unknown fields rejected | result all zero; zero on the anchor's `required_tier`; non-zero `tape` without a tape disk |
 | `set-write-safety` | `min_replicas_before_ack`, `write_timeout_secs` (u32) | value below 1 |

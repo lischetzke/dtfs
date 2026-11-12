@@ -280,6 +280,11 @@ pub fn stamp_mgr_rpc_auth(
     Some((ts.to_string(), mac))
 }
 
+/// MAC binding of a `CommitCacheFill` (client and manager must agree).
+pub fn cache_fill_binding(path: &str, chunk_index: u64, chunk_id: &str, node_id: u64, disk_id: u32) -> String {
+    format!("{path}\n{chunk_index}\n{chunk_id}\n{node_id}\n{disk_id}")
+}
+
 /// Verify manager metadata RPC auth headers.
 ///
 /// Empty `secret` → always true (legacy skip). Otherwise requires a parseable

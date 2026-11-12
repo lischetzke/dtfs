@@ -16,6 +16,8 @@ use tracing::info;
 
 use crate::placement::PlacementEngine;
 
+mod cache_fill;
+
 /// CR-6-3 (PROTO-2) — warn once per manager process when a sub-hour
 /// quick/deep scrub cadence is configured, since an older data node
 /// can't honour it (rounds up to the nearest hour via the legacy
@@ -754,19 +756,26 @@ pub(crate) fn liveness_write_status(
 /// over metadata.rs / monitor.rs: `UpdateNodeUsage`, `UpdateNodeDiskUsage`,
 /// `UpdateNodeStatus` (heartbeat + health monitor), `AppendAudit`,
 /// `QuarantineNode`, `RemoveCorruptChunkReplicas`, `ReportScrubResult`,
-/// `ReportChunkReads`. Pure so it is unit-testable without a live service.
+/// `ReportChunkReads`, and the lease-less union-only `UpdateChunkLocations`
+/// of a follower's `CommitCacheFill` (apply never removes rows or grows size
+/// there). Pure so it is unit-testable without a live service.
 fn forwardable(req: &ClientRequest) -> bool {
-    matches!(
-        req,
-        ClientRequest::UpdateNodeUsage { .. }
-            | ClientRequest::UpdateNodeDiskUsage { .. }
-            | ClientRequest::UpdateNodeStatus { .. }
-            | ClientRequest::AppendAudit { .. }
-            | ClientRequest::QuarantineNode { .. }
-            | ClientRequest::RemoveCorruptChunkReplicas { .. }
-            | ClientRequest::ReportScrubResult { .. }
-            | ClientRequest::ReportChunkReads { .. }
-    )
+    match req {
+        ClientRequest::UpdateChunkLocations { lease_id, extent_from_request, .. } => {
+            lease_id.is_empty() && !extent_from_request
+        }
+        _ => matches!(
+            req,
+            ClientRequest::UpdateNodeUsage { .. }
+                | ClientRequest::UpdateNodeDiskUsage { .. }
+                | ClientRequest::UpdateNodeStatus { .. }
+                | ClientRequest::AppendAudit { .. }
+                | ClientRequest::QuarantineNode { .. }
+                | ClientRequest::RemoveCorruptChunkReplicas { .. }
+                | ClientRequest::ReportScrubResult { .. }
+                | ClientRequest::ReportChunkReads { .. }
+        ),
+    }
 }
 
 /// Short variant name for logging/auditing a denied forward without
@@ -781,6 +790,7 @@ fn client_request_variant_name(req: &ClientRequest) -> &'static str {
         ClientRequest::RemoveCorruptChunkReplicas { .. } => "RemoveCorruptChunkReplicas",
         ClientRequest::ReportScrubResult { .. } => "ReportScrubResult",
         ClientRequest::ReportChunkReads { .. } => "ReportChunkReads",
+        ClientRequest::UpdateChunkLocations { .. } => "UpdateChunkLocations",
         _ => "other",
     }
 }
@@ -1856,6 +1866,22 @@ impl ManagerService for MetadataService {
         // F-037 / F-033: explicit logical size (truncate/fallocate) wins,
         // else the chunk extent (`FileMetadata::reported_size`).
         let total_size: u64 = file.reported_size();
+        // Fill on read: only for a reader with a DC that wants the chunks.
+        let fill = if req.omit_chunks || file.is_directory {
+            None
+        } else {
+            cache_fill::cache_fill_target(
+                &data,
+                &file.volume_id,
+                &req.client_dc,
+                &self.config.placement,
+                self.config.tiering.cache_low_watermark_pct,
+            )
+        };
+        let (fill_node_id, fill_node_addr, fill_tier) = match fill {
+            Some((id, addr, tier)) => (id, addr, tier.to_string()),
+            None => (0, String::new(), String::new()),
+        };
 
         Ok(Response::new(GetFileLocationsResponse {
             path: req.path,
@@ -1873,6 +1899,9 @@ impl ManagerService for MetadataService {
             // stops hardcoding "default" on every refresh.
             volume_id: file.volume_id.clone(),
             is_symlink: file.symlink_target.is_some(),
+            fill_node_addr,
+            fill_tier,
+            fill_node_id,
         }))
     }
 
@@ -3254,6 +3283,54 @@ impl ManagerService for MetadataService {
                 error: String::new(),
             })),
         }
+    }
+
+    async fn commit_cache_fill(
+        &self,
+        request: Request<CommitCacheFillRequest>,
+    ) -> Result<Response<CommitCacheFillResponse>, Status> {
+        let r = request.get_ref();
+        let binding = dtfs_common::crypto::cache_fill_binding(&r.path, r.chunk_index, &r.chunk_id, r.node_id, r.disk_id);
+        require_mgr_rpc_auth(&self.config.cluster.shared_secret, "CommitCacheFill", &binding, request.metadata())?;
+        let req = request.into_inner();
+        let row = {
+            let sm = self.sm_data.read().await;
+            cache_fill::check_cache_fill(&sm, &req)
+        };
+        let row = match row {
+            Ok(Some(row)) => row,
+            Ok(None) => return Ok(Response::new(CommitCacheFillResponse {})),
+            Err(e) => {
+                // Expected races (copy cap reached, file rewritten); not warn-worthy.
+                tracing::debug!(path = %req.path, chunk = %req.chunk_id, node_id = req.node_id, disk_id = req.disk_id, reason = %e.message(), "cache fill refused");
+                return Err(e);
+            }
+        };
+        // Lease-less, union-only: the apply skips (and errors on) a stale index.
+        let resp = self
+            .raft_write_or_forward(ClientRequest::UpdateChunkLocations {
+                now_ms: stamp_now_ms(),
+                path: req.path.clone(),
+                chunks: vec![row],
+                lease_id: String::new(),
+                extent_from_request: false,
+            })
+            .await?;
+        crate::scheduler::client_response_ok(&resp).map_err(|e| {
+            tracing::debug!(path = %req.path, chunk = %req.chunk_id, error = %e, "cache fill not registered");
+            Status::failed_precondition(format!("cache fill not registered: {e}"))
+        })?;
+        // Per chunk of a remote stream: debug; the audit row is the record.
+        tracing::debug!(path = %req.path, chunk = %req.chunk_id, node_id = req.node_id, disk_id = req.disk_id, dc = %req.client_dc, "cache fill registered");
+        if let Some(audit) = &self.audit {
+            audit.log(
+                "fuse",
+                "cache.fill",
+                &format!("chunk={} node={} disk={} dc={}", req.chunk_id, req.node_id, req.disk_id, req.client_dc),
+                "registered",
+            );
+        }
+        Ok(Response::new(CommitCacheFillResponse {}))
     }
 
     // ---- Extended POSIX surface (F-034 .. F-038) ----

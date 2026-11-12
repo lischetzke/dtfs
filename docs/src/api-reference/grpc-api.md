@@ -38,6 +38,7 @@ There are two planes so a stamp for one cannot be replayed on the other: `dtfs-d
 | ManagerService | `CreateFile`, `DeleteFile`, `AllocateChunks`, `CommitChunkLocations`, `SetFileSize`, `CreateSymlink`, `AcquireWriteLease`, `RenewWriteLease`, `ReleaseWriteLease` | `path` |
 | ManagerService | `RenameFile` | `from\nto` |
 | ManagerService | `CreateLink` | `source\ndest` |
+| ManagerService | `CommitCacheFill` | `path\nchunk_index\nchunk_id\nnode_id\ndisk_id` |
 | ManagerService | `Heartbeat`, `ReportChunkStatus` | `node_id` |
 | ManagerService | `ReleaseLeasesByHost` | `hostname` |
 | ManagerService | `ForwardClientWrite` | hex `blake3(client_request_json)`; while `cluster.accept_legacy_forward_secret = true` (default) the follower also fills the legacy raw `shared_secret` field (for pre-HMAC leaders) and the leader accepts an unstamped forward on it; with `false` the field is sent empty and an unstamped forward is refused |
@@ -64,7 +65,8 @@ Used by FUSE clients (metadata, leases), data nodes (registration, heartbeat) an
 | RPC | Request | Response |
 |---|---|---|
 | `CreateFile` | `path`, optional `volume_id` | `success`, `chunk_size`, `volume_id` |
-| `GetFileLocations` | `path`, optional `omit_chunks` (attributes only, no chunk list; an older manager ignores it and sends chunks) | `path`, `total_size`, `chunks` (`ChunkLocationInfo`), `chunk_size`, `created_at_ms`, `modified_at_ms`, `is_directory`, `volume_id`, `is_symlink` |
+| `GetFileLocations` | `path`, optional `omit_chunks` (attributes only, no chunk list; an older manager ignores it and sends chunks), `client_dc` (the reader's `[location].datacenter`) | `path`, `total_size`, `chunks` (`ChunkLocationInfo`), `chunk_size`, `created_at_ms`, `modified_at_ms`, `is_directory`, `volume_id`, `is_symlink`, `fill_node_addr`, `fill_tier` (lowercase), `fill_node_id` (the [fill-on-read](../storage/tiering.md#fill-on-read) target in `client_dc`; empty when none) |
+| `CommitCacheFill` | `path`, `chunk_index`, `chunk_id`, `node_id`, `disk_id` (from `PutChunkResponse`), `client_dc` | empty. Registers a fill-on-read cache copy; refusals: `NOT_FOUND` (file), `FAILED_PRECONDITION` (volume not `on_read`, chunk not at that index, node unknown / not a survivor / outside `client_dc`, DC at the cache max), `INVALID_ARGUMENT` (disk not on the node or not a cache tier). |
 | `DeleteFile` | `path` | `success` |
 | `ListDirectory` | `path` | `entries` (`DirectoryEntry`) |
 | `RenameFile` | `from`, `to` | `success`, `error` |

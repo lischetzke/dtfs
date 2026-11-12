@@ -427,6 +427,21 @@ pub struct CacheReplication {
     /// 0 = `promote_window_secs`; see `effective_retention_secs`.
     #[serde(default)]
     pub retention_secs: u64,
+
+    /// When a remote DC gets its cache copy (v0.1.16): `on_promote`
+    /// (default) after `promote_reads` reads; `on_read` from the FUSE reader
+    /// that already pulled the chunk over the WAN.
+    #[serde(default)]
+    pub fill: CacheFill,
+}
+
+/// `CacheReplication.fill`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheFill {
+    #[default]
+    OnPromote,
+    OnRead,
 }
 
 impl CacheReplication {
@@ -1200,6 +1215,7 @@ mod bug_av_types_tests {
             promote_window_secs: 7200,
             cooldown_secs: 600,
             retention_secs: 1_209_600,
+            fill: CacheFill::OnRead,
         };
         let toml_str = toml::to_string(&original).unwrap();
         let round_tripped: CacheReplication = toml::from_str(&toml_str).unwrap();
@@ -1220,6 +1236,17 @@ mod bug_av_types_tests {
         let old_p: PrecachePolicy = serde_json::from_str(r#"{"mode":"plex"}"#).unwrap();
         assert_eq!((old.retention_secs, old_p.cursor_ttl_secs), (0, 0));
         assert_eq!(old_p.effective_cursor_ttl_secs(&old), 60);
+    }
+
+    /// `fill` defaults to on_promote, parses snake_case, rejects other values.
+    #[test]
+    fn cache_fill_defaults_to_on_promote_and_parses_snake_case() {
+        let old: CacheReplication = serde_json::from_str(r#"{"promote_window_secs":60}"#).unwrap();
+        assert_eq!(old.fill, CacheFill::OnPromote);
+        let on_read: CacheReplication = serde_json::from_str(r#"{"fill":"on_read"}"#).unwrap();
+        assert_eq!(on_read.fill, CacheFill::OnRead);
+        assert_eq!(serde_json::to_value(CacheFill::OnPromote).unwrap(), "on_promote");
+        assert!(serde_json::from_str::<CacheReplication>(r#"{"fill":"OnRead"}"#).is_err());
     }
 
     /// AV-1-1 test 5 — the `validate()` helper rejects `max < min`.

@@ -3006,6 +3006,7 @@ mod bug_av_tiering_tick_tests {
                 promote_window_secs: 14_400,
                 cooldown_secs: 300,
                 retention_secs: 0,
+                fill: Default::default(),
             },
             anchor: Some(AnchorPolicy {
                 datacenter: "leli".to_string(),

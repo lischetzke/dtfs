@@ -15,7 +15,7 @@ use dtfs_proto::dtfs::manager::manager_service_client::ManagerServiceClient;
 use dtfs_proto::dtfs::manager::{
     AcquireWriteLeaseRequest, AcquireWriteLeaseResponse,
     AllocateChunksRequest, AllocateChunksResponse, ChunkLocationCommit, ClusterCapacityRequest,
-    CommitChunkLocationsRequest, CreateFileRequest, CreateFileResponse, CreateLinkRequest,
+    CommitCacheFillRequest, CommitChunkLocationsRequest, CreateFileRequest, CreateFileResponse, CreateLinkRequest,
     CreateSymlinkRequest, DeleteFileRequest, DeleteFileResponse, GetFileLocationsRequest,
     GetFileLocationsResponse, ListDirectoryRequest, ListDirectoryResponse, ReadSymlinkRequest, ReleaseLeasesByHostRequest,
     ReleaseLeasesByHostResponse, ReleaseWriteLeaseRequest, RenameFileRequest,
@@ -482,10 +482,7 @@ impl DtfsClient {
     /// GetFileLocations; `omit_chunks` (#135) asks for attributes only (an
     /// older manager ignores it and sends the chunks anyway).
     pub async fn get_file_locations_opt(&self, path: &str, omit_chunks: bool) -> Result<GetFileLocationsResponse> {
-        let request = GetFileLocationsRequest {
-            path: path.to_string(),
-            omit_chunks,
-        };
+        let request = self.file_locations_request(path, omit_chunks);
         let response = self
             .call_manager("get_file_locations", true, |mut c| {
                 let r = request.clone();
@@ -493,6 +490,34 @@ impl DtfsClient {
             })
             .await?;
         Ok(response.into_inner())
+    }
+
+    /// GetFileLocations request; `client_dc` (the `[location]` DC) lets the
+    /// manager answer a fill-on-read target.
+    fn file_locations_request(&self, path: &str, omit_chunks: bool) -> GetFileLocationsRequest {
+        GetFileLocationsRequest {
+            path: path.to_string(),
+            omit_chunks,
+            client_dc: self.inner.requester_dc.read().clone(),
+        }
+    }
+
+    /// Register a fill-on-read cache copy (`PutChunk` to the
+    /// GetFileLocations fill target done). Mutating: `dtfs-mgr-rpc` stamped.
+    pub async fn commit_cache_fill(&self, request: CommitCacheFillRequest) -> Result<()> {
+        let binding = dtfs_common::crypto::cache_fill_binding(
+            &request.path,
+            request.chunk_index,
+            &request.chunk_id,
+            request.node_id,
+            request.disk_id,
+        );
+        self.call_manager("commit_cache_fill", false, |mut c| {
+            let r = self.stamp_mgr_mutation("CommitCacheFill", &binding, request.clone());
+            async move { c.commit_cache_fill(r).await }
+        })
+        .await?;
+        Ok(())
     }
 
     /// Delete a file from the DTFS namespace.
@@ -1766,6 +1791,16 @@ mod requester_location_tests {
         );
         c.set_requester_location("home", "", "r1", "h");
         assert_eq!(c.requester_location_proto(), None);
+    }
+
+    /// GetFileLocations carries the `[location]` DC (fill on read); none set = "".
+    #[test]
+    fn file_locations_request_carries_client_dc() {
+        let c = DtfsClient::new();
+        assert_eq!(c.file_locations_request("/f", false).client_dc, "");
+        c.set_requester_location("home", "hun", "r1", "client04_cln");
+        let r = c.file_locations_request("/f", true);
+        assert_eq!((r.path.as_str(), r.omit_chunks, r.client_dc.as_str()), ("/f", true, "hun"));
     }
 }
 

@@ -973,6 +973,36 @@ async fn upserts_carrying_retention_or_cursor_ttl_need_v0_1_16() {
     assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
 }
 
+/// set-cache `fill`: on_read is 409 on a mixed cluster, passes the gate on
+/// v0.1.16 (503 = leaderless write); on_promote (the default) is a noop;
+/// the volume JSON carries the snake_case value.
+#[tokio::test]
+async fn fill_on_read_needs_v0_1_16() {
+    use dtfs_common::types::CacheFill;
+    let h = harness().await;
+    let p = || axum::extract::Path("v".to_string());
+    h.state.sm_data.write().await.volumes.insert("v".into(), precache_vol("v"));
+    let fill = |f| Json(SetCacheRequest { fill: Some(f), ..Default::default() });
+
+    let e = set_volume_cache_endpoint(State(h.state.clone()), p(), fill(CacheFill::OnRead)).await.unwrap_err();
+    assert_v0_1_16_conflict(&e);
+    assert!(e.1.0["error"].as_str().unwrap().contains("fill"), "{:?}", e.1.0);
+    let r = set_volume_cache_endpoint(State(h.state.clone()), p(), fill(CacheFill::OnPromote)).await.unwrap();
+    assert_eq!(r.0["changed"], false);
+    // A volume already on_read gates every other full-config upsert.
+    let mut v = precache_vol("v");
+    v.cache_replicas.fill = CacheFill::OnRead;
+    h.state.sm_data.write().await.volumes.insert("v".into(), v.clone());
+    let ws = Json(SetWriteSafetyRequest { min_replicas_before_ack: None, write_timeout_secs: Some(60) });
+    assert_v0_1_16_conflict(&set_volume_write_safety_endpoint(State(h.state.clone()), p(), ws).await.unwrap_err());
+    assert_eq!(volume_config_to_json(&v)["cache_replicas"]["fill"], "on_read");
+
+    h.state.sm_data.write().await.volumes.insert("v".into(), precache_vol("v"));
+    open_v0_1_16_gate(&mut *h.state.sm_data.write().await);
+    let e = set_volume_cache_endpoint(State(h.state.clone()), p(), fill(CacheFill::OnRead)).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+}
+
 #[test]
 fn apply_set_precache_pins_replace_and_validate() {
     use dtfs_common::types::PrecachePin;

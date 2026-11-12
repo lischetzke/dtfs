@@ -141,6 +141,21 @@ mod mgr_11_forward_allow_list_tests {
             status: "Healthy".into(),
         }));
     }
+
+    /// CommitCacheFill on a follower: only the lease-less union-only shape.
+    #[test]
+    fn only_lease_less_update_chunk_locations_is_forwardable() {
+        let ucl = |lease: &str, extent: bool| ClientRequest::UpdateChunkLocations {
+            now_ms: 0,
+            path: "/f".into(),
+            chunks: Vec::new(),
+            lease_id: lease.into(),
+            extent_from_request: extent,
+        };
+        assert!(forwardable(&ucl("", false)));
+        assert!(!forwardable(&ucl("lease-1", false)));
+        assert!(!forwardable(&ucl("", true)));
+    }
 }
 
 #[cfg(test)]
@@ -589,6 +604,7 @@ mod bug_av_preferred_tier_tests {
                 promote_window_secs: 60,
                 cooldown_secs: 30,
                 retention_secs: 0,
+                fill: Default::default(),
             },
             anchor: None,
             spill: dtfs_common::types::SpillPolicy::default(),
@@ -705,6 +721,7 @@ mod rev_4_10_hint_ack_floor_tests {
                 promote_window_secs: 60,
                 cooldown_secs: 30,
                 retention_secs: 0,
+                fill: Default::default(),
             },
             anchor: None,
             spill: SpillPolicy::default(),
@@ -2117,6 +2134,7 @@ mod tests {
                 promote_window_secs: 60,
                 cooldown_secs: 30,
                 retention_secs: 0,
+                fill: Default::default(),
             },
             anchor: None,
             spill: SpillPolicy::default(),
