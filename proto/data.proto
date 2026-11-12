@@ -85,6 +85,8 @@ message RecordCacheHitRequest {
   string chunk_id = 1;
   string requester_dc = 2;
   string requester_host = 3;
+  // Scanner read (NFS/library scan): not counted. proto3 false = counts, so old clients are unchanged.
+  bool scanner = 4;
 }
 
 message RecordCacheHitResponse {}
@@ -120,6 +122,8 @@ message GetChunkRequest {
   string requester_dc = 2;
   // Optional: requester host (for debugging hot/cold reads).
   string requester_host = 3;
+  // Scanner read (NFS/library scan): not counted. proto3 false = counts, so old clients are unchanged.
+  bool scanner = 4;
 }
 
 message GetChunkResponse {

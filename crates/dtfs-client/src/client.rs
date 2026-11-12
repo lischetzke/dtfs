@@ -50,11 +50,12 @@ impl std::fmt::Display for IntegrityFaultError {
 impl std::error::Error for IntegrityFaultError {}
 
 /// GetChunk request; an untracked read carries no requester DC.
-pub(crate) fn get_chunk_request(chunk_id: &str, dc: &str, host: &str, track: bool) -> GetChunkRequest {
+pub(crate) fn get_chunk_request(chunk_id: &str, dc: &str, host: &str, track: bool, scanner: bool) -> GetChunkRequest {
     GetChunkRequest {
         chunk_id: chunk_id.to_string(),
         requester_dc: if track { dc.to_string() } else { String::new() },
         requester_host: host.to_string(),
+        scanner,
     }
 }
 
@@ -665,6 +666,7 @@ impl DtfsClient {
         &self,
         node_addr: &str,
         chunk_id: &str,
+        scanner: bool,
     ) -> Result<()> {
         use dtfs_proto::dtfs::data::RecordCacheHitRequest;
         let mut client = self.data_client(node_addr).await?;
@@ -672,6 +674,7 @@ impl DtfsClient {
             chunk_id: chunk_id.to_string(),
             requester_dc: self.inner.requester_dc.read().clone(),
             requester_host: self.inner.requester_host.read().clone(),
+            scanner,
         });
         {
             use dtfs_common::crypto::{
@@ -698,20 +701,22 @@ impl DtfsClient {
     /// pieces which are reassembled into a single `Bytes` buffer.
     #[instrument(skip(self))]
     pub async fn read_chunk(&self, node_addr: &str, chunk_id: &str) -> Result<Bytes> {
-        self.read_chunk_as(node_addr, chunk_id, true).await
+        self.read_chunk_as(node_addr, chunk_id, true, false).await
     }
 
     /// `read_chunk`; `track = false` sends an empty requester_dc so the data
     /// node counts the read under "unknown" and tiering never promotes on it
-    /// (FUSE `untracked_read_processes`). Verification is unchanged.
+    /// (FUSE `untracked_read_processes`). `scanner = true` makes the data node
+    /// skip the per-chunk read count. Verification is unchanged.
     #[instrument(skip(self))]
-    pub async fn read_chunk_as(&self, node_addr: &str, chunk_id: &str, track: bool) -> Result<Bytes> {
+    pub async fn read_chunk_as(&self, node_addr: &str, chunk_id: &str, track: bool, scanner: bool) -> Result<Bytes> {
         let mut client = self.data_client(node_addr).await?;
         let mut request = tonic::Request::new(get_chunk_request(
             chunk_id,
             &self.inner.requester_dc.read(),
             &self.inner.requester_host.read(),
             track,
+            scanner,
         ));
         {
             use dtfs_common::crypto::{
@@ -1769,10 +1774,12 @@ mod untracked_read_tests {
 
     #[test]
     fn get_chunk_request_dc_only_when_tracked() {
-        let t = get_chunk_request("c", "toro", "h", true);
+        let t = get_chunk_request("c", "toro", "h", true, false);
         assert_eq!((t.requester_dc.as_str(), t.requester_host.as_str()), ("toro", "h"));
-        let u = get_chunk_request("c", "toro", "h", false);
+        let u = get_chunk_request("c", "toro", "h", false, false);
         assert_eq!(u.requester_dc, "", "untracked read must carry no DC");
         assert_eq!(u.chunk_id, "c");
+        assert!(!t.scanner);
+        assert!(get_chunk_request("c", "toro", "h", true, true).scanner);
     }
 }

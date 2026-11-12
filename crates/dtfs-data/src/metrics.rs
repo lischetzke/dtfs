@@ -91,6 +91,13 @@ impl DataMetrics {
     /// P0-9: record a per-chunk read attributed to a requester DC.
     /// Empty `requester_dc` is recorded under the `"unknown"` bucket so the
     /// counter is never lost (server-side TieringEngine can ignore it).
+    /// `record_chunk_read` unless the client flagged a scanner read.
+    pub fn record_demand_read(&self, chunk_id: &str, requester_dc: &str, now_ms: u64, scanner: bool) {
+        if !scanner {
+            self.record_chunk_read(chunk_id, requester_dc, now_ms);
+        }
+    }
+
     pub fn record_chunk_read(&self, chunk_id: &str, requester_dc: &str, now_ms: u64) {
         let dc = if requester_dc.is_empty() {
             "unknown"
@@ -350,6 +357,15 @@ mod tests {
             .filter(|h| h.chunk_id == "c")
             .map(|h| h.reads_by_dc.get(dc).copied().unwrap_or(0))
             .sum()
+    }
+
+    #[test]
+    fn scanner_reads_are_not_counted() {
+        let m = DataMetrics::new();
+        m.record_demand_read("c", "A", 1_000, true);
+        assert_eq!(counted(&m, "A"), 0);
+        m.record_demand_read("c", "A", 1_000, false);
+        assert_eq!(counted(&m, "A"), 1);
     }
 
     #[test]

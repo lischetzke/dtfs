@@ -636,8 +636,8 @@ impl ReadAheadEngine {
 
             // FUSE-2 — bound the fetch so a hung replica releases the permit.
             let fetch = match fetch_timeout {
-                None => client.read_chunk_as(&node_addr, &chunk_id, track).await,
-                Some(t) => match tokio::time::timeout(t, client.read_chunk_as(&node_addr, &chunk_id, track)).await {
+                None => client.read_chunk_as(&node_addr, &chunk_id, track, true).await,
+                Some(t) => match tokio::time::timeout(t, client.read_chunk_as(&node_addr, &chunk_id, track, true)).await {
                     Ok(res) => res,
                     Err(_) => Err(anyhow::anyhow!(
                         "prefetch of {chunk_id} from {node_addr} timed out after {}s",

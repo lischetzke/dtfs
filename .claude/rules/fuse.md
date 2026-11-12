@@ -423,7 +423,11 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   `join_pending` waiters before its disk-cache mirror put.
 - Per (fh, chunk) transition (`should_notify`): `record_cache_hit` at most
   once, bounded by `CACHE_HIT_NOTIFY_MAX_INFLIGHT` (8, skip when full);
-  `readahead.on_chunk_read` on every transition, hit or miss.
+  `readahead.on_chunk_read` on every transition, hit or miss. Both it and a foreground
+  GetChunk carry `scanner = report_as_scanner(bytes on the fh before this read)`
+  (< 1 MiB, per fh only, unlike `is_viewer_read`); data nodes skip the per-chunk read count
+  for `scanner = true`. Prefetch GetChunks are always `scanner = true`: the transition's
+  `record_cache_hit` carries the demand, so a chunk is not counted twice.
 - A disk-cache hit is also inserted into the readahead memory cache
   (`promote_disk_hit`); the readahead cache evicts oldest-inserted first and
   drains per entry (never `clear()` + `store(0)`). The prefetch candidate

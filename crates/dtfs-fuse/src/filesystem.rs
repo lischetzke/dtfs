@@ -250,6 +250,13 @@ pub(crate) fn tgid_from_status(status: &str) -> Option<u32> {
 /// actively prefetching for this mount (a scanner's stat+header access
 /// never drives sequential prefetch, so an active readahead engine is
 /// itself a viewer signal).
+/// Per-fh only (no mount-wide readahead term): scanner reads are reported to
+/// the data node as `scanner = true` and not counted as cache demand.
+/// `bytes_on_fh` is the fh total BEFORE the current read.
+pub(crate) fn report_as_scanner(bytes_on_fh: u64) -> bool {
+    bytes_on_fh < crate::local_cache::ATIME_UPDATE_MIN_BYTES as u64
+}
+
 pub(crate) fn is_viewer_read(bytes_on_fh: u64, readahead_active: bool) -> bool {
     bytes_on_fh >= crate::local_cache::ATIME_UPDATE_MIN_BYTES as u64 || readahead_active
 }
@@ -1491,9 +1498,11 @@ impl DtfsFilesystem {
         // decide the disk-cache viewer/scanner hint for every chunk this
         // call touches. No `.await` between the DashMap lookup and the
         // update (CO-3-12).
+        let mut report_scanner = true;
         let is_viewer = {
             match self.open_files.get_mut(&fh) {
                 Some(mut of) => {
+                    report_scanner = report_as_scanner(of.bytes_read_on_fh);
                     of.bytes_read_on_fh =
                         of.bytes_read_on_fh.saturating_add(actual_size as u64);
                     is_viewer_read(of.bytes_read_on_fh, self.readahead.is_active())
@@ -1695,7 +1704,7 @@ impl DtfsFilesystem {
                             tokio::spawn(async move {
                                 let _permit = permit;
                                 if let Err(e) = client
-                                    .record_cache_hit(&notify_addr, &chunk_id_clone)
+                                    .record_cache_hit(&notify_addr, &chunk_id_clone, report_scanner)
                                     .await
                                 {
                                     debug!(
@@ -1749,7 +1758,7 @@ impl DtfsFilesystem {
                                 // fetch it ourselves rather than failing
                                 // this read outright.
                                 let (_, d) = self
-                                    .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id, !untracked)
+                                    .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id, !untracked, report_scanner)
                                     .await?;
                                 d
                             }
@@ -1757,7 +1766,7 @@ impl DtfsFilesystem {
                     }
                     ForegroundFetchClaim::Owner(tx) => {
                         let fetch_result = self
-                            .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id, !untracked)
+                            .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id, !untracked, report_scanner)
                             .await;
                         let (node_addr, data) = match fetch_result {
                             Ok(v) => v,
@@ -3870,11 +3879,12 @@ impl DtfsFilesystem {
         candidates: &[String],
         chunk_id: &str,
         track: bool,
+        scanner: bool,
     ) -> Result<(String, bytes::Bytes)> {
         let fetch_timeout_secs = self.config.client.chunk_read_timeout_secs;
         let mut last_err: Option<anyhow::Error> = None;
         for cand in candidates {
-            let fetch = self.client.read_chunk_as(cand, chunk_id, track);
+            let fetch = self.client.read_chunk_as(cand, chunk_id, track, scanner);
             let result = if fetch_timeout_secs == 0 {
                 fetch.await
             } else {
@@ -4496,7 +4506,7 @@ impl DtfsFilesystem {
         }
         let candidates = self.read_candidates(chunk);
         let (_, existing) = self
-            .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id, true)
+            .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id, true, false)
             .await
             .with_context(|| format!("RMW seed read failed for {path} chunk {chunk_idx}"))?;
         let keep = seed_len_within_eof(existing.len(), chunk_idx * chunk_size, eof);
@@ -5535,6 +5545,20 @@ mod cr_6_6_should_notify_tests {
     fn a_new_chunk_index_notifies_again() {
         assert!(!should_notify(Some(3), 3));
         assert!(should_notify(Some(3), 4));
+    }
+}
+
+#[cfg(test)]
+mod report_as_scanner_tests {
+    use super::report_as_scanner;
+    use crate::local_cache::ATIME_UPDATE_MIN_BYTES;
+
+    #[test]
+    fn scanner_below_one_mib_viewer_at_or_above() {
+        assert!(report_as_scanner(0), "fresh fh (tail probe)");
+        assert!(report_as_scanner(128 * 1024), "header probe");
+        assert!(report_as_scanner(ATIME_UPDATE_MIN_BYTES as u64 - 1));
+        assert!(!report_as_scanner(ATIME_UPDATE_MIN_BYTES as u64));
     }
 }
 
@@ -8741,7 +8765,7 @@ mod async_commit_fs_tests {
         let (a, b) = ("127.0.0.1:1".to_string(), "127.0.0.1:2".to_string());
         let chunk1 = committed_chunk_info(1, &"d".repeat(64), 10, vec![a.clone(), b.clone()], "warm");
         assert_eq!(fs.read_candidates(&chunk1), [a.clone(), b.clone()]);
-        assert!(fs.fetch_chunk_from_candidates(&[a.clone()], &"c".repeat(64), true).await.is_err());
+        assert!(fs.fetch_chunk_from_candidates(&[a.clone()], &"c".repeat(64), true, false).await.is_err());
         assert_eq!(fs.read_candidates(&chunk1), [b.clone(), a.clone()], "dead replica still first");
         let now = Instant::now();
         let order = vec![a.clone(), b.clone()];

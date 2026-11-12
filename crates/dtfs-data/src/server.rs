@@ -716,7 +716,7 @@ impl DataService for DataServiceImpl {
             .unwrap_or_default()
             .as_millis() as u64;
         self.metrics
-            .record_chunk_read(&req.chunk_id, &req.requester_dc, now_ms);
+            .record_demand_read(&req.chunk_id, &req.requester_dc, now_ms, req.scanner);
 
         let verify_on_read = self.scrub_config.read().await.verify_on_read;
 
@@ -1070,7 +1070,7 @@ impl DataService for DataServiceImpl {
             .unwrap_or_default()
             .as_millis() as u64;
         self.metrics
-            .record_chunk_read(&req.chunk_id, &req.requester_dc, now_ms);
+            .record_demand_read(&req.chunk_id, &req.requester_dc, now_ms, req.scanner);
         // Bug AL — also count the read for the manager's
         // dashboard rate calculation. The bytes-served estimate
         // is unknown at this layer, so we report 0 bytes; the
@@ -1255,6 +1255,7 @@ max_io_percent = 10
             chunk_id: chunk_hex.to_string(),
             requester_dc: String::new(),
             requester_host: String::new(),
+            scanner: false,
         });
         attach_data_rpc_auth(
             &mut req,
@@ -1778,6 +1779,7 @@ max_io_percent = 10
                 chunk_id: chunk_hex.clone(),
                 requester_dc: String::new(),
                 requester_host: String::new(),
+                scanner: false,
             }))
             .await
             .expect_err("unauthenticated GetChunk must fail");
@@ -1852,6 +1854,7 @@ max_io_percent = 10
                 chunk_id: "00".repeat(32),
                 requester_dc: String::new(),
                 requester_host: String::new(),
+                scanner: false,
             }))
             .await
             .expect_err("unauthenticated RecordCacheHit must fail");
