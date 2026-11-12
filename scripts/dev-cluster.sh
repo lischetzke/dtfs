@@ -43,6 +43,8 @@ Usage: scripts/dev-cluster.sh <command>
   precache-check    pre-cache runtime check (volume media, Plex policy, toro FUSE
                     client, series E01 played): PASS/FAIL per criterion. Needs a
                     cluster built with DTFS_DEV_VERSION=v0.1.16 (else 409)
+  cache-check       cache retention/eviction/scanner check (~45 min): PASS/FAIL per
+                    criterion. Needs DTFS_DEV_VERSION=v0.1.16 DTFS_DEV_CACHE=1 up
   down              remove all dtfs-dev-* containers, network and volumes
 
 Topology: mgr01/02/03 (leli/toro/nrb), data01 leli cold, data02 toro warm,
@@ -53,6 +55,11 @@ DTFS_DEV_ASYNC_COMMIT=<secs> writes [write] async_commit = true with that
 async_commit_secs into the client configs (written by up; up --no-build to switch).
 DTFS_DEV_VERSION=<tag> stamps DTFS_VERSION into the build (v0.1.16 opens the
 pre-caching version gate; unset = v0.0.0-dev).
+DTFS_DEV_CACHE=1 (with up) sets 20 s tiering evaluation and 60/50 cache watermarks,
+makes data02's /mnt/d0 a 512 MiB tmpfs volume (placement min_free_bytes 1 MiB: the 1 GiB
+default headroom would exclude it) and writes nfs-toro.toml/fuse-bulk.toml.
+tmpfs content is lost when data02 restarts (deploy), so cache mode needs a fresh
+down + up.
 DTFS_DEV_RUST_LOG (default info) sets RUST_LOG for the FUSE/NFS client containers.
 No systemd, journald or sshd in the containers: MCP host_* tools and Ansible
 do not apply.
@@ -109,7 +116,11 @@ mode = "disabled"
 anchor_datacenter = "leli"
 [tiering]
 precache_max_mbps = 200
+$([ "${DTFS_DEV_CACHE:-}" = 1 ] && printf 'evaluation_interval_secs = 20\ncache_high_watermark_pct = 60\ncache_low_watermark_pct = 50\n')
 [monitoring]
+$([ "${DTFS_DEV_CACHE:-}" = 1 ] && printf '[placement]
+min_free_bytes = 1048576
+')
 EOF
 }
 
@@ -136,16 +147,20 @@ mode = "disabled"
 path = "/mnt/d0"
 tier = "$(data_tier $n)"
 [scrub]
+$([ "${DTFS_DEV_CACHE:-}" = 1 ] && printf '[placement]
+min_free_bytes = 1048576
+')
 EOF
 }
 
-fuse_cfg() { # fuse_cfg <host> <allow_other> [dc] [volume_id]
+fuse_cfg() { # fuse_cfg <host> <allow_other> [dc] [volume_id] [chunk_size_mb]
   cat <<EOF
 [client]
 manager_addr = "mgr01:9401"
 manager_addrs = ["mgr02:9401", "mgr03:9401"]
 shared_secret = "$SECRET"
 $([ -n "${4:-}" ] && echo "volume_id = \"$4\"")
+$([ -n "${5:-}" ] && echo "chunk_size_mb = $5")
 [location]
 region = "dev"
 datacenter = "${3:-leli}"
@@ -170,6 +185,17 @@ write_configs() {
   fuse_cfg fuse01_cln false | put_cfg fuse.toml
   fuse_cfg nfs01_cln true | put_cfg nfs.toml
   fuse_cfg fuse02_cln false toro media | put_cfg fuse-toro.toml
+  if [ "${DTFS_DEV_CACHE:-}" = 1 ]; then
+    fuse_cfg nfs02_cln true toro wan | put_cfg nfs-toro.toml
+    fuse_cfg fuse03_cln false leli bulk 1 | put_cfg fuse-bulk.toml
+  fi
+}
+
+# cache mode: data02's disk is a 512 MiB tmpfs so the watermarks are reachable
+ensure_cache_vol() {
+  [ "${DTFS_DEV_CACHE:-}" = 1 ] || return 0
+  docker volume inspect dtfs-dev-data02-d0 >/dev/null 2>&1 && return 0
+  docker volume create --driver local --opt type=tmpfs --opt device=tmpfs --opt o=size=512m dtfs-dev-data02-d0 >/dev/null
 }
 
 ensure_net() {
@@ -216,7 +242,7 @@ cmd_up() {
   local nb=0; [ "${1:-}" = --no-build ] && nb=1
   docker image inspect "$IMG" >/dev/null 2>&1 || die "image $IMG missing (see CLAUDE.md A.4)"
   if [ $nb = 0 ]; then build; fi
-  copy_bins; write_configs; start_all; wait_healthy
+  copy_bins; write_configs; ensure_cache_vol; start_all; wait_healthy
   log "REST: mgr01 http://127.0.0.1:29402 mgr02 :29412 mgr03 :29422"
 }
 
@@ -483,6 +509,246 @@ cmd_precache_check() {
   docker exec -i -e DTFS_SECRET="$SECRET" dtfs-dev-fuse-toro python3 -c "$PRECACHE_PY" check
 }
 
+CACHE_PY='
+import json, os, sys, time, urllib.request, urllib.error
+rc = 0
+def ck(ok, msg):
+    global rc
+    print(("PASS: " if ok else "FAIL: ") + msg, flush=True)
+    if not ok: rc = 1
+def http(base, method, path, body=None):
+    req = urllib.request.Request(base + path, method=method, data=None if body is None else json.dumps(body).encode(),
+                                 headers={"content-type": "application/json", "X-Dtfs-Shared-Secret": os.environ["DTFS_SECRET"]})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r: return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try: return e.code, json.loads(e.read() or b"{}")
+        except ValueError: return e.code, {}
+def find_leader():
+    for m in ("mgr01", "mgr02", "mgr03"):
+        base = "http://%s:9402" % m
+        try:
+            if http(base, "GET", "/api/v1/tiering/precache")[0] == 200: return base
+        except OSError: pass
+    return None
+def now(): return time.strftime("%H:%M:%S")
+cmd = sys.argv[1]; args = sys.argv[2:]
+if cmd == "leader":
+    l = find_leader(); print(l.split("//")[1].split(":")[0] if l else ""); sys.exit(0 if l else 1)
+if cmd == "healthy":
+    t0 = time.time()
+    while time.time() - t0 < 300:
+        l = find_leader()
+        if l:
+            try: st = http(l, "GET", "/api/v1/cluster/status")[1]
+            except OSError: st = {}
+            if "\"data_nodes_healthy\":3" in json.dumps(st, separators=(",", ":")):
+                print("LEADER=%s ELECT_SECS=%d" % (l.split("//")[1].split(":")[0], time.time() - t0)); sys.exit(0)
+        time.sleep(2)
+    print("FAIL: no leader with 3 healthy data nodes within 300 s"); sys.exit(1)
+leader = find_leader()
+if not leader: print("FAIL: no leader answered /api/v1/tiering/precache"); sys.exit(1)
+def post(path, body):
+    st, r = http(leader, "POST", path, body)
+    for _ in range(12):   # the version gate opens once every manager has registered its version after a fresh up
+        if st != 409: break
+        time.sleep(10); st, r = http(leader, "POST", path, body)
+    if st == 409: print("FAIL: %s -> 409 %s (wrong build: rebuild with DTFS_DEV_VERSION=v0.1.16)" % (path, r)); sys.exit(1)
+    if st != 200: print("FAIL: %s -> %s %s" % (path, st, r)); sys.exit(1)
+if cmd == "setup":
+    if http(leader, "GET", "/api/v1/volumes/wan")[0] != 200:
+        post("/api/v1/volumes", {"name": "wan", "chunk_size_mb": 4, "anchor_datacenter": "leli"})
+    post("/api/v1/volumes/wan/set-mandatory", {"hot_replicas": 0, "warm_replicas": 0, "cold_replicas": 1})
+    post("/api/v1/volumes/wan/set-anchor", {"datacenter": "leli", "required_tier": "cold"})
+    post("/api/v1/volumes/wan/set-cache", {"warm_min": 1, "warm_max": 1, "per_dc": True, "promote_reads": 1, "promote_window_secs": 60, "retention_secs": 1200})
+    if http(leader, "GET", "/api/v1/volumes/bulk")[0] != 200:
+        post("/api/v1/volumes", {"name": "bulk", "chunk_size_mb": 1, "anchor_datacenter": "leli"})
+    post("/api/v1/volumes/bulk/set-mandatory", {"hot_replicas": 0, "warm_replicas": 0, "cold_replicas": 1})
+    post("/api/v1/volumes/bulk/set-anchor", {"datacenter": "leli", "required_tier": "cold"})
+    print("volumes wan and bulk configured"); sys.exit(0)
+def rows(path):
+    hosts = {n["node_id"]: n["hostname"] for n in http(leader, "GET", "/api/v1/nodes")[1] if n.get("role", "").lower() == "data"}
+    st, r = http(leader, "GET", "/api/v1/files/inspect?path=" + urllib.request.quote(path))
+    if st != 200: return None
+    return [{hosts.get(x["node_id"], x["node_id"]) for x in c["replicas"]} for c in r["chunks"]]
+def cnt(path):
+    r = rows(path) or []
+    return sum("data02" in c for c in r[1:]), max(len(r) - 1, 0)
+if cmd == "promo":   # promo <path> <timeout_s>: chunks 1..N all on data02
+    p = args[0]; end = time.time() + int(args[1]); r = None
+    while time.time() < end:
+        r = rows(p)
+        if r:
+            n = sum("data02" in c for c in r[1:]); print("  %s %s promoted %d/%d (chunk0 on data02: %s)" % (now(), p, n, len(r) - 1, "data02" in r[0]), flush=True)
+            if n == len(r) - 1 and len(r) > 1: break
+        time.sleep(10)
+    ok = bool(r) and len(r) > 1 and all("data02" in c for c in r[1:])
+    ck(ok, "%s: chunks 1..%d have a data02 row" % (p, len(r) - 1 if r else -1))
+    if ok: print("TA=%d" % time.time()); print("INFO: %s chunk 0 (scanner read) promoted: %s" % (p, "data02" in r[0]))
+    sys.exit(rc)
+if cmd == "none":    # none <paths...>: no data02 row on any chunk
+    for p in args:
+        r = rows(p); ck(bool(r) and not any("data02" in c for c in r), "%s: no data02 row on any chunk (%s)" % (p, [i for i, c in enumerate(r or []) if "data02" in c]))
+    sys.exit(rc)
+if cmd == "present": # present <path>: chunks 1..N all still on data02
+    p = args[0]; r = rows(p) or []
+    ck(len(r) > 1 and all("data02" in c for c in r[1:]), "%s: all promoted chunks still on data02 (%d/%d)" % (p, cnt(p)[0], cnt(p)[1]))
+    sys.exit(rc)
+if cmd == "anchors": # anchors <paths...>: every chunk has data01
+    for p in args:
+        r = rows(p) or []; ck(len(r) > 0 and all("data01" in c for c in r), "%s: every chunk has its data01 row (%d chunks)" % (p, len(r)))
+    sys.exit(rc)
+if cmd == "cnt":
+    b, c = cnt(args[0]), cnt(args[1]); print("COUNTS %d %d %d %d" % (b + c)); sys.exit(0)
+if cmd == "retention": # retention <path> <ta_epoch>
+    p = args[0]; ta = int(args[1]); deadline = ta + 2400; td = None
+    while time.time() < deadline:
+        r = rows(p) or []
+        if len(r) > 2:
+            mid = sum("data02" in c for c in r[1:-1]); last = "data02" in r[-1]
+            print("  %s +%.1f min: middle chunks on data02 %d/%d, last chunk on data02 %s" % (now(), (time.time() - ta) / 60, mid, len(r) - 2, last), flush=True)
+            if mid == 0: td = time.time(); break
+        time.sleep(30)
+    if td is None: ck(False, "middle chunks of %s never lost their data02 row by tA+40 min" % p); sys.exit(1)
+    m = (td - ta) / 60
+    ck(20 <= m <= 31, "tD = tA+%.1f min, within [tA+20, tA+31] (retention honoured, node-local path)" % m)
+    last = "data02" in (rows(p) or [{"data02"}])[-1]
+    if last:
+        time.sleep(30); last = "data02" in (rows(p) or [{"data02"}])[-1]
+    ck(not last, "last chunk of %s lost its data02 row within one poll of the middle chunks (tA+11 scan did not refresh it)" % p)
+    sys.exit(rc)
+print("unknown command " + cmd); sys.exit(2)
+'
+
+cmd_cache_check() {
+  set +e
+  local LOG RC=0 TA t T0=$SECONDS
+  LOG="$(mktemp)"
+  tlog() { echo "[$(date +%H:%M:%S)] $*"; }
+  # py <args>: run a CACHE_PY stage in nfs-toro, tee to $LOG, RC=1 on non-zero exit
+  py() { docker exec -i -e DTFS_SECRET="$SECRET" dtfs-dev-nfs-toro python3 -c "$CACHE_PY" "$@" | tee -a "$LOG"; [ "${PIPESTATUS[0]}" = 0 ] || RC=1; }
+  sleep_until() { local d=$(( $1 - $(date +%s) )); [ $d -gt 0 ] && { tlog "waiting ${d}s until $2"; sleep $d; }; return 0; }
+  nfsx() { docker exec dtfs-dev-nfs-toro sh -c "$1"; }
+
+  running dtfs-dev-mgr01 || die "cluster not up (run: DTFS_DEV_VERSION=v0.1.16 DTFS_DEV_CACHE=1 up)"
+  docker exec dtfs-dev-data02 df -T /mnt/d0 | grep -q tmpfs || die "data02 /mnt/d0 is not tmpfs: needs DTFS_DEV_CACHE=1 on a fresh down + up"
+
+  tlog "setup: volumes wan and bulk"
+  docker run --rm -i --network $NET -e DTFS_SECRET="$SECRET" "$IMG" python3 -c "$CACHE_PY" setup || { fail "volume setup"; exit 1; }
+
+  tlog "starting fuse-bulk and writing bulk.bin (10.5 GiB, urandom: zeros would dedupe to one chunk) in the background"
+  exists dtfs-dev-fuse-bulk && docker rm -f dtfs-dev-fuse-bulk >/dev/null
+  start_client fuse-bulk fuse-bulk.toml 0
+  docker exec dtfs-dev-fuse-bulk dd if=/dev/urandom of=/mnt/dtfs/bulk.bin bs=1M count=10752 iflag=fullblock conv=fsync 2>/dev/null &
+  local BULKPID=$!
+  sleep 10; kill -0 $BULKPID 2>/dev/null || { wait $BULKPID; fail "bulk.bin write died early (dd exit $?; see docker logs dtfs-dev-fuse-bulk)"; exit 1; }
+
+  # nfs_up: fresh nfs-toro container with the NFS server, export and mount
+  nfs_up() {
+    exists dtfs-dev-nfs-toro && docker rm -f dtfs-dev-nfs-toro >/dev/null
+    start_client nfs-toro nfs-toro.toml 1
+    tlog "installing nfs packages in dtfs-dev-nfs-toro"
+    docker exec dtfs-dev-nfs-toro sh -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-kernel-server nfs-common >/dev/null'       || { fail "apt install nfs packages"; exit 1; }
+    nfsx 'mount -t nfsd nfsd /proc/fs/nfsd 2>/dev/null; rpcbind; sleep 1
+      echo "/mnt/dtfs *(rw,sync,no_subtree_check,no_root_squash,fsid=4242)" > /etc/exports
+      exportfs -ra && rpc.mountd && rpc.nfsd 4 && mkdir -p /mnt/nfs &&
+      mount -t nfs -o vers=3,nolock,actimeo=0 127.0.0.1:/mnt/dtfs /mnt/nfs' || { fail "nfs server/mount in nfs-toro"; exit 1; }
+  }
+  nfs_up
+  # knfsd holds the FUSE mount while exported: never leave it exported on an early exit
+  trap 'docker exec dtfs-dev-nfs-toro sh -c "umount /mnt/nfs; exportfs -ua; exportfs -f; rpc.nfsd 0" >/dev/null 2>&1' EXIT
+  tlog "writing A (64 MiB), B (128 MiB), C (64 MiB) via NFS"
+  nfsx 'mkdir -p /mnt/nfs/wan-check && cd /mnt/nfs/wan-check &&
+    dd if=/dev/urandom of=A bs=1M count=64 conv=fsync 2>/dev/null && dd if=/dev/urandom of=B bs=1M count=128 conv=fsync 2>/dev/null &&
+    dd if=/dev/urandom of=C bs=1M count=64 conv=fsync 2>/dev/null' || { fail "writing A/B/C via NFS"; exit 1; }
+  # fresh client: the writes warmed its local cache, so reads below would never reach the data nodes
+  tlog "restarting nfs-toro for a cold client cache"
+  nfsx 'umount /mnt/nfs; exportfs -ua; exportfs -f; rpc.nfsd 0'
+  nfs_up
+  local P=/wan-check D=/mnt/nfs/wan-check
+
+  tlog "stage 1: viewer read of A"
+  nfsx "echo 3 > /proc/sys/vm/drop_caches; dd if=$D/A of=/dev/null bs=1M 2>/dev/null" || { fail "viewer read of A"; exit 1; }
+  py promo $P/A 300
+  TA="$(grep '^TA=' "$LOG" | tail -1 | cut -d= -f2)"
+  [ -n "$TA" ] || { fail "A never promoted: cannot run the timeline"; exit 1; }
+  tlog "tA = $TA ($(date -d @$TA +%H:%M:%S 2>/dev/null))"
+  tlog "stage 1: scanner passes over B and C"
+  for t in 1 2 3; do
+    nfsx "echo 3 > /proc/sys/vm/drop_caches; for f in B C; do head -c 131072 $D/\$f >/dev/null; tail -c 131072 $D/\$f >/dev/null; done"
+    sleep 5
+  done
+  sleep 90
+  py none $P/B $P/C
+
+  sleep_until $((TA + 660)) "tA+11 min (scan of A)"
+  nfsx "echo 3 > /proc/sys/vm/drop_caches; head -c 131072 $D/A >/dev/null; tail -c 131072 $D/A >/dev/null"
+  tlog "scanned A header and tail"
+
+  sleep_until $((TA + 720)) "tA+12 min (bulk read + leader restart)"
+  wait $BULKPID || { fail "bulk.bin write (dd exit $?)"; exit 1; }
+  tlog "reading bulk.bin via fuse-bulk (10.5k distinct 1 MiB chunks)"
+  docker exec dtfs-dev-fuse-bulk dd if=/mnt/dtfs/bulk.bin of=/dev/null bs=1M 2>&1 | tail -1
+  [ "${PIPESTATUS[0]}" = 0 ] || { fail "bulk.bin read"; RC=1; }
+  local OLD; OLD="$(docker exec -e DTFS_SECRET="$SECRET" dtfs-dev-nfs-toro python3 -c "$CACHE_PY" leader)"
+  [ -n "$OLD" ] || { fail "no leader to restart"; exit 1; }
+  tlog "restarting leader $OLD"
+  docker restart dtfs-dev-$OLD >/dev/null
+  py healthy
+  tlog "new leader and election time above (restarted $OLD)"
+
+  sleep_until $((TA + 900)) "tA+15 min"
+  py present $P/A
+
+  tlog "stage 3: waiting for retention demotion of A (up to tA+40 min)"
+  py retention $P/A "$TA"
+  py anchors $P/A
+
+  tlog "stage 4: eviction"
+  nfsx "echo 3 > /proc/sys/vm/drop_caches; dd if=$D/B of=/dev/null bs=1M 2>/dev/null"
+  py promo $P/B 300
+  sleep 60
+  nfsx "echo 3 > /proc/sys/vm/drop_caches; dd if=$D/C of=/dev/null bs=1M 2>/dev/null"
+  py promo $P/C 300
+  set -- $(py cnt $P/B $P/C | grep '^COUNTS' | cut -d' ' -f2-)
+  local B0=$1 BT=$2 C0=$3 CT=$4 SZ USED NEED
+  tlog "baseline promoted chunks: B $B0/$BT C $C0/$CT"
+  read -r SZ USED < <(docker exec dtfs-dev-data02 df -B1 --output=size,used /mnt/d0 | tail -1)
+  NEED=$(( SZ * 62 / 100 - USED ))
+  tlog "data02 tmpfs size $SZ used $USED; junk bytes to reach 62%: $NEED"
+  if [ $NEED -le 0 ]; then fail "usage already above 62% before the junk file"; exit 1; fi
+  docker exec dtfs-dev-data02 dd if=/dev/zero of=/mnt/d0/junk bs=1M count=$(( NEED / 1048576 )) 2>/dev/null
+  local i B1 C1 PCT BELOW=0 MINPCT=100
+  for i in $(seq 1 20); do
+    read -r _ USED < <(docker exec dtfs-dev-data02 df -B1 --output=size,used /mnt/d0 | tail -1)
+    PCT=$(( USED * 100 / SZ ))
+    set -- $(py cnt $P/B $P/C | grep '^COUNTS' | cut -d' ' -f2-); B1=$1; C1=$3
+    tlog "usage ${PCT}% ($USED bytes) B $B1/$BT C $C1/$CT"
+    [ $PCT -lt 60 ] && { BELOW=1; break; }
+    sleep 15
+  done
+  if [ $BELOW = 1 ]; then pass "usage dropped below 60% (high watermark)"; else fail "usage still ${PCT}% after 5 min"; fi
+  if [ $BELOW = 1 ]; then
+    sleep 75   # let the eviction round settle
+    read -r _ USED < <(docker exec dtfs-dev-data02 df -B1 --output=size,used /mnt/d0 | tail -1)
+    PCT=$(( USED * 100 / SZ ))
+    set -- $(py cnt $P/B $P/C | grep '^COUNTS' | cut -d' ' -f2-); B1=$1; C1=$3
+    tlog "settled: usage ${PCT}% B $B1/$BT C $C1/$CT"
+    [ $PCT -ge 45 ] && pass "usage settled at ${PCT}% (>= 45%, no gross over-eviction)" || fail "usage settled at ${PCT}% (< 45%: over-eviction)"
+  fi
+  [ "$C1" = "$C0" ] && pass "C data02 rows all intact ($C1/$C0)" || fail "C lost data02 rows ($C1/$C0)"
+  [ "$B1" -lt "$B0" ] && pass "B lost data02 rows ($B1/$B0): oldest-read evicted first" || fail "B lost no data02 rows ($B1/$B0)"
+  py anchors $P/A $P/B $P/C
+
+  tlog "cleanup"
+  docker exec dtfs-dev-data02 rm -f /mnt/d0/junk
+  # knfsd holds the FUSE mount while exported: a later docker rm -f leaves a zombie.
+  nfsx 'umount /mnt/nfs; exportfs -ua; exportfs -f; rpc.nfsd 0'
+  grep -c '^FAIL' "$LOG" | grep -qx 0 || RC=1
+  tlog "cache-check finished in $(( (SECONDS - T0) / 60 )) min: $(grep -c '^PASS' "$LOG") PASS, $(grep -c '^FAIL' "$LOG") FAIL"
+  exit $RC
+}
+
 cmd_down() {
   local c; c="$(docker ps -aq --filter name=dtfs-dev-)"
   # shellcheck disable=SC2086
@@ -503,6 +769,7 @@ case "${1:-}" in
   empty-files) cmd_empty_files;;
   big-file) shift; cmd_big_file "$@";;
   precache-check) cmd_precache_check;;
+  cache-check) cmd_cache_check;;
   down) cmd_down;;
   -h|--help|help|"") usage;;
   *) usage >&2; exit 2;;
