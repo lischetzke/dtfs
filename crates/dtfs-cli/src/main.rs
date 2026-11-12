@@ -284,6 +284,10 @@ enum VolumesCmd {
         /// (seconds). Engine-driven idle demote clears this.
         #[arg(long)]
         cooldown_secs: Option<u64>,
+        /// Seconds without a read before a cache copy is demoted
+        /// (0 = promote_window_secs; non-zero needs every manager on v0.1.16).
+        #[arg(long)]
+        retention_secs: Option<u64>,
     },
     /// Set the volume's predictive pre-caching policy (needs every manager
     /// on v0.1.16 or later). Omitted flags keep the current value.
@@ -312,6 +316,10 @@ enum VolumesCmd {
         /// Remove every pin.
         #[arg(long)]
         clear_pins: bool,
+        /// Seconds a played file stays a pre-cache cursor after its last read
+        /// (0 = the volume's promote_window_secs).
+        #[arg(long)]
+        cursor_ttl_secs: Option<u64>,
     },
     /// Bug AV (AV-4-1a) — set or update the volume's
     /// `mandatory_replicas` (durability floor enforced by the
@@ -796,21 +804,23 @@ async fn main() -> anyhow::Result<()> {
             VolumesCmd::SetCache {
                 volume_id,
                 warm_min, warm_max, hot_min, hot_max,
-                per_dc, promote_reads, promote_window_secs, cooldown_secs,
+                per_dc, promote_reads, promote_window_secs, cooldown_secs, retention_secs,
             } => {
                 cmd_volumes_set_cache(
                     &api, &args.format, &volume_id,
                     warm_min, warm_max, hot_min, hot_max,
-                    per_dc, promote_reads, promote_window_secs, cooldown_secs,
+                    per_dc, promote_reads, promote_window_secs, cooldown_secs, retention_secs,
                 ).await?
             }
             VolumesCmd::SetPrecache {
                 volume_id, mode, next_files, next_max_gb, series_max_gb, max_series, pins, clear_pins,
+                cursor_ttl_secs,
             } => {
-                cmd_volumes_set_precache(
-                    &api, &args.format, &volume_id,
-                    set_precache_body(mode.as_deref(), next_files, next_max_gb, series_max_gb, max_series, &pins, clear_pins)?,
-                ).await?
+                let mut body = set_precache_body(mode.as_deref(), next_files, next_max_gb, series_max_gb, max_series, &pins, clear_pins)?;
+                if let Some(v) = cursor_ttl_secs {
+                    body["cursor_ttl_secs"] = v.into();
+                }
+                cmd_volumes_set_precache(&api, &args.format, &volume_id, body).await?
             }
             VolumesCmd::SetMandatory {
                 volume_id,
@@ -1218,6 +1228,7 @@ async fn cmd_volumes_show(
             println!("  promote_reads:        {}", c["promote_reads"].as_u64().unwrap_or(2));
             println!("  promote_window_secs:  {}", c["promote_window_secs"].as_u64().unwrap_or(14_400));
             println!("  cooldown_secs:        {}", c["cooldown_secs"].as_u64().unwrap_or(300));
+            println!("  retention_secs:       {} (effective {})", c["retention_secs"].as_u64().unwrap_or(0), c["effective_retention_secs"].as_u64().unwrap_or(0));
             if v["anchor"].is_null() {
                 println!("Anchor:  (none)");
             } else {
@@ -1336,6 +1347,7 @@ async fn cmd_volumes_set_cache(
     promote_reads: Option<u32>,
     promote_window_secs: Option<u64>,
     cooldown_secs: Option<u64>,
+    retention_secs: Option<u64>,
 ) -> anyhow::Result<()> {
     let mut body = serde_json::Map::new();
     if let Some(v) = warm_min { body.insert("warm_min".into(), v.into()); }
@@ -1349,6 +1361,8 @@ async fn cmd_volumes_set_cache(
         { body.insert("promote_window_secs".into(), v.into()); }
     if let Some(v) = cooldown_secs
         { body.insert("cooldown_secs".into(), v.into()); }
+    if let Some(v) = retention_secs
+        { body.insert("retention_secs".into(), v.into()); }
     let body = serde_json::Value::Object(body);
 
     let url = format!("/api/v1/volumes/{}/set-cache", volume_id);
@@ -1377,6 +1391,7 @@ async fn cmd_volumes_set_cache(
             println!("  promote_reads:        {}", c["promote_reads"].as_u64().unwrap_or(2));
             println!("  promote_window_secs:  {}", c["promote_window_secs"].as_u64().unwrap_or(14_400));
             println!("  cooldown_secs:        {}", c["cooldown_secs"].as_u64().unwrap_or(300));
+            println!("  retention_secs:       {} (effective {})", c["retention_secs"].as_u64().unwrap_or(0), c["effective_retention_secs"].as_u64().unwrap_or(0));
         }
     }
     Ok(())
@@ -1437,6 +1452,7 @@ async fn cmd_volumes_set_precache(
             println!("  next_max_gb:    {}", c["next_max_gb"].as_u64().unwrap_or(0));
             println!("  series_max_gb:  {}", c["series_max_gb"].as_u64().unwrap_or(0));
             println!("  max_series:     {}", c["max_series"].as_u64().unwrap_or(0));
+            println!("  cursor_ttl_secs: {} (effective {})", c["cursor_ttl_secs"].as_u64().unwrap_or(0), c["effective_cursor_ttl_secs"].as_u64().unwrap_or(0));
             for p in c["pins"].as_array().into_iter().flatten() {
                 println!("  pin:            {}@{}", p["prefix"].as_str().unwrap_or(""), p["datacenter"].as_str().unwrap_or(""));
             }

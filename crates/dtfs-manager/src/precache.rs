@@ -368,8 +368,9 @@ pub(crate) struct PrecachePlan {
     pub status: PrecacheStatus,
 }
 
+/// A played file stays a cursor for the volume's `effective_cursor_ttl_secs`.
 fn within_window(now_ms: u64, last_read_ms: u64, vol: &VolumeConfig) -> bool {
-    now_ms.saturating_sub(last_read_ms) <= vol.cache_replicas.promote_window_secs.saturating_mul(1000)
+    now_ms.saturating_sub(last_read_ms) <= vol.precache.effective_cursor_ttl_secs(&vol.cache_replicas).saturating_mul(1000)
 }
 
 fn dir_of(path: &str) -> &str {
@@ -1466,6 +1467,27 @@ mod planner_tests {
         assert!(p.copies.iter().all(|c| c.target_node == 2 && c.tier == DiskTier::Warm && c.source_node == 1));
     }
 
+    /// A played file is a cursor for exactly `cursor_ttl_secs` after its last
+    /// read, not for the (longer) promote window.
+    #[test]
+    fn cursor_ttl_bounds_cursor_activity() {
+        let mut w = show5();
+        w.vol().precache.cursor_ttl_secs = 600;
+        w.vol().cache_replicas.promote_window_secs = 900;
+        let plan_at = |w: &W, last_read_ms: u64| {
+            let mut snap = PrecacheSnapshot::default();
+            let a = FileActivity { last_read_ms, chunk_ids: [format!("{S1}/E01.mkv#20")].into_iter().collect(), overflow: false };
+            snap.activity.insert((format!("{S1}/E01.mkv"), "toro".to_string()), a);
+            plan_precache(&w.sm, &snap, NOW, &cfg(), 0)
+        };
+        assert!(!plan_at(&w, NOW - 600_000).copies.is_empty(), "active at exactly the ttl");
+        assert!(plan_at(&w, NOW - 600_001).copies.is_empty(), "expired 1 ms past the ttl");
+        // 0 falls back to promote_window_secs.
+        w.vol().precache.cursor_ttl_secs = 0;
+        assert!(!plan_at(&w, NOW - 600_001).copies.is_empty());
+        assert!(plan_at(&w, NOW - 900_001).copies.is_empty());
+    }
+
     #[test]
     fn plex_playback_order_crosses_seasons_naturally() {
         let mut w = world();
@@ -2110,6 +2132,7 @@ mod engine_tests {
             chunk_id: chunk.into(),
             chunk_index: 0,
             file_path: "/f".into(),
+            volume_id: "v".into(),
             node_id: node,
             disk_id: disk,
             tier: DiskTier::Warm,

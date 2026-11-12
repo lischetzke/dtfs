@@ -422,6 +422,11 @@ pub struct CacheReplication {
     /// Default 300 (= 5 minutes).
     #[serde(default = "CacheReplication::default_cooldown_secs")]
     pub cooldown_secs: u64,
+
+    /// Seconds without a read before a cache copy is demoted (v0.1.16).
+    /// 0 = `promote_window_secs`; see `effective_retention_secs`.
+    #[serde(default)]
+    pub retention_secs: u64,
 }
 
 impl CacheReplication {
@@ -429,6 +434,11 @@ impl CacheReplication {
     fn default_promote_reads()     -> u32  { 2 }
     fn default_promote_window_secs() -> u64 { 4 * 3600 }
     fn default_cooldown_secs()     -> u64  { 5 * 60 }
+
+    /// Idle time before demotion: `retention_secs`, or `promote_window_secs` when 0.
+    pub fn effective_retention_secs(&self) -> u64 {
+        if self.retention_secs > 0 { self.retention_secs } else { self.promote_window_secs }
+    }
 
     /// Per-tier accessor mirroring `TierReplication::for_tier`.
     pub fn for_tier(&self, tier: DiskTier) -> &CacheTierConfig {
@@ -617,6 +627,10 @@ pub struct PrecachePolicy {
     /// Operator-pinned subtrees kept pre-cached in a DC whatever the mode.
     #[serde(default)]
     pub pins: Vec<PrecachePin>,
+    /// Seconds a played file stays a pre-cache cursor after its last read
+    /// (v0.1.16). 0 = the volume's `promote_window_secs`.
+    #[serde(default)]
+    pub cursor_ttl_secs: u64,
 }
 
 /// Subtree `prefix` pinned to the cache of datacenter `datacenter`.
@@ -633,6 +647,11 @@ impl PrecachePolicy {
     fn default_next_files() -> u32 { 2 }
     fn default_series_max_gb() -> u32 { 20 }
     fn default_max_series() -> u32 { 3 }
+
+    /// Cursor lifetime: `cursor_ttl_secs`, or `cache.promote_window_secs` when 0.
+    pub fn effective_cursor_ttl_secs(&self, cache: &CacheReplication) -> u64 {
+        if self.cursor_ttl_secs > 0 { self.cursor_ttl_secs } else { cache.promote_window_secs }
+    }
 
     /// Reject a policy that cannot work with the volume's tier policy.
     /// `off` is always valid.
@@ -686,6 +705,7 @@ impl Default for PrecachePolicy {
             series_max_gb: Self::default_series_max_gb(),
             max_series: Self::default_max_series(),
             pins: Vec::new(),
+            cursor_ttl_secs: 0,
         }
     }
 }
@@ -1179,10 +1199,27 @@ mod bug_av_types_tests {
             promote_reads: 5,
             promote_window_secs: 7200,
             cooldown_secs: 600,
+            retention_secs: 1_209_600,
         };
         let toml_str = toml::to_string(&original).unwrap();
         let round_tripped: CacheReplication = toml::from_str(&toml_str).unwrap();
         assert_eq!(round_tripped, original);
+    }
+
+    /// 0 falls back to `promote_window_secs`; a set value wins. An old
+    /// volume JSON without the fields loads as 0.
+    #[test]
+    fn retention_and_cursor_ttl_resolve_to_promote_window_when_unset() {
+        let mut c = CacheReplication { promote_window_secs: 14_400, ..Default::default() };
+        let mut p = PrecachePolicy::default();
+        assert_eq!((c.effective_retention_secs(), p.effective_cursor_ttl_secs(&c)), (14_400, 14_400));
+        c.retention_secs = 1_209_600;
+        p.cursor_ttl_secs = 86_400;
+        assert_eq!((c.effective_retention_secs(), p.effective_cursor_ttl_secs(&c)), (1_209_600, 86_400));
+        let old: CacheReplication = serde_json::from_str(r#"{"promote_window_secs":60}"#).unwrap();
+        let old_p: PrecachePolicy = serde_json::from_str(r#"{"mode":"plex"}"#).unwrap();
+        assert_eq!((old.retention_secs, old_p.cursor_ttl_secs), (0, 0));
+        assert_eq!(old_p.effective_cursor_ttl_secs(&old), 60);
     }
 
     /// AV-1-1 test 5 — the `validate()` helper rejects `max < min`.

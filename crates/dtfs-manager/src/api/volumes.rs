@@ -208,6 +208,36 @@ fn volume_cas_check(
     Ok(())
 }
 
+/// A volume carrying a non-zero `retention_secs` / `cursor_ttl_secs` is
+/// proposed only while every manager is on v0.1.16: an older applier drops the
+/// unknown fields and its state diverges. Checked before EVERY `UpsertVolume`
+/// with a full config, not only where the fields change.
+pub(crate) fn volume_fields_gate(
+    gate_open: bool,
+    cfg: &dtfs_common::types::VolumeConfig,
+) -> Result<(), (axum::http::StatusCode, Json<Value>)> {
+    if gate_open || (cfg.cache_replicas.retention_secs == 0 && cfg.precache.cursor_ttl_secs == 0) {
+        return Ok(());
+    }
+    warn!(volume = %cfg.id, "volume upsert refused: retention_secs / cursor_ttl_secs need every manager on v0.1.16");
+    Err((
+        axum::http::StatusCode::CONFLICT,
+        Json(json!({
+            "error": "retention_secs and cursor_ttl_secs need every manager on v0.1.16 or later",
+            "min_version": "v0.1.16",
+        })),
+    ))
+}
+
+/// `volume_fields_gate` against the current state.
+async fn check_volume_fields_gate(
+    state: &AppState,
+    cfg: &dtfs_common::types::VolumeConfig,
+) -> Result<(), (axum::http::StatusCode, Json<Value>)> {
+    let open = dtfs_raft::state_machine::cluster_on_v0_1_16(&*state.sm_data.read().await);
+    volume_fields_gate(open, cfg)
+}
+
 // ---------------------------------------------------------------------------
 // Bug AV (AV-1-10) — POST /api/v1/volumes/{id}/migrate-policy
 // ---------------------------------------------------------------------------
@@ -242,6 +272,7 @@ pub(super) async fn migrate_volume_policy_endpoint(
     let changed = current != migrated;
 
     if changed {
+        check_volume_fields_gate(&state, &migrated).await?;
         let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: migrated.clone(), expected_version: Some(current.version) };
         let resp = match state.raft.client_write(req).await {
             Ok(r) => r,
@@ -352,6 +383,8 @@ pub(crate) fn volume_config_to_json(
             "promote_reads": cfg.cache_replicas.promote_reads,
             "promote_window_secs": cfg.cache_replicas.promote_window_secs,
             "cooldown_secs": cfg.cache_replicas.cooldown_secs,
+            "retention_secs": cfg.cache_replicas.retention_secs,
+            "effective_retention_secs": cfg.cache_replicas.effective_retention_secs(),
         },
         "anchor": anchor.as_ref().map(|a| json!({
             "datacenter": a.datacenter,
@@ -374,6 +407,8 @@ pub(crate) fn volume_config_to_json(
             "series_max_gb": cfg.precache.series_max_gb,
             "max_series":    cfg.precache.max_series,
             "pins":          cfg.precache.pins,
+            "cursor_ttl_secs": cfg.precache.cursor_ttl_secs,
+            "effective_cursor_ttl_secs": cfg.precache.effective_cursor_ttl_secs(&cfg.cache_replicas),
         },
     })
 }
@@ -401,6 +436,9 @@ pub(crate) struct SetCacheRequest {
     pub promote_reads: Option<u32>,
     pub promote_window_secs: Option<u64>,
     pub cooldown_secs: Option<u64>,
+    /// 0 = fall back to `promote_window_secs`.
+    #[serde(default)]
+    pub retention_secs: Option<u64>,
 }
 
 /// AV-3-5 pure helper — apply the partial update onto a clone of
@@ -429,6 +467,8 @@ pub(crate) fn apply_set_cache(
         { next.cache_replicas.promote_window_secs = v; }
     if let Some(v) = req.cooldown_secs
         { next.cache_replicas.cooldown_secs = v; }
+    if let Some(v) = req.retention_secs
+        { next.cache_replicas.retention_secs = v; }
 
     // Validate min<=max per tier — `validate()` lives on
     // CacheTierConfig already.
@@ -470,6 +510,7 @@ pub(super) async fn set_volume_cache_endpoint(
 
     let changed = current != next;
     if changed {
+        check_volume_fields_gate(&state, &next).await?;
         let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: next.clone(), expected_version: Some(current.version) };
         let resp = match state.raft.client_write(req).await {
             Ok(r) => r,
@@ -510,6 +551,8 @@ pub(crate) struct SetPrecacheRequest {
     pub max_series: Option<u32>,
     /// Replaces the whole pin list (empty clears it).
     pub pins: Option<Vec<dtfs_common::types::PrecachePin>>,
+    /// 0 = fall back to `cache_replicas.promote_window_secs`.
+    pub cursor_ttl_secs: Option<u64>,
 }
 
 /// Every pin DC must be the datacenter of some registered node (case-insensitive).
@@ -538,6 +581,7 @@ pub(crate) fn apply_set_precache(
     if let Some(v) = req.series_max_gb { next.precache.series_max_gb = v; }
     if let Some(v) = req.max_series { next.precache.max_series = v; }
     if let Some(v) = &req.pins { next.precache.pins = v.clone(); }
+    if let Some(v) = req.cursor_ttl_secs { next.precache.cursor_ttl_secs = v; }
     next.precache.validate(&next.cache_replicas, next.effective_mandatory_replicas())?;
     Ok(next)
 }
@@ -675,6 +719,7 @@ pub(super) async fn set_volume_write_safety_endpoint(
 
     let changed = current != next;
     if changed {
+        check_volume_fields_gate(&state, &next).await?;
         let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: next.clone(), expected_version: Some(current.version) };
         let resp = match state.raft.client_write(req).await {
             Ok(r) => r,
@@ -968,6 +1013,7 @@ pub(super) async fn set_volume_anchor_endpoint(
 
     let changed = current != next;
     if changed {
+        check_volume_fields_gate(&state, &next).await?;
         let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: next.clone(), expected_version: Some(current.version) };
         let resp = match state.raft.client_write(req).await {
             Ok(r) => r,
@@ -1074,6 +1120,7 @@ pub(super) async fn set_volume_spill_endpoint(
 
     let changed = current != next;
     if changed {
+        check_volume_fields_gate(&state, &next).await?;
         let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: next.clone(), expected_version: Some(current.version) };
         let resp = match state.raft.client_write(req).await {
             Ok(r) => r,
@@ -1138,6 +1185,7 @@ pub(super) async fn set_volume_mandatory_endpoint(
 
     let changed = current != next;
     if changed {
+        check_volume_fields_gate(&state, &next).await?;
         let req = ClientRequest::UpsertVolume { now_ms: crate::metadata::stamp_now_ms(), config: next.clone(), expected_version: Some(current.version) };
         let resp = match state.raft.client_write(req).await {
             Ok(r) => r,

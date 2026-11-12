@@ -820,6 +820,14 @@
             <input id="ve-promote-window" class="form-input" type="number" min="1" step="1">
         </div>
         <div class="modal-row">
+            <label for="ve-retention">Demote after unread for (seconds, 0 = promote window)</label>
+            <input id="ve-retention" class="form-input" type="number" min="0" step="1">
+        </div>
+        <div class="modal-row">
+            <label for="ve-cursor-ttl">Pre-cache cursor lifetime (seconds, 0 = promote window)</label>
+            <input id="ve-cursor-ttl" class="form-input" type="number" min="0" step="1">
+        </div>
+        <div class="modal-row">
             <label for="ve-cooldown">Cooldown (seconds)</label>
             <input id="ve-cooldown" class="form-input" type="number" min="0" step="1">
         </div>
@@ -2831,7 +2839,7 @@
             <div style="font-weight:bold;margin-bottom:.5rem">Policy for ${esc(v.volume_id)}</div>
             <div style="font-family:monospace;font-size:.78rem;line-height:1.6">
                 <div>Mandatory replicas: hot=${(v.mandatory_replicas||{}).hot||0}, warm=${(v.mandatory_replicas||{}).warm||0}, cold=${(v.mandatory_replicas||{}).cold||0}, tape=${(v.mandatory_replicas||{}).tape||0}</div>
-                <div>Cache replicas (per_dc=${cr.per_dc===true?'true':'false'}, promote_reads=${cr.promote_reads||0}, promote_window_secs=${cr.promote_window_secs||0}, cooldown_secs=${cr.cooldown_secs||0}):</div>
+                <div>Cache replicas (per_dc=${cr.per_dc===true?'true':'false'}, promote_reads=${cr.promote_reads||0}, promote_window_secs=${cr.promote_window_secs||0}, retention_secs=${cr.retention_secs||0}, cooldown_secs=${cr.cooldown_secs||0}):</div>
                 <div style="margin-left:1rem">${tier('hot')}</div>
                 <div style="margin-left:1rem">${tier('warm')}</div>
                 <div style="margin-left:1rem">${tier('cold')}</div>
@@ -3018,6 +3026,10 @@
             document.getElementById('ve-per-dc').checked = cr.per_dc === true;
             document.getElementById('ve-promote-reads').value = cr.promote_reads || '';
             document.getElementById('ve-promote-window').value = cr.promote_window_secs || '';
+            document.getElementById('ve-retention').value = cr.retention_secs || 0;
+            const ttlEl = document.getElementById('ve-cursor-ttl');
+            ttlEl.value = (v.precache && v.precache.cursor_ttl_secs) || 0;
+            ttlEl.dataset.orig = ttlEl.value;
             document.getElementById('ve-cooldown').value = cr.cooldown_secs || '';
             // prefill mandatory replicas.
             const mr = v.mandatory_replicas || {};
@@ -3110,6 +3122,7 @@
             promote_reads:       intOrNull('ve-promote-reads'),
             promote_window_secs: intOrNull('ve-promote-window'),
             cooldown_secs:       intOrNull('ve-cooldown'),
+            retention_secs:      intOrNull('ve-retention'),
         };
         // Client-side guard: warm.max >= warm.min when both provided.
         if (cacheBody.warm_min != null && cacheBody.warm_max != null
@@ -3213,6 +3226,11 @@
             lines.push(await post('set-write-safety', writeSafetyBody));
         }
         lines.push(await post('set-cache', cacheBody));
+        // Only on change: set-precache is refused (409) before v0.1.16.
+        const ttlEl = document.getElementById('ve-cursor-ttl');
+        if (ttlEl.value.trim() !== ttlEl.dataset.orig) {
+            lines.push(await post('set-precache', { cursor_ttl_secs: intOrNull('ve-cursor-ttl') }));
+        }
 
         result.className = 'modal-result';
         result.textContent = lines.join('\n');

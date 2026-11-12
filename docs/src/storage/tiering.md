@@ -61,8 +61,11 @@ For each existing cache-tier placement:
 1. **Tier check** — must be a *cache* tier (i.e., the volume's
    `cache_replicas.<tier>.max > 0` AND
    `mandatory_replicas.<tier> == 0`).
-2. **Window check** — `reads_in_window_by_dc[placement.dc]` must
-   be 0 (no reads from this DC inside `promote_window_secs`).
+2. **Window check** — no reads from the placement's DC inside the
+   volume's idle window: `cache_replicas.retention_secs`, or
+   `promote_window_secs` when it is 0. Volumes with `retention_secs` set
+   use the node-local retention pass below instead, on every disk whose
+   last-read index answers; this ring-based check is their fallback.
 3. **Anchor safety** — at least one other **live** replica must
    satisfy the anchor (datacenter, and tier if `required_tier` is
    set). A replica on a Down, Failed, Maintenance or Quarantined node
@@ -72,7 +75,8 @@ For each existing cache-tier placement:
    path re-checks via `enforce_anchor` on `RemoveChunkLocation`.
 4. **Read history** — read windows live only in the leader's memory.
    After an election or leader restart no idle demotion runs until this
-   leader has held the role for the largest `promote_window_secs`, and
+   leader has held the role for the longest idle window among the planned
+   demotions, and
    none while the read-window store hit its key cap within that window
    (evicted counts would read as 0). Promotions are not delayed.
 
@@ -148,6 +152,20 @@ A disk at or above `high` lists its least recently read chunks (`ListOldestChunk
 * Each copy goes through the idle demote's path: `RemoveChunkLocation` with `enforce_anchor` through Raft first, then the byte delete. Audit `cache.evict_capacity` per copy, one warn line per disk and round.
 
 While the watermarks are set, promotion target selection and pre-cache room never plan a hot/warm disk past `low`, so they do not immediately trigger eviction. A data node too old for `ListOldestChunks`, a cold/tape disk, or a last-read index not seeded yet skips the disk for that round (logged once at info).
+
+### Retention demotion
+
+The idle demote above trusts read counts kept in the leader's memory, so it waits a full window after every leader change and after a read-window key-cap eviction. With a long window (days) that means it rarely runs. A volume can instead set `cache_replicas.retention_secs` (0 = unset, the ring-based idle demote with `promote_window_secs` as before; non-zero needs every manager on v0.1.16, otherwise the REST call is refused with 409).
+
+For such volumes the 30 s pre-cache loop visits each hot/warm disk of a node that is not Down, Failed, Maintenance or Quarantined at most every 10 min, asks it for chunks unread for the shortest `retention_secs` of any volume (`ListOldestChunks` with `older_than_ms`, up to 4096, oldest first; library-scan reads do not count) and demotes up to 512 copies per disk and visit:
+
+* every location row of the hash on that disk belongs to a volume with `retention_secs` set that has elapsed since the chunk's last read (`now - last_read >= retention`), and the file was not updated or given a replica within `promote_window_secs` + 180 s;
+* the same per-row safety as capacity eviction: cache tier, live mandatory survivor, anchor kept by a live replica (anchor-pending chunks are never touched);
+* copies protected by the pre-cache (cursors, scheduled copies) and pins are never taken.
+
+No leader-tenure or read-window gate applies: the last-read time is persisted on the data node. Each copy goes through `RemoveChunkLocation` with `enforce_anchor` first, then the byte delete; audit `cache.demote` with result `retention_elapsed` and the last-read age.
+
+A disk whose index answered within the last 30 min is "capable": the ring-based idle demote skips copies of retention volumes there. A disk that answers Unimplemented (old data node), FailedPrecondition (cold/tape) or Unavailable (index not seeded, node unreachable) is not, and keeps the ring-based idle demote with `retention_secs` as the idle window and its leader-tenure gate.
 
 ### Worked example — `/movies/Wicked.mkv` lifecycle
 
@@ -231,13 +249,13 @@ Disks declare their tier in `data.toml` (`[[disks]]`, `tier = "hot|warm|cold|tap
 
 Reactive promotion waits for reads to reach a datacenter. Pre-caching copies the files a reader will open next into that datacenter's cache tier before they are opened. It is opt-in per volume (`precache.mode`, see [Volume Configuration](../configuration/volume-config.md#pre-caching-policy)) and runs on the leader every 30 s.
 
-**Signal.** Reads reported by the data nodes (the same 30 s batches that feed reactive promotion) are remembered per (file, datacenter). Reads with no datacenter, or from the `unknown` bucket, are ignored; this is also how FUSE `untracked_read_processes` keeps library scans from counting. A file counts as being played when a chunk from index 12 on (and not within the last 2 chunks) was read, or more than 64 distinct chunks were read. Header and tail probes by scanners therefore never start pre-caching. The head skip assumes the default `readahead.prefetch_chunks = 8`: one read near chunk 0 prefetches up to index 9, and a 16 MiB probe with 4 MiB chunks reaches index 11. A client with `prefetch_chunks >= 11` makes every header probe count as playing. Because of the head and tail skips a file needs at least 15 chunks (`i >= 12 && i + 2 < chunk_count`) to count as played: with 64 MiB chunks files under about 960 MiB never start pre-caching, with 16 MiB chunks under about 240 MiB, with 4 MiB chunks under 60 MiB. The most recently played file per directory (`files`) or per series (`plex`) is the cursor, active while its last read is within the volume's `promote_window_secs`.
+**Signal.** Reads reported by the data nodes (the same 30 s batches that feed reactive promotion) are remembered per (file, datacenter). Reads with no datacenter, or from the `unknown` bucket, are ignored; this is also how FUSE `untracked_read_processes` keeps library scans from counting. A file counts as being played when a chunk from index 12 on (and not within the last 2 chunks) was read, or more than 64 distinct chunks were read. Header and tail probes by scanners therefore never start pre-caching. The head skip assumes the default `readahead.prefetch_chunks = 8`: one read near chunk 0 prefetches up to index 9, and a 16 MiB probe with 4 MiB chunks reaches index 11. A client with `prefetch_chunks >= 11` makes every header probe count as playing. Because of the head and tail skips a file needs at least 15 chunks (`i >= 12 && i + 2 < chunk_count`) to count as played: with 64 MiB chunks files under about 960 MiB never start pre-caching, with 16 MiB chunks under about 240 MiB, with 4 MiB chunks under 60 MiB. The most recently played file per directory (`files`) or per series (`plex`) is the cursor, active while its last read is within the volume's `precache.cursor_ttl_secs` (0 = `promote_window_secs`; non-zero needs every manager on v0.1.16).
 
 **Modes and ordering.** In `files` mode the next files in the cursor's directory are taken in natural order (`E2` before `E10`, case-insensitive text). In `plex` mode the series root is the nearest of the parent or grandparent directory holding a regular file named `.plexmatch`; all files under it are ordered component by component (`Season 02/E10` before `Season 10/E01`). Specials, Extras, Trailers and similar folders are not part of the playback order. Directories, symlinks, dot-files, files under 16 MiB and files with an active write lease are skipped.
 
 **Selection.** Whole files, contiguous after the cursor, until the budget (`series_max_gb`, or `next_files` / `next_max_gb`) runs out; the leftover budget caches the head of the next file (whole chunks only), then selection stops. The file being watched is excluded: read-ahead and reactive promotion own it. New episodes are picked up on the next pass.
 
-**Capacity and eviction order.** One copy per chunk and datacenter, on the hottest tier with `cache_replicas.<t>.max > 0` and no mandatory replicas, placed like a reactive promotion. A node's room is its serviceable cache-tier disks minus the placement headroom and a 10% reserve; when it runs out planning stops and the datacenter shows `capacity_limited`. Pre-caching never deletes anything. Protection from the idle demote ends in this order: series beyond `max_series` (oldest first), then file cursors beyond 8 per datacenter, then cursors older than the window. Unprotected copies are removed only by the existing idle demote, which skips protected copies. An operator `flush_cache` removes protected copies too and its cooldown stops re-copying.
+**Capacity and eviction order.** One copy per chunk and datacenter, on the hottest tier with `cache_replicas.<t>.max > 0` and no mandatory replicas, placed like a reactive promotion. A node's room is its serviceable cache-tier disks minus the placement headroom and a 10% reserve; when it runs out planning stops and the datacenter shows `capacity_limited`. Pre-caching never deletes anything. Protection from the idle demote ends in this order: series beyond `max_series` (oldest first), then file cursors beyond 8 per datacenter, then cursors older than the cursor TTL. Unprotected copies are removed only by the idle demote, retention demotion and capacity eviction; the first two skip protected copies. An operator `flush_cache` removes protected copies too and its cooldown stops re-copying.
 
 **Bandwidth and yield.** Copies start at an average of `[tiering] precache_max_mbps` (default 10, 120 s burst); a copy that does not fit the balance waits, later ones do not jump ahead. The normal scheduler limits (6 copies at once, 2 per target node) still apply. With 24 or more live scheduler tasks of any class (repair included) pre-caching schedules nothing, and below that it adds at most the room left under 24. A chunk larger than the burst (for example 64 MiB at 4 Mbps) still schedules: the bucket holds at least the largest planned chunk. One planning pass walks at most 200000 chunk entries under the state read lock (cursors first, then pins); a pin that does not fit is marked `truncated`.
 
@@ -247,7 +265,7 @@ Reactive promotion waits for reads to reach a datacenter. Pre-caching copies the
 
 **Anchor.** Pre-caching only adds cache replicas through the verified replication path. Chunks without a live anchor copy (anchor-pending, judged like the dashboard: anchor DC and the anchor's `required_tier`) are not copied.
 
-**Leader change.** Copy tasks are Raft state and finish on their own. The new leader starts with an empty protection set and rebuilds cursors within 30 to 90 s; idle demote is refused for `promote_window_secs` after a new leader's tenure starts, so nothing is lost in between. A volume whose policy stops validating (for example after `set-cache` removed the cache tier) is skipped and logged once.
+**Leader change.** Copy tasks are Raft state and finish on their own. The new leader starts with an empty protection set and rebuilds cursors within 30 to 90 s; the ring-based idle demote is refused for its idle window after a new leader's tenure starts (retention demotion is not gated; it runs after the pre-cache pass of the same 30 s tick, so it sees the protection that pass rebuilt from the read activity this manager holds), so nothing is lost in between. A volume whose policy stops validating (for example after `set-cache` removed the cache tier) is skipped and logged once.
 
 **Recommended profile.** Plex library volume: `plex` mode, `series_max_gb` 20, `max_series` 3, a warm cache tier with `max = 1` and `per_dc = true`, `promote_window_secs` 14400 or more, and `precache_max_mbps` at most half the DC's link.
 

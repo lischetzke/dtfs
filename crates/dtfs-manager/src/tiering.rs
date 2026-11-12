@@ -115,6 +115,12 @@ pub struct TieringEngine {
     evict_skip_logged: parking_lot::Mutex<std::collections::HashSet<(u64, u32, i32)>>,
     /// (node, disk) -> last capacity-eviction round that evicted something.
     evict_records: parking_lot::Mutex<HashMap<(u64, u32), evict::EvictRecord>>,
+    /// (node, disk) -> last successful retention `ListOldestChunks` (ms).
+    retention_capable: parking_lot::Mutex<HashMap<(u64, u32), u64>>,
+    /// (node, disk) -> last retention pass (ms), success or not.
+    retention_last_run: parking_lot::Mutex<HashMap<(u64, u32), u64>>,
+    /// (node, disk, tonic code) a retention skip was already logged for.
+    retention_skip_logged: parking_lot::Mutex<std::collections::HashSet<(u64, u32, i32)>>,
 }
 
 impl TieringEngine {
@@ -137,6 +143,9 @@ impl TieringEngine {
             precache: parking_lot::Mutex::new(Default::default()),
             evict_skip_logged: parking_lot::Mutex::new(Default::default()),
             evict_records: parking_lot::Mutex::new(HashMap::new()),
+            retention_capable: parking_lot::Mutex::new(HashMap::new()),
+            retention_last_run: parking_lot::Mutex::new(HashMap::new()),
+            retention_skip_logged: parking_lot::Mutex::new(Default::default()),
         }
     }
 
@@ -156,7 +165,8 @@ impl TieringEngine {
     }
 
     /// Pre-cache loop: every `PRECACHE_TICK_SECS`, leader only. Spawned from main.rs.
-    /// Each tick then runs capacity eviction, against the protected set just planned.
+    /// Each tick then runs capacity eviction and retention demotion, against the
+    /// protected set just planned.
     pub async fn run_precache(&self) {
         let phase = Duration::from_secs(crate::precache::PRECACHE_PHASE_SECS);
         let mut interval = tokio::time::interval_at(
@@ -168,6 +178,7 @@ impl TieringEngine {
             interval.tick().await;
             self.precache_tick().await;
             self.capacity_evict_tick().await;
+            self.retention_demote_tick().await;
         }
     }
 
@@ -185,6 +196,8 @@ impl TieringEngine {
         if !self.scheduler.is_leader() {
             self.precache.lock().reset_leader_state();
             self.evict_records.lock().clear();
+            self.retention_last_run.lock().clear();
+            self.retention_capable.lock().clear();
             return;
         }
         let now_ms = now_millis();
@@ -694,6 +707,11 @@ impl TieringEngine {
         if kept > 0 {
             debug!(kept, "idle demote skipped pre-cache protected copies");
         }
+        let capable = evict::fresh_capable_disks(&self.retention_capable.lock(), now_ms);
+        let handed = drop_retention_handled(&mut plan.demotions, &snapshot.volumes, &capable);
+        if handed > 0 {
+            debug!(handed, "idle demote left retention-volume copies to the node-local retention pass");
+        }
 
         // CO-1-2 [HIGH anchor] — surface any demote the planner refused
         // because it would have stranded the volume's anchor DC. The
@@ -809,18 +827,19 @@ impl TieringEngine {
         let grace_ms = promote_window_max
             .saturating_add(180)
             .saturating_mul(1_000);
+        let idle_window = idle_gate_window_secs(&plan.demotions, &snapshot.volumes);
         if !plan.demotions.is_empty()
             && !idle_demote_allowed(
                 now_ms,
                 self.leader_since_ms.load(std::sync::atomic::Ordering::Relaxed),
                 self.evicted_newest_sample_ms.load(std::sync::atomic::Ordering::Relaxed),
-                promote_window_max,
+                idle_window,
             )
         {
             info!(
                 demotions = plan.demotions.len(),
-                window_secs = promote_window_max,
-                "idle demotions deferred: leader tenure or read-window history shorter than the promote window"
+                window_secs = idle_window,
+                "idle demotions deferred: leader tenure or read-window history shorter than the idle window"
             );
             return Ok(());
         }
@@ -1025,7 +1044,7 @@ impl TieringEngine {
             Vec<TickPlacement>,
             u64,
             u64,
-            u64,
+            (u64, u64),
         )> = Vec::new();
         for (path, fm) in sm.files.iter() {
             let Some(policy) = volumes.get(&fm.volume_id) else {
@@ -1070,7 +1089,7 @@ impl TieringEngine {
                     placements,
                     cooldown,
                     fm.updated_at_ms.max(fm.replica_added_at_ms), // #146
-                    policy.cache.promote_window_secs,
+                    (policy.cache.promote_window_secs, policy.cache.effective_retention_secs()),
                 ));
             }
         }
@@ -1087,14 +1106,15 @@ impl TieringEngine {
         let mut chunks: Vec<TickChunk> = Vec::with_capacity(raw_chunks.len());
         {
             let mut windows = self.read_windows.write().await;
-            for (chunk_id, idx, path, volume_id, placements, cooldown, updated_at_ms, window_secs) in
+            for (chunk_id, idx, path, volume_id, placements, cooldown, updated_at_ms, (window_secs, idle_secs)) in
                 raw_chunks
             {
-                let reads_in_window_by_dc = window_counts_for_chunk(
+                let (reads_in_window_by_dc, idle_reads_by_dc) = window_and_idle_counts(
                     &chunk_id,
                     &unique_dcs,
                     now_ms,
                     window_secs,
+                    idle_secs,
                     &mut windows,
                 );
                 chunks.push(TickChunk {
@@ -1106,6 +1126,7 @@ impl TieringEngine {
                     cooldown_until_ms: cooldown,
                     reads_in_window_by_dc,
                     file_updated_at_ms: updated_at_ms,
+                    idle_reads_by_dc,
                 });
             }
         }
@@ -1404,6 +1425,33 @@ pub(crate) fn idle_demote_allowed(now_ms: u64, leader_since_ms: u64, evicted_ms:
         && (evicted_ms == 0 || now_ms.saturating_sub(evicted_ms) >= window_ms)
 }
 
+/// Drop ring-based idle demotions that the node-local retention pass owns: a
+/// copy of a volume with `retention_secs` set on a disk in `capable` (its
+/// last-read index answered recently). Returns how many were dropped.
+pub(crate) fn drop_retention_handled(
+    demotions: &mut Vec<TickDemotion>,
+    volumes: &HashMap<String, TickVolumePolicy>,
+    capable: &std::collections::HashSet<(u64, u32)>,
+) -> usize {
+    let before = demotions.len();
+    demotions.retain(|d| {
+        let retention = volumes.get(&d.volume_id).is_some_and(|p| p.cache.retention_secs > 0);
+        !(retention && capable.contains(&(d.node_id, d.disk_id)))
+    });
+    before - demotions.len()
+}
+
+/// Window `idle_demote_allowed` must cover for `demotions`: the longest
+/// effective retention among their volumes.
+pub(crate) fn idle_gate_window_secs(demotions: &[TickDemotion], volumes: &HashMap<String, TickVolumePolicy>) -> u64 {
+    demotions
+        .iter()
+        .filter_map(|d| volumes.get(&d.volume_id))
+        .map(|p| p.cache.effective_retention_secs())
+        .max()
+        .unwrap_or(0)
+}
+
 /// Returns the newest sample ts among the rings evicted at the key cap
 /// (0 if none), for `idle_demote_allowed` (#119).
 pub(crate) fn apply_heartbeat_reads(
@@ -1477,6 +1525,33 @@ pub(crate) fn window_counts_for_chunk(
         }
     }
     out
+}
+
+/// Promote-window counts plus, when the idle (retention) window differs, the
+/// idle-window counts (`None` = same window). Rings are pruned to the longer one.
+pub(crate) fn window_and_idle_counts(
+    chunk_id: &str,
+    dcs: &std::collections::HashSet<String>,
+    now_ms: u64,
+    window_secs: u64,
+    idle_secs: u64,
+    windows: &mut HashMap<(String, String), Vec<ReadSample>>,
+) -> (HashMap<String, u32>, Option<HashMap<String, u32>>) {
+    if idle_secs == window_secs {
+        return (window_counts_for_chunk(chunk_id, dcs, now_ms, window_secs, windows), None);
+    }
+    let (mut reads, mut idle) = (HashMap::new(), HashMap::new());
+    for dc in dcs {
+        let Some(ring) = windows.get_mut(&(chunk_id.to_string(), dc.clone())) else { continue };
+        prune_read_window(ring, now_ms, window_secs.max(idle_secs));
+        for (secs, out) in [(window_secs, &mut reads), (idle_secs, &mut idle)] {
+            let cnt = count_reads_in_window(ring, now_ms, secs);
+            if cnt > 0 {
+                out.insert(dc.clone(), cnt);
+            }
+        }
+    }
+    (reads, Some(idle))
 }
 
 /// AV-2-1 housekeeping helper — drop samples older than the window.
@@ -1826,6 +1901,9 @@ pub(crate) struct TickChunk {
     /// the SM entry).
     #[doc(hidden)]
     pub file_updated_at_ms: u64,
+    /// Reads by DC in the volume's `effective_retention_secs`, for the idle
+    /// demote. `None` = that window is the promote window (`reads_in_window_by_dc`).
+    pub idle_reads_by_dc: Option<std::collections::HashMap<String, u32>>,
 }
 
 /// AV-2-4 — one placement of a chunk (node + DC + tier).
@@ -1880,6 +1958,7 @@ pub(crate) struct TickDemotion {
     pub chunk_id: String,
     pub chunk_index: u64,
     pub file_path: String,
+    pub volume_id: String,
     pub node_id: u64,
     /// CO-1-1 — the disk holding the cache replica being demoted. The
     /// dispatcher passes it to the data-node delete and RemoveChunkLocation
@@ -2220,8 +2299,9 @@ pub(crate) fn mandatory_survives(chunk: &TickChunk, placement: &TickPlacement, p
 ///   * the tier is cache-eligible for the volume
 ///     (`cache_replicas.<tier>.max > 0`) AND not mandatory,
 ///   * the volume has `cache_replicas.promote_window_secs > 0`,
-///   * `reads_in_window_by_dc.get(dc)` is 0 (no recent reads
-///     from the placement's DC),
+///   * no reads from the placement's DC in the volume's
+///     `effective_retention_secs` (`idle_reads_by_dc`, else
+///     `reads_in_window_by_dc`),
 ///   * dropping the placement wouldn't strand the mandatory copy
 ///     (i.e., at least one mandatory-tier replica still remains).
 ///
@@ -2260,12 +2340,12 @@ fn plan_chunk_demotions(
     // reads in its DC and at least one mandatory replica surviving
     // after the drop.
     let mut chosen: Vec<(u64, u32)> = Vec::new();
+    let idle_reads = chunk.idle_reads_by_dc.as_ref().unwrap_or(&chunk.reads_in_window_by_dc);
     for placement in &chunk.placements {
         if !is_cache_tier(policy, placement.tier) {
             continue;
         }
-        let dc_reads = chunk
-            .reads_in_window_by_dc
+        let dc_reads = idle_reads
             .get(&placement.dc)
             .copied()
             .unwrap_or(0);
@@ -2300,6 +2380,7 @@ fn plan_chunk_demotions(
             chunk_id: chunk.chunk_id.clone(),
             chunk_index: chunk.chunk_index,
             file_path: chunk.file_path.clone(),
+            volume_id: chunk.volume_id.clone(),
             node_id: placement.node_id,
             disk_id: placement.disk_id,
             tier: placement.tier,
@@ -2901,6 +2982,7 @@ mod bug_av_tiering_tick_tests {
                 promote_reads: 2,
                 promote_window_secs: 14_400,
                 cooldown_secs: 300,
+                retention_secs: 0,
             },
             anchor: Some(AnchorPolicy {
                 datacenter: "leli".to_string(),
@@ -2937,6 +3019,7 @@ mod bug_av_tiering_tick_tests {
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
                 file_updated_at_ms: 0,
+                idle_reads_by_dc: None,
             }],
             nodes: vec![
                 node(10, "leli", 1_000_000, /* cold */ false),
@@ -2956,6 +3039,92 @@ mod bug_av_tiering_tick_tests {
         assert_eq!(p.source_node_id, 10);
         // No demotions (no idle-warm placements yet).
         assert!(plan.demotions.is_empty());
+    }
+
+    /// A warm toro cache copy (node 11, disk 0) next to the leli cold anchor.
+    fn cached_chunk(idle_reads_by_dc: Option<HashMap<String, u32>>) -> TickChunk {
+        let pl = |node_id, dc: &str, tier| TickPlacement { node_id, disk_id: 0, dc: dc.into(), tier, live: true };
+        TickChunk {
+            chunk_id: "h0".into(),
+            chunk_index: 0,
+            file_path: "/movies/x.mkv".into(),
+            volume_id: "default".into(),
+            placements: vec![pl(10, "leli", DiskTier::Cold), pl(11, "toro", DiskTier::Warm)],
+            cooldown_until_ms: 0,
+            reads_in_window_by_dc: HashMap::new(),
+            file_updated_at_ms: 0,
+            idle_reads_by_dc,
+        }
+    }
+
+    fn demotions_of(chunk: TickChunk, policy: TickVolumePolicy) -> Vec<TickDemotion> {
+        let snapshot = TickSnapshot { chunks: vec![chunk], nodes: vec![], volumes: vols(policy) };
+        plan_cache_tick(&snapshot, 1_000_000_000, false).demotions
+    }
+
+    /// The ring-based idle demote reads the retention-window counts when
+    /// present: a read inside the retention (but outside the promote window)
+    /// keeps the copy; none demotes it, tagged with the volume.
+    #[test]
+    fn ring_demote_uses_the_retention_window_counts() {
+        let toro = |n| Some([("toro".to_string(), n)].into_iter().collect::<HashMap<_, _>>());
+        assert!(demotions_of(cached_chunk(toro(1)), plex_policy()).is_empty());
+        let d = demotions_of(cached_chunk(Some(HashMap::new())), plex_policy());
+        assert_eq!((d.len(), d[0].node_id, d[0].volume_id.as_str()), (1, 11, "default"));
+        // None = the promote-window counts (empty here) decide, as before.
+        assert_eq!(demotions_of(cached_chunk(None), plex_policy()).len(), 1);
+    }
+
+    /// Retention longer than the promote window: a read between the two is
+    /// in the idle count only, and survives the ring prune.
+    #[test]
+    fn window_and_idle_counts_split_and_prune_to_the_longer_window() {
+        let now = 100_000_000;
+        let dcs: std::collections::HashSet<String> = ["toro".to_string()].into();
+        let mut w: HashMap<(String, String), Vec<ReadSample>> = HashMap::new();
+        let key = ("c".to_string(), "toro".to_string());
+        w.insert(key.clone(), vec![ReadSample { ts_ms: now - 50_000_000, count: 1 }, ReadSample { ts_ms: now - 90_000_000, count: 1 }]);
+        let (reads, idle) = window_and_idle_counts("c", &dcs, now, 3_600, 60_000, &mut w);
+        assert!(reads.is_empty());
+        assert_eq!(idle.unwrap()["toro"], 1);
+        assert_eq!(w[&key].len(), 1, "pruned to the 60 000 s window, not the 3 600 s one");
+        // Equal windows: no separate idle count (unchanged behaviour).
+        let (_, idle) = window_and_idle_counts("c", &dcs, now, 60_000, 60_000, &mut w);
+        assert!(idle.is_none());
+    }
+
+    fn demotion(volume: &str, node_id: u64, disk_id: u32) -> TickDemotion {
+        TickDemotion {
+            chunk_id: "h".into(),
+            chunk_index: 0,
+            file_path: "/f".into(),
+            volume_id: volume.into(),
+            node_id,
+            disk_id,
+            tier: DiskTier::Warm,
+            reason: "idle_window",
+            cooldown_until_ms_at_snapshot: 0,
+            enforce_anchor: None,
+        }
+    }
+
+    /// Only retention-volume copies on a capable disk leave the ring path;
+    /// the same copy on a non-capable disk (or another disk of the node), and
+    /// a no-retention volume's copy on the capable disk, stay.
+    #[test]
+    fn ring_demote_skips_retention_copies_on_capable_disks_only() {
+        let mut ret = plex_policy();
+        ret.cache.retention_secs = 1_209_600;
+        let volumes: HashMap<String, TickVolumePolicy> =
+            [("ret".to_string(), ret), ("plain".to_string(), plex_policy())].into();
+        let capable: std::collections::HashSet<(u64, u32)> = [(11, 0)].into();
+        let mut ds = vec![demotion("ret", 11, 0), demotion("ret", 11, 1), demotion("ret", 12, 0), demotion("plain", 11, 0)];
+        assert_eq!(drop_retention_handled(&mut ds, &volumes, &capable), 1);
+        let left: Vec<(&str, u64, u32)> = ds.iter().map(|d| (d.volume_id.as_str(), d.node_id, d.disk_id)).collect();
+        assert_eq!(left, [("ret", 11, 1), ("ret", 12, 0), ("plain", 11, 0)]);
+        // The gate window is the longest effective retention among what is left.
+        assert_eq!(idle_gate_window_secs(&ds, &volumes), 1_209_600);
+        assert_eq!(idle_gate_window_secs(&ds[2..], &volumes), 14_400);
     }
 
     /// #119 — a new leader's read windows are empty; idle demotion waits for
@@ -3053,6 +3222,7 @@ mod bug_av_tiering_tick_tests {
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
                 file_updated_at_ms: 0,
+                idle_reads_by_dc: None,
             }],
             nodes: vec![node(10, "leli", 500_000, true)],
             volumes: vols(plex_policy()),
@@ -3085,6 +3255,7 @@ mod bug_av_tiering_tick_tests {
                 cooldown_until_ms: 2_000_000, // future, still in cooldown
                 reads_in_window_by_dc: reads,
                 file_updated_at_ms: 0,
+                idle_reads_by_dc: None,
             }],
             nodes: vec![node(11, "toro", 500_000, true)],
             volumes: vols(plex_policy()),
@@ -3113,6 +3284,7 @@ mod bug_av_tiering_tick_tests {
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
                 file_updated_at_ms: 0,
+                idle_reads_by_dc: None,
             }],
             nodes: vec![
                 node(11, "toro", 500_000, true),
@@ -3154,6 +3326,7 @@ mod bug_av_tiering_tick_tests {
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
                 file_updated_at_ms: 0,
+                idle_reads_by_dc: None,
             }],
             nodes: vec![
                 node(11, "toro", 500_000, true),
@@ -3191,6 +3364,7 @@ mod bug_av_tiering_tick_tests {
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
                 file_updated_at_ms: 0,
+                idle_reads_by_dc: None,
             }],
             nodes: vec![
                 node(11, "toro", 500_000, true),
@@ -3232,6 +3406,7 @@ mod bug_av_tiering_tick_tests {
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
                 file_updated_at_ms: 0,
+                idle_reads_by_dc: None,
             }],
             // Only 1 warm-tier node in toro, and it already holds
             // the chunk. Planner must not pick it again.
@@ -3292,6 +3467,7 @@ mod bug_av_tiering_tick_tests {
                 cooldown_until_ms: 1_500_000, // future operator cooldown
                 reads_in_window_by_dc: reads,
                 file_updated_at_ms: 0,
+                idle_reads_by_dc: None,
             }],
             nodes: vec![node(11, "toro", 500_000, true)],
             volumes: vols(plex_policy()),
@@ -3331,6 +3507,7 @@ mod bug_av_tiering_tick_tests {
                 cooldown_until_ms: 0,
                 reads_in_window_by_dc: reads,
                 file_updated_at_ms: 0,
+                idle_reads_by_dc: None,
             }],
             nodes: vec![
                 node(11, "toro", 500_000, true),
@@ -3596,6 +3773,7 @@ mod audit_co_tests {
             cooldown_until_ms: 0,
             reads_in_window_by_dc: HashMap::new(),
             file_updated_at_ms: 0,
+            idle_reads_by_dc: None,
         }
     }
 

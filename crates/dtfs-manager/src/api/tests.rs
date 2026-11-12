@@ -979,9 +979,11 @@ mod bug_av_set_cache_tests {
             promote_reads: Some(2),
             promote_window_secs: Some(60),
             cooldown_secs: Some(300),
+            retention_secs: Some(1_209_600),
             ..Default::default()
         };
         let next = apply_set_cache(&current, &req).expect("valid update");
+        assert_eq!(next.cache_replicas.retention_secs, 1_209_600);
         assert_eq!(next.cache_replicas.warm.min, 1);
         assert_eq!(next.cache_replicas.warm.max, 1);
         assert!(next.cache_replicas.per_dc);
@@ -1157,6 +1159,16 @@ mod bug_av_set_cache_tests {
         assert_eq!(v["cache_replicas"]["promote_reads"], 2);
         assert_eq!(v["cache_replicas"]["promote_window_secs"], 14400);
         assert_eq!(v["cache_replicas"]["cooldown_secs"], 300);
+        // Unset retention / cursor TTL resolve to the promote window.
+        assert_eq!(v["cache_replicas"]["retention_secs"], 0);
+        assert_eq!(v["cache_replicas"]["effective_retention_secs"], 14400);
+        assert_eq!(v["precache"]["cursor_ttl_secs"], 0);
+        assert_eq!(v["precache"]["effective_cursor_ttl_secs"], 14400);
+        cfg.cache_replicas.retention_secs = 86_400;
+        cfg.precache.cursor_ttl_secs = 3_600;
+        let v = volume_config_to_json(&cfg);
+        assert_eq!(v["cache_replicas"]["effective_retention_secs"], 86_400);
+        assert_eq!(v["precache"]["effective_cursor_ttl_secs"], 3_600);
         assert_eq!(v["anchor"]["datacenter"], "leli");
         assert_eq!(v["anchor"]["required_tier"], "cold");
         // Legacy `replication` block still present (back-compat).

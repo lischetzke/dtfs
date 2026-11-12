@@ -4,6 +4,11 @@
 //! the 30 s pre-cache loop. Removes cache replicas only, with the idle
 //! demote's safety checks (cache tier, mandatory survivor, anchor); never a
 //! `precache.pins` copy.
+//!
+//! Retention demotion (same loop, every 10 min per disk): cache copies of a
+//! volume with `cache_replicas.retention_secs` set that the disk's last-read
+//! index reports unread for that long go, with the same per-row checks;
+//! pre-cache protected copies and pins stay.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -102,14 +107,27 @@ pub(crate) fn eviction_chunks(sm: &StateMachineData, hashes: &HashSet<String>) -
                 cooldown_until_ms: fm.cache_cooldown_until_ms.get(&idx).copied().unwrap_or(0),
                 reads_in_window_by_dc: HashMap::new(),
                 file_updated_at_ms: fm.updated_at_ms.max(fm.replica_added_at_ms),
+                idle_reads_by_dc: None,
             });
         }
     }
     out
 }
 
+/// The row's volume has `retention_secs` set, it elapsed since `last_read_ms`,
+/// and the file is past the idle demote's fresh-copy grace (#146:
+/// `promote_window_secs` + 180 s since its last update or replica add).
+pub(crate) fn retention_elapsed(tc: &TickChunk, policy: &TickVolumePolicy, now_ms: u64, last_read_ms: u64) -> bool {
+    let retention_ms = policy.cache.retention_secs.saturating_mul(1000);
+    let grace_ms = policy.cache.promote_window_secs.saturating_add(180).saturating_mul(1000);
+    retention_ms > 0
+        && now_ms.saturating_sub(last_read_ms) >= retention_ms
+        && !(tc.file_updated_at_ms > 0 && now_ms.saturating_sub(tc.file_updated_at_ms) < grace_ms)
+}
+
 /// The eviction of `chunk_id` from (node_id, disk_id) when EVERY row on that
-/// disk passes the idle demote's checks; `None` otherwise or for a stale id.
+/// disk passes the idle demote's checks (and, with `retention_at = Some((now,
+/// last_read))`, `retention_elapsed`); `None` otherwise or for a stale id.
 fn evictable(
     node_id: u64,
     disk_id: u32,
@@ -117,6 +135,7 @@ fn evictable(
     chunks: &HashMap<String, Vec<TickChunk>>,
     volumes: &HashMap<String, TickVolumePolicy>,
     removed: &[(String, u64, u64, u32)],
+    retention_at: Option<(u64, u64)>,
 ) -> Option<(DiskTier, Vec<EvictRow>)> {
     let mut rows = Vec::new();
     let mut tier = None;
@@ -124,6 +143,9 @@ fn evictable(
         for p in tc.placements.iter().filter(|p| p.node_id == node_id && p.disk_id == disk_id) {
             let policy = volumes.get(&tc.volume_id)?;
             if !is_cache_tier(policy, p.tier) || !mandatory_survives(tc, p, policy) {
+                return None;
+            }
+            if retention_at.is_some_and(|(now, last)| !retention_elapsed(tc, policy, now, last)) {
                 return None;
             }
             let already: Vec<(u64, u32)> = removed
@@ -162,9 +184,43 @@ pub(crate) fn plan_capacity_eviction(
     target_bytes: u64,
     removed: &mut Vec<(String, u64, u64, u32)>,
 ) -> Vec<CapacityEviction> {
+    plan_disk(node_id, disk_id, candidates, chunks, volumes, prot, target_bytes, &[1, 2], None, removed)
+}
+
+/// Plan the retention demotion of one disk. Pure. A candidate goes when every
+/// row on (node, disk) passes `plan_capacity_eviction`'s checks AND belongs to
+/// a volume whose `retention_secs` elapsed since the candidate's `last_read_ms`
+/// (`retention_elapsed`). Pass 1 only: protected (cursor / scheduled) and
+/// pinned copies stay. No byte target, at most `MAX_EVICTIONS_PER_ROUND`.
+pub(crate) fn plan_retention_demotion(
+    node_id: u64,
+    disk_id: u32,
+    candidates: &[OldestChunk],
+    chunks: &HashMap<String, Vec<TickChunk>>,
+    volumes: &HashMap<String, TickVolumePolicy>,
+    prot: &EvictProtection,
+    now_ms: u64,
+    removed: &mut Vec<(String, u64, u64, u32)>,
+) -> Vec<CapacityEviction> {
+    plan_disk(node_id, disk_id, candidates, chunks, volumes, prot, u64::MAX, &[1], Some(now_ms), removed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_disk(
+    node_id: u64,
+    disk_id: u32,
+    candidates: &[OldestChunk],
+    chunks: &HashMap<String, Vec<TickChunk>>,
+    volumes: &HashMap<String, TickVolumePolicy>,
+    prot: &EvictProtection,
+    target_bytes: u64,
+    passes: &[u8],
+    retention_now: Option<u64>,
+    removed: &mut Vec<(String, u64, u64, u32)>,
+) -> Vec<CapacityEviction> {
     let mut out: Vec<CapacityEviction> = Vec::new();
     let mut freed = 0u64;
-    for pass in [1u8, 2] {
+    for &pass in passes {
         for c in candidates {
             if freed >= target_bytes || out.len() >= MAX_EVICTIONS_PER_ROUND {
                 return out;
@@ -178,7 +234,8 @@ pub(crate) fn plan_capacity_eviction(
             if protected != (pass == 2) {
                 continue;
             }
-            let Some((tier, rows)) = evictable(node_id, disk_id, &c.chunk_id, chunks, volumes, removed) else {
+            let retention_at = retention_now.map(|now| (now, c.last_read_ms));
+            let Some((tier, rows)) = evictable(node_id, disk_id, &c.chunk_id, chunks, volumes, removed, retention_at) else {
                 continue;
             };
             removed.extend(rows.iter().map(|r| (r.file_path.clone(), r.chunk_index, node_id, disk_id)));
@@ -253,25 +310,9 @@ impl TieringEngine {
 
         let mut lists: Vec<(DiskToEvict, Vec<OldestChunk>)> = Vec::new();
         for d in disks {
-            match self.scheduler.list_oldest_chunks_on_node(&d.addr, d.disk_id, LIST_LIMIT).await {
-                Ok(c) => {
-                    self.evict_skip_logged.lock().retain(|k| (k.0, k.1) != (d.node_id, d.disk_id));
-                    lists.push((d, c));
-                }
-                Err(s) => {
-                    let first = self.evict_skip_logged.lock().insert((d.node_id, d.disk_id, s.code() as i32));
-                    let expected = matches!(
-                        s.code(),
-                        tonic::Code::Unimplemented | tonic::Code::FailedPrecondition | tonic::Code::Unavailable
-                    );
-                    if first && expected {
-                        info!(node_id = d.node_id, disk_id = d.disk_id, code = ?s.code(), "capacity eviction: ListOldestChunks unavailable, disk skipped");
-                    } else if first {
-                        warn!(node_id = d.node_id, disk_id = d.disk_id, code = ?s.code(), error = %s.message(), "capacity eviction: ListOldestChunks failed, disk skipped");
-                    } else {
-                        debug!(node_id = d.node_id, disk_id = d.disk_id, code = ?s.code(), "capacity eviction: disk skipped");
-                    }
-                }
+            let res = self.scheduler.list_oldest_chunks_on_node(&d.addr, d.disk_id, LIST_LIMIT, 0).await;
+            if let Some(c) = note_list_result(&self.evict_skip_logged, "capacity eviction", &d, res) {
+                lists.push((d, c));
             }
         }
         if lists.is_empty() {
@@ -311,62 +352,7 @@ impl TieringEngine {
                 return;
             }
             let now_ms = now_millis();
-            let (mut count, mut bytes) = (0u64, 0u64);
-            for e in &evictions {
-                // A copy task targeting this node may be writing the same id.
-                if active_pairs.contains(&(e.chunk_id.clone(), d.node_id)) {
-                    continue;
-                }
-                let mut result = "evicted";
-                for r in &e.rows {
-                    let delocate = crate::scheduler::SchedulerDelocate {
-                        sched: &*self.scheduler,
-                        remove_req: dtfs_raft::ClientRequest::RemoveChunkLocation {
-                            now_ms: now_millis(),
-                            path: r.file_path.clone(),
-                            chunk_index: r.chunk_index,
-                            node_id: d.node_id.to_string(),
-                            disk_id: d.disk_id,
-                            enforce_anchor: r.enforce_anchor.clone(),
-                            chunk_hash: named.then(|| e.chunk_id.clone()),
-                        },
-                        node_addr: d.addr.clone(),
-                        chunk_id: e.chunk_id.clone(),
-                        disk_id: d.disk_id,
-                        tier: e.tier.to_string(),
-                    };
-                    match crate::scheduler::delocate_replica(&delocate).await {
-                        crate::scheduler::DelocateOutcome::Done => {}
-                        crate::scheduler::DelocateOutcome::RemovedBytesLeftover => {
-                            warn!(chunk_id = %e.chunk_id, node_id = d.node_id, disk_id = d.disk_id, "capacity eviction: byte delete failed after Raft remove (orphan reaper reclaims it)");
-                            result = "rpc_failed_after_remove";
-                        }
-                        crate::scheduler::DelocateOutcome::RemoveFailed => {
-                            warn!(chunk_id = %e.chunk_id, node_id = d.node_id, disk_id = d.disk_id, file = %r.file_path, "capacity eviction: RemoveChunkLocation refused or failed, copy kept");
-                            result = "remove_failed";
-                            break;
-                        }
-                    }
-                }
-                self.audit.log(
-                    "tiering",
-                    "cache.evict_capacity",
-                    &format!(
-                        "chunk={} node={} disk={} tier={:?} last_read_age_secs={} pass={}",
-                        e.chunk_id,
-                        d.node_id,
-                        d.disk_id,
-                        e.tier,
-                        now_ms.saturating_sub(e.last_read_ms) / 1000,
-                        e.pass
-                    ),
-                    result,
-                );
-                if result != "remove_failed" {
-                    count += 1;
-                    bytes += e.size_bytes;
-                }
-            }
+            let (count, bytes) = self.dispatch_removals(&d, &evictions, &active_pairs, named, ("cache.evict_capacity", "evicted")).await;
             if count > 0 {
                 self.evict_records
                     .lock()
@@ -374,6 +360,230 @@ impl TieringEngine {
                 let used_pct = d.used as u128 * 100 / d.total.max(1) as u128;
                 warn!(node_id = d.node_id, disk_id = d.disk_id, used_pct = used_pct as u64, evicted = count, bytes, "capacity eviction: cache copies evicted above high watermark");
             }
+        }
+    }
+
+    /// One retention round: for every hot/warm survivor disk not visited in
+    /// `RETENTION_INTERVAL_MS`, list the chunks unread for the shortest
+    /// `retention_secs` and demote the cache copies whose volume retention
+    /// elapsed (`plan_retention_demotion`). A disk that answers is "capable":
+    /// the ring-based idle demote leaves its retention-volume copies alone.
+    /// No-op while no volume sets `retention_secs`.
+    pub(super) async fn retention_demote_tick(&self) {
+        if !self.config.read().await.enabled || !self.scheduler.is_leader() {
+            return;
+        }
+        let now_ms = now_millis();
+        let (min_retention_secs, disks) = {
+            let sm = self.state_data.read().await;
+            let min = sm.volumes.values().map(|v| v.cache_replicas.retention_secs).filter(|r| *r > 0).min();
+            let Some(min) = min else { return };
+            let mut last_run = self.retention_last_run.lock();
+            let mut v = Vec::new();
+            for (nid, n) in sm.nodes.iter() {
+                for d in &n.disks {
+                    let key = (*nid, d.disk_id);
+                    if !(matches!(d.tier, DiskTier::Hot | DiskTier::Warm)
+                        && crate::scheduler::survivor_replica_tier(Some(n), d.disk_id).is_some())
+                        || !retention_due(last_run.get(&key).copied(), now_ms)
+                    {
+                        continue;
+                    }
+                    last_run.insert(key, now_ms);
+                    v.push(DiskToEvict {
+                        node_id: *nid,
+                        addr: n.grpc_addr.clone(),
+                        disk_id: d.disk_id,
+                        total: d.total_bytes,
+                        used: d.used_bytes,
+                    });
+                }
+            }
+            (min, v)
+        };
+        if disks.is_empty() {
+            return;
+        }
+        let older_than_ms = now_ms.saturating_sub(min_retention_secs.saturating_mul(1000)).max(1);
+        let mut lists: Vec<(DiskToEvict, Vec<OldestChunk>)> = Vec::new();
+        for d in disks {
+            let res = self.scheduler.list_oldest_chunks_on_node(&d.addr, d.disk_id, LIST_LIMIT, older_than_ms).await;
+            let key = (d.node_id, d.disk_id);
+            match note_list_result(&self.retention_skip_logged, "retention demote", &d, res) {
+                Some(c) => {
+                    self.retention_capable.lock().insert(key, now_ms);
+                    lists.push((d, c));
+                }
+                None => {
+                    // The ring-based idle demote takes this disk back.
+                    self.retention_capable.lock().remove(&key);
+                }
+            }
+        }
+        lists.retain(|(_, c)| !c.is_empty());
+        if lists.is_empty() {
+            return;
+        }
+
+        let hashes: HashSet<String> = lists.iter().flat_map(|(_, c)| c.iter().map(|o| o.chunk_id.clone())).collect();
+        let (chunks, volumes, named) = {
+            let sm = self.state_data.read().await;
+            (
+                eviction_chunks(&sm, &hashes),
+                tick_volume_policies(&sm),
+                dtfs_raft::state_machine::cluster_understands_named_remove(&sm),
+            )
+        };
+        let (protected, pinned, scheduled) = {
+            let st = self.precache.lock();
+            (st.protected.clone(), st.pinned.clone(), st.scheduled.clone())
+        };
+        let prot = EvictProtection { protected: &protected, scheduled: &scheduled, pinned: &pinned };
+        let mut removed = Vec::new();
+        let plans: Vec<(DiskToEvict, Vec<CapacityEviction>)> = lists
+            .into_iter()
+            .map(|(d, cands)| {
+                let ev = plan_retention_demotion(d.node_id, d.disk_id, &cands, &chunks, &volumes, &prot, now_ms, &mut removed);
+                (d, ev)
+            })
+            .collect();
+
+        let active_pairs = self.scheduler.active_replication_pairs().await;
+        for (d, demotions) in plans {
+            if demotions.is_empty() {
+                continue;
+            }
+            if !self.scheduler.is_leader() {
+                return;
+            }
+            let (count, bytes) = self.dispatch_removals(&d, &demotions, &active_pairs, named, ("cache.demote", "retention_elapsed")).await;
+            if count > 0 {
+                info!(node_id = d.node_id, disk_id = d.disk_id, demoted = count, bytes, "retention demote: cache copies unread past their volume retention removed");
+            }
+        }
+    }
+
+    /// De-locate every planned copy of one disk (Raft remove first, byte delete
+    /// after, via `delocate_replica`) and audit each as `audit.0`, result
+    /// `audit.1` on success. Skips a copy a live copy task targets. Returns the
+    /// copies and bytes removed.
+    async fn dispatch_removals(
+        &self,
+        d: &DiskToEvict,
+        evictions: &[CapacityEviction],
+        active_pairs: &HashSet<(String, u64)>,
+        named: bool,
+        audit: (&str, &'static str),
+    ) -> (u64, u64) {
+        let now_ms = now_millis();
+        let (mut count, mut bytes) = (0u64, 0u64);
+        for e in evictions {
+            // A copy task targeting this node may be writing the same id.
+            if active_pairs.contains(&(e.chunk_id.clone(), d.node_id)) {
+                continue;
+            }
+            let mut result = audit.1;
+            for r in &e.rows {
+                let delocate = crate::scheduler::SchedulerDelocate {
+                    sched: &*self.scheduler,
+                    remove_req: dtfs_raft::ClientRequest::RemoveChunkLocation {
+                        now_ms: now_millis(),
+                        path: r.file_path.clone(),
+                        chunk_index: r.chunk_index,
+                        node_id: d.node_id.to_string(),
+                        disk_id: d.disk_id,
+                        enforce_anchor: r.enforce_anchor.clone(),
+                        chunk_hash: named.then(|| e.chunk_id.clone()),
+                    },
+                    node_addr: d.addr.clone(),
+                    chunk_id: e.chunk_id.clone(),
+                    disk_id: d.disk_id,
+                    tier: e.tier.to_string(),
+                };
+                match crate::scheduler::delocate_replica(&delocate).await {
+                    crate::scheduler::DelocateOutcome::Done => {}
+                    crate::scheduler::DelocateOutcome::RemovedBytesLeftover => {
+                        warn!(chunk_id = %e.chunk_id, node_id = d.node_id, disk_id = d.disk_id, action = audit.0, "cache removal: byte delete failed after Raft remove (orphan reaper reclaims it)");
+                        result = "rpc_failed_after_remove";
+                    }
+                    crate::scheduler::DelocateOutcome::RemoveFailed => {
+                        warn!(chunk_id = %e.chunk_id, node_id = d.node_id, disk_id = d.disk_id, file = %r.file_path, action = audit.0, "cache removal: RemoveChunkLocation refused or failed, copy kept");
+                        result = "remove_failed";
+                        break;
+                    }
+                }
+            }
+            self.audit.log(
+                "tiering",
+                audit.0,
+                &format!(
+                    "chunk={} node={} disk={} tier={:?} last_read_age_secs={} pass={}",
+                    e.chunk_id,
+                    d.node_id,
+                    d.disk_id,
+                    e.tier,
+                    now_ms.saturating_sub(e.last_read_ms) / 1000,
+                    e.pass
+                ),
+                result,
+            );
+            if result != "remove_failed" {
+                count += 1;
+                bytes += e.size_bytes;
+            }
+        }
+        (count, bytes)
+    }
+}
+
+/// Cadence of the retention pass per (node, disk): the data node's last-read index only refreshes an entry every 10 min anyway.
+pub(crate) const RETENTION_INTERVAL_MS: u64 = 10 * 60 * 1000;
+/// A disk counts as retention-capable this long after its last successful
+/// `ListOldestChunks`.
+pub(crate) const RETENTION_CAPABLE_FRESH_MS: u64 = 30 * 60 * 1000;
+
+/// True when the disk's last retention pass is `RETENTION_INTERVAL_MS` old (or never ran).
+pub(crate) fn retention_due(last_run_ms: Option<u64>, now_ms: u64) -> bool {
+    last_run_ms.is_none_or(|t| now_ms.saturating_sub(t) >= RETENTION_INTERVAL_MS)
+}
+
+/// (node, disk) whose last-read index answered within `RETENTION_CAPABLE_FRESH_MS`.
+pub(crate) fn fresh_capable_disks(capable: &HashMap<(u64, u32), u64>, now_ms: u64) -> HashSet<(u64, u32)> {
+    capable
+        .iter()
+        .filter(|(_, t)| now_ms.saturating_sub(**t) <= RETENTION_CAPABLE_FRESH_MS)
+        .map(|(k, _)| *k)
+        .collect()
+}
+
+/// `Some(list)` on success (and forget earlier skip logs for the disk); on an
+/// error log once per (disk, code): info for the expected Unimplemented /
+/// FailedPrecondition / Unavailable, warn otherwise.
+fn note_list_result(
+    logged: &parking_lot::Mutex<HashSet<(u64, u32, i32)>>,
+    what: &str,
+    d: &DiskToEvict,
+    res: Result<Vec<OldestChunk>, tonic::Status>,
+) -> Option<Vec<OldestChunk>> {
+    match res {
+        Ok(c) => {
+            logged.lock().retain(|k| (k.0, k.1) != (d.node_id, d.disk_id));
+            Some(c)
+        }
+        Err(s) => {
+            let first = logged.lock().insert((d.node_id, d.disk_id, s.code() as i32));
+            let expected = matches!(
+                s.code(),
+                tonic::Code::Unimplemented | tonic::Code::FailedPrecondition | tonic::Code::Unavailable
+            );
+            if first && expected {
+                info!(node_id = d.node_id, disk_id = d.disk_id, code = ?s.code(), what, "ListOldestChunks unavailable, disk skipped");
+            } else if first {
+                warn!(node_id = d.node_id, disk_id = d.disk_id, code = ?s.code(), error = %s.message(), what, "ListOldestChunks failed, disk skipped");
+            } else {
+                debug!(node_id = d.node_id, disk_id = d.disk_id, code = ?s.code(), what, "disk skipped");
+            }
+            None
         }
     }
 }
@@ -401,6 +611,7 @@ mod tests {
                 promote_reads: 2,
                 promote_window_secs: 14_400,
                 cooldown_secs: 300,
+                retention_secs: 0,
             },
             // Any-tier anchor: a leli warm cache copy can be the only anchor copy.
             anchor: Some(AnchorPolicy { datacenter: "LELI".into(), required_tier: None }),
@@ -430,6 +641,7 @@ mod tests {
             cooldown_until_ms: 0,
             reads_in_window_by_dc: HashMap::new(),
             file_updated_at_ms: 0,
+            idle_reads_by_dc: None,
         }
     }
 
@@ -605,6 +817,125 @@ mod tests {
         assert!(second.is_empty(), "the second leli copy is the last anchor copy");
     }
 
+    // --- retention ----------------------------------------------------------
+
+    const R: u64 = 86_400; // retention_secs
+    const T: u64 = 10_000_000_000; // now_ms
+
+    fn ret_vols() -> HashMap<String, TickVolumePolicy> {
+        vols()
+            .into_iter()
+            .map(|(k, mut p)| {
+                p.cache.retention_secs = R;
+                (k, p)
+            })
+            .collect()
+    }
+
+    fn plan_ret_with(cands: &[OldestChunk], chunks: &HashMap<String, Vec<TickChunk>>, vols: &HashMap<String, TickVolumePolicy>, prot: &Prot) -> Vec<CapacityEviction> {
+        plan_retention_demotion(N, 0, cands, chunks, vols, &prot.view(), T, &mut Vec::new())
+    }
+
+    fn plan_ret(cands: &[OldestChunk], chunks: &HashMap<String, Vec<TickChunk>>, prot: &Prot) -> Vec<CapacityEviction> {
+        plan_ret_with(cands, chunks, &ret_vols(), prot)
+    }
+
+    /// Unread for exactly the retention.
+    fn aged(hash: &str) -> OldestChunk {
+        cand(hash, T - R * 1000, 10)
+    }
+
+    /// Each refused shape sits between two demotable candidates; only those two go.
+    fn assert_ret_skipped(chunks: HashMap<String, Vec<TickChunk>>, prot: &Prot) {
+        let mut chunks = chunks;
+        chunks.extend(std_world(&["ok1", "ok2"]));
+        let cands = [aged("ok1"), aged("x"), aged("ok2")];
+        assert_eq!(ids(&plan_ret(&cands, &chunks, prot)), ["ok1", "ok2"]);
+    }
+
+    #[test]
+    fn retention_demotes_at_exactly_elapsed_and_keeps_one_ms_short() {
+        let chunks = std_world(&["a", "b"]);
+        let cands = [aged("a"), cand("b", T - R * 1000 + 1, 10)];
+        let ev = plan_ret(&cands, &chunks, &Prot::none());
+        assert_eq!(ids(&ev), ["a"]);
+        assert_eq!(ev[0].rows, vec![EvictRow { file_path: "/f/a".into(), chunk_index: 0, enforce_anchor: policy(0).anchor }]);
+        // No retention on the volume: the ring-based idle demote owns it.
+        assert!(plan_ret_with(&cands, &chunks, &vols(), &Prot::none()).is_empty());
+    }
+
+    #[test]
+    fn retention_keeps_mandatory_anchor_and_last_live_copies() {
+        assert_ret_skipped(one("x", vec![tc("x", "/m/x", "m", std_placements())]), &Prot::none());
+        let only_leli = vec![pl(3, "nrb", DiskTier::Cold, true), pl(N, "leli", DiskTier::Warm, true)];
+        assert_ret_skipped(one("x", vec![tc("x", "/f/x", "v", only_leli)]), &Prot::none());
+        let anchor_pending = vec![pl(3, "nrb", DiskTier::Cold, true), pl(N, "toro", DiskTier::Warm, true)];
+        assert_ret_skipped(one("x", vec![tc("x", "/f/x", "v", anchor_pending)]), &Prot::none());
+        let dead_other = vec![pl(1, "leli", DiskTier::Cold, false), pl(N, "toro", DiskTier::Warm, true)];
+        assert_ret_skipped(one("x", vec![tc("x", "/f/x", "v", dead_other)]), &Prot::none());
+    }
+
+    #[test]
+    fn retention_keeps_a_hash_shared_with_a_mandatory_or_non_retention_row() {
+        let rows = vec![tc("x", "/f/x", "v", std_placements()), tc("x", "/m/x", "m", std_placements())];
+        assert_ret_skipped(one("x", rows), &Prot::none());
+        // Volume "n" has no retention: its row keeps the copy.
+        let mut vols = ret_vols();
+        vols.insert("n".into(), policy(0));
+        let rows = vec![tc("x", "/f/x", "v", std_placements()), tc("x", "/n/x", "n", std_placements())];
+        assert!(plan_ret_with(&[aged("x")], &one("x", rows), &vols, &Prot::none()).is_empty());
+    }
+
+    #[test]
+    fn retention_never_takes_protected_scheduled_or_pinned_copies() {
+        for prot in [
+            Prot { protected: [("x".to_string(), N, 0)].into(), ..Prot::none() },
+            Prot { scheduled: [("x".to_string(), N)].into(), ..Prot::none() },
+            Prot { protected: [("x".to_string(), N, 0)].into(), pinned: [("x".to_string(), N, 0)].into(), ..Prot::none() },
+        ] {
+            assert_ret_skipped(std_world(&["x"]), &prot);
+        }
+    }
+
+    #[test]
+    fn retention_respects_the_fresh_copy_grace() {
+        // Grace = promote_window_secs (14 400) + 180 s since the file's last update / replica add.
+        let grace_ms = (14_400 + 180) * 1000;
+        let fresh = |updated: u64| {
+            let mut t = tc("x", "/f/x", "v", std_placements());
+            t.file_updated_at_ms = updated;
+            one("x", vec![t])
+        };
+        assert!(plan_ret(&[aged("x")], &fresh(T - grace_ms + 1), &Prot::none()).is_empty());
+        assert_eq!(ids(&plan_ret(&[aged("x")], &fresh(T - grace_ms), &Prot::none())), ["x"]);
+    }
+
+    /// The ring-based idle demote would be gated off (new leader, a ring evicted
+    /// at the key cap); the node-local retention pass does not consult it.
+    #[test]
+    fn retention_ignores_the_ring_tenure_and_eviction_gates() {
+        assert!(!crate::tiering::idle_demote_allowed(T, T - 1_000, T - 1_000, R));
+        assert_eq!(ids(&plan_ret(&[aged("a")], &std_world(&["a"]), &Prot::none())), ["a"]);
+    }
+
+    #[test]
+    fn retention_is_capped_per_round() {
+        let hs: Vec<String> = (0..600).map(|i| format!("h{i:03}")).collect();
+        let refs: Vec<&str> = hs.iter().map(String::as_str).collect();
+        let cands: Vec<OldestChunk> = hs.iter().map(|h| aged(h)).collect();
+        assert_eq!(plan_ret(&cands, &std_world(&refs), &Prot::none()).len(), MAX_EVICTIONS_PER_ROUND);
+    }
+
+    #[test]
+    fn retention_cadence_and_capable_freshness() {
+        assert!(retention_due(None, 0));
+        assert!(!retention_due(Some(1_000), 1_000 + RETENTION_INTERVAL_MS - 1));
+        assert!(retention_due(Some(1_000), 1_000 + RETENTION_INTERVAL_MS));
+        let m: HashMap<(u64, u32), u64> = [((1, 0), 1_000), ((2, 0), 999)].into();
+        let fresh = fresh_capable_disks(&m, 1_000 + RETENTION_CAPABLE_FRESH_MS);
+        assert_eq!(fresh, [(1, 0)].into());
+    }
+
     // --- SM view ----------------------------------------------------------
 
     fn node(id: u64, dc: &str, tier: DiskTier, health: HealthStatus) -> dtfs_raft::NodeInfo {
@@ -677,16 +1008,22 @@ mod tests {
     /// Random placements, policies and candidate lists over several full disks
     /// in one round: after removing every planned row, each chunk keeps its live
     /// mandatory replicas and, if it had one, a live anchor copy; no mandatory
-    /// row and no pinned copy is ever planned.
+    /// row and no pinned copy is ever planned. Odd seeds plan capacity
+    /// eviction, even seeds retention demotion (random `retention_secs`, 0 =
+    /// unset): there additionally no protected copy and no row whose volume
+    /// retention has not elapsed is planned.
     #[test]
     fn property_evictions_keep_mandatory_and_anchor() {
         let dcs = ["leli", "toro", "nrb"];
         let tiers = [DiskTier::Hot, DiskTier::Warm, DiskTier::Cold];
-        for seed in 1..300u64 {
+        const NOW_P: u64 = 3_000;
+        for seed in 1..600u64 {
+            let retention_mode = seed % 2 == 0;
             let mut r = Rng(seed * 0x9E37_79B9_7F4A_7C15);
             let mut vols = HashMap::new();
             for v in ["a", "b", "c"] {
                 let mut p = policy(r.next(2) as u32);
+                p.cache.retention_secs = r.next(3);
                 p.mandatory.hot = r.next(2) as u32;
                 p.cache.hot = CacheTierConfig { min: 0, max: r.next(2) as u32 };
                 p.anchor = match r.next(3) {
@@ -737,18 +1074,30 @@ mod tests {
             let mut removed = Vec::new();
             let mut planned: Vec<(u64, CapacityEviction)> = Vec::new();
             for n in 1..7u64 {
-                let mut cands: Vec<OldestChunk> = (0..14).map(|h| cand(&format!("h{h}"), r.next(100), 1 + r.next(10))).collect();
+                let mut cands: Vec<OldestChunk> = (0..14).map(|h| cand(&format!("h{h}"), r.next(100) * 30, 1 + r.next(10))).collect();
                 cands.sort_by_key(|c| c.last_read_ms);
                 let target = r.next(40);
-                let ev = plan_capacity_eviction(n, 0, &cands, &chunks, &vols, &prot.view(), target, &mut removed);
+                let ev = if retention_mode {
+                    plan_retention_demotion(n, 0, &cands, &chunks, &vols, &prot.view(), NOW_P, &mut removed)
+                } else {
+                    plan_capacity_eviction(n, 0, &cands, &chunks, &vols, &prot.view(), target, &mut removed)
+                };
                 // Oldest-first, cap, and stop-at-target.
                 assert!(ev.len() <= MAX_EVICTIONS_PER_ROUND);
                 let sizes: Vec<u64> = ev.iter().map(|e| e.size_bytes).collect();
-                if let Some((_, before_last)) = sizes.split_last() {
+                if let (false, Some((_, before_last))) = (retention_mode, sizes.split_last()) {
                     assert!(before_last.iter().sum::<u64>() < target, "seed {seed}: planned past the target");
                 }
                 for e in ev {
                     assert!(!prot.pinned.contains(&(e.chunk_id.clone(), n, 0)), "seed {seed}: pin evicted");
+                    if retention_mode {
+                        assert!(!prot.protected.contains(&(e.chunk_id.clone(), n, 0)), "seed {seed}: protected copy demoted");
+                        for row in &e.rows {
+                            let vol = row.file_path.split('/').nth(1).unwrap();
+                            let ret_ms = vols[vol].cache.retention_secs * 1000;
+                            assert!(ret_ms > 0 && NOW_P - e.last_read_ms >= ret_ms, "seed {seed}: retention not elapsed");
+                        }
+                    }
                     planned.push((n, e));
                 }
             }

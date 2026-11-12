@@ -21,6 +21,7 @@ Shape returned by `GET /api/v1/volumes/{id}` ([REST API](../api-reference/rest-a
 | `cache_replicas.promote_reads` | u32 | `2` | `set-cache` |
 | `cache_replicas.promote_window_secs` | u64 | `14400` (4 h) | `set-cache` |
 | `cache_replicas.cooldown_secs` | u64 | `300` | `set-cache` |
+| `cache_replicas.retention_secs` | u64 | `0` (= `promote_window_secs`) | `set-cache`; non-zero needs every manager on v0.1.16 (409). Idle time before a cache copy is demoted, read from the data node's last-read index ([Tiering](../storage/tiering.md#retention-demotion)) |
 | `anchor.datacenter` | string | request `anchor_datacenter`; none if omitted (`[defaults].anchor_datacenter` applies only to the auto-created `default` volume) | create, `set-anchor` |
 | `anchor.required_tier` | `hot`/`warm`/`cold`/`tape` or null | null (any tier in the anchor DC) | `set-anchor` |
 | `write_safety.min_replicas_before_ack` | u32 | `[defaults.write_safety]` (2) | `set-write-safety` |
@@ -71,7 +72,7 @@ Result: every chunk has one cold replica in `leli`; two reads from a datacenter 
 
 ## Pre-caching policy
 
-`precache` (set with `dtfs-cli volumes set-precache` or `POST /api/v1/volumes/{id}/set-precache`) tells the manager to copy the files a reader is likely to open next into the reader's datacenter cache tier. It only adds cache replicas; the existing idle demote removes them.
+`precache` (set with `dtfs-cli volumes set-precache` or `POST /api/v1/volumes/{id}/set-precache`) tells the manager to copy the files a reader is likely to open next into the reader's datacenter cache tier. It only adds cache replicas; idle / retention demotion and capacity eviction remove them.
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -80,6 +81,7 @@ Result: every chunk has one cold replica in `leli`; two reads from a datacenter 
 | `next_max_gb` | 0 | GiB cap on that selection (0 = no byte cap) |
 | `series_max_gb` | 20 | GiB budget per series (plex) |
 | `max_series` | 3 | series kept pre-cached per volume per datacenter (plex) |
+| `cursor_ttl_secs` | 0 (= `cache_replicas.promote_window_secs`) | how long a played file stays a cursor after its last read; non-zero needs every manager on v0.1.16 |
 | `pins` | `[]` | up to 32 `{prefix, datacenter}` entries: subtrees kept pre-cached in a datacenter whatever the mode (see [Tiering](../storage/tiering.md#pinned-prefixes)) |
 
 Constraints for any mode other than `off`: a cache tier with `cache_replicas.<tier>.max > 0` whose `mandatory_replicas.<tier>` is 0, and `cache_replicas.per_dc = true`. A pin prefix must start with `/` and must not be `/`; the pin datacenter must match a registered node's datacenter (case-insensitive, REST answers 400 otherwise). Pins alone (mode `off`) are valid and need the same cache tier and `per_dc`. Plex needs `series_max_gb` and `max_series` above 0; files needs `next_files` or `next_max_gb` above 0. The setting needs every manager on v0.1.16 or later (409 otherwise).

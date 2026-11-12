@@ -916,6 +916,63 @@ async fn set_precache_404_400_409_and_noop() {
     assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
 }
 
+fn assert_v0_1_16_conflict(e: &(StatusCode, Json<serde_json::Value>)) {
+    assert_eq!(e.0, StatusCode::CONFLICT, "{:?}", e.1.0);
+    assert_eq!(e.1.0["min_version"], "v0.1.16");
+}
+
+/// Mixed cluster: set-cache with `retention_secs` and set-precache with
+/// `cursor_ttl_secs` are 409; on v0.1.16 both pass the gate (503 = the
+/// leaderless Raft write). 0 needs no gate.
+#[tokio::test]
+async fn retention_and_cursor_ttl_need_v0_1_16() {
+    let h = harness().await;
+    let p = || axum::extract::Path("v".to_string());
+    h.state.sm_data.write().await.volumes.insert("v".into(), precache_vol("v"));
+    let ret = |s| SetCacheRequest { retention_secs: Some(s), ..Default::default() };
+    let ttl = |s| SetPrecacheRequest { cursor_ttl_secs: Some(s), ..Default::default() };
+
+    let e = set_volume_cache_endpoint(State(h.state.clone()), p(), Json(ret(1_209_600))).await.unwrap_err();
+    assert_v0_1_16_conflict(&e);
+    assert!(e.1.0["error"].as_str().unwrap().contains("retention_secs"), "{:?}", e.1.0);
+    let e = set_volume_precache_endpoint(State(h.state.clone()), p(), Json(ttl(3600))).await.unwrap_err();
+    assert_v0_1_16_conflict(&e);
+    // retention 0 on a mixed cluster is not gated (noop here: already 0).
+    let r = set_volume_cache_endpoint(State(h.state.clone()), p(), Json(ret(0))).await.unwrap();
+    assert_eq!(r.0["changed"], false);
+
+    open_v0_1_16_gate(&mut *h.state.sm_data.write().await);
+    let e = set_volume_cache_endpoint(State(h.state.clone()), p(), Json(ret(1_209_600))).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+    let e = set_volume_precache_endpoint(State(h.state.clone()), p(), Json(ttl(3600))).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// A volume already carrying the fields is refused on a mixed cluster by
+/// every other full-config upsert too (an older applier would drop them).
+#[tokio::test]
+async fn upserts_carrying_retention_or_cursor_ttl_need_v0_1_16() {
+    let h = harness().await;
+    let p = || axum::extract::Path("v".to_string());
+    let ws = || Json(SetWriteSafetyRequest { min_replicas_before_ack: None, write_timeout_secs: Some(60) });
+    for (retention, ttl) in [(1u64, 0u64), (0, 1)] {
+        let mut v = precache_vol("v");
+        v.cache_replicas.retention_secs = retention;
+        v.precache.cursor_ttl_secs = ttl;
+        h.state.sm_data.write().await.volumes.insert("v".into(), v);
+        let e = set_volume_write_safety_endpoint(State(h.state.clone()), p(), ws()).await.unwrap_err();
+        assert_v0_1_16_conflict(&e);
+        let e = set_volume_cache_endpoint(State(h.state.clone()), p(), Json(SetCacheRequest { promote_reads: Some(9), ..Default::default() }))
+            .await
+            .unwrap_err();
+        assert_v0_1_16_conflict(&e);
+    }
+    // Neither field set: the same upsert passes the gate (503 = leaderless write).
+    h.state.sm_data.write().await.volumes.insert("v".into(), precache_vol("v"));
+    let e = set_volume_write_safety_endpoint(State(h.state.clone()), p(), ws()).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::SERVICE_UNAVAILABLE);
+}
+
 #[test]
 fn apply_set_precache_pins_replace_and_validate() {
     use dtfs_common::types::PrecachePin;

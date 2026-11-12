@@ -407,6 +407,25 @@ fn upsert_volume_v1_entry_defaults_cas_fields() {
     assert_eq!(snap_volume_version(), 0);
 }
 
+/// The v1 fixtures predate `cache_replicas.retention_secs` and
+/// `precache.cursor_ttl_secs`: both load as 0 (= the promote window).
+#[test]
+fn v1_fixtures_default_retention_and_cursor_ttl() {
+    let snap = deserialize_snapshot(io::Cursor::new(SNAPSHOT_V1.as_bytes().to_vec())).unwrap();
+    let v = &snap.volumes["default"];
+    assert_eq!((v.cache_replicas.retention_secs, v.precache.cursor_ttl_secs), (0, 0));
+    assert_eq!(v.cache_replicas.effective_retention_secs(), v.cache_replicas.promote_window_secs);
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V1).unwrap();
+    let cfg = reqs
+        .iter()
+        .find_map(|r| match r {
+            ClientRequest::UpsertVolume { config, .. } => Some(config),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!((cfg.cache_replicas.retention_secs, cfg.precache.cursor_ttl_secs), (0, 0));
+}
+
 /// The v1 fixture predates the audit `now_ms` on these variants: it must
 /// default to 0 (apply then falls back to `log_id.index`).
 #[test]
