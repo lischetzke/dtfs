@@ -6,7 +6,7 @@
 //! on the disk (~60 B/entry). Best-effort: a corrupt or missing file only
 //! loses retention precision, never blocks startup. Scrub never touches it.
 
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -95,20 +95,22 @@ impl LastReadIndex {
             return Err(ListError::NotReady);
         }
         let limit = if limit == 0 { LIST_MAX } else { limit.min(LIST_MAX) };
-        let mut v: Vec<(Key, u64, u64)> = self
-            .map
-            .lock()
-            .iter()
-            .filter(|(_, e)| older_than_ms == 0 || e.0 <= older_than_ms)
-            .filter(|(k, e)| after.is_none_or(|(ms, id)| (e.0, **k) > (ms, id)))
-            .map(|(k, e)| (*k, e.0, e.1))
-            .collect();
-        if v.len() > limit {
-            v.select_nth_unstable_by_key(limit - 1, |x| (x.1, x.0));
-            v.truncate(limit);
+        // Max-heap of the `limit` smallest (ms, id, size): bounded, no copy of the map under the lock.
+        let mut heap: BinaryHeap<(u64, Key, u64)> = BinaryHeap::with_capacity(limit);
+        for (k, e) in self.map.lock().iter() {
+            if (older_than_ms != 0 && e.0 > older_than_ms) || after.is_some_and(|(ms, id)| (e.0, *k) <= (ms, id)) {
+                continue;
+            }
+            let item = (e.0, *k, e.1);
+            if heap.len() < limit {
+                heap.push(item);
+            } else if let Some(mut top) = heap.peek_mut() {
+                if item < *top {
+                    *top = item;
+                }
+            }
         }
-        v.sort_by_key(|x| (x.1, x.0));
-        Ok(v)
+        Ok(heap.into_sorted_vec().into_iter().map(|(ms, k, size)| (k, ms, size)).collect())
     }
 
     /// Seed from the on-disk chunk walk (`walked`: id, `.dat` mtime, size) and
@@ -174,9 +176,11 @@ impl LastReadIndex {
     }
 
     fn write_file(&self) -> std::io::Result<()> {
-        let mut text = String::new();
-        for (k, e) in self.map.lock().iter() {
-            text.push_str(&format!("{}\t{}\n", hex::encode(k), e.0));
+        // Snapshot under the lock, format after: `touch` takes it on the read path.
+        let snap: Vec<(Key, u64)> = self.map.lock().iter().map(|(k, e)| (*k, e.0)).collect();
+        let mut text = String::with_capacity(snap.len() * 80);
+        for (k, ms) in snap {
+            text.push_str(&format!("{}\t{}\n", hex::encode(k), ms));
         }
         let tmp = self.file.with_extension("tsv.tmp");
         let mut f = std::fs::File::create(&tmp)?;
