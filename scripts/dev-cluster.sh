@@ -692,10 +692,17 @@ cmd_cache_check() {
   [ "${PIPESTATUS[0]}" = 0 ] || { fail "bulk.bin read"; RC=1; }
   local OLD; OLD="$(docker exec -e DTFS_SECRET="$SECRET" dtfs-dev-nfs-toro python3 -c "$CACHE_PY" leader)"
   [ -n "$OLD" ] || { fail "no leader to restart"; exit 1; }
-  tlog "restarting leader $OLD"
-  docker restart dtfs-dev-$OLD >/dev/null
+  # stop (not restart): a restarted leader reclaims leadership from its own vote
+  tlog "stopping leader $OLD until another manager leads"
+  docker stop dtfs-dev-$OLD >/dev/null
+  local NEW="" i
+  for i in $(seq 1 60); do
+    NEW="$(docker exec -e DTFS_SECRET="$SECRET" dtfs-dev-nfs-toro python3 -c "$CACHE_PY" leader 2>/dev/null || true)"
+    [ -n "$NEW" ] && [ "$NEW" != "$OLD" ] && break; sleep 2
+  done
+  docker start dtfs-dev-$OLD >/dev/null
   py healthy
-  tlog "new leader and election time above (restarted $OLD)"
+  [ -n "$NEW" ] && [ "$NEW" != "$OLD" ] && pass "leader changed $OLD -> $NEW" || { fail "no other leader after stopping $OLD"; RC=1; }
 
   sleep_until $((TA + 900)) "tA+15 min"
   py present $P/A
