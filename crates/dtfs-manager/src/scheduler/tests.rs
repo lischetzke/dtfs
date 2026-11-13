@@ -3494,7 +3494,8 @@ mod link_budget_wiring_tests {
     use dtfs_common::config::TieringLink;
     use dtfs_common::types::DiskInfo;
 
-    const MB10: u64 = 10_000_000;
+    // The 1 Mbps bucket holds two max chunks (134 MB): one 100 MB copy fits, two do not.
+    const CHUNK: u64 = 100_000_000;
 
     fn node(dc: &str, tier: DiskTier) -> dtfs_raft::NodeInfo {
         dtfs_raft::NodeInfo {
@@ -3528,7 +3529,7 @@ mod link_budget_wiring_tests {
         dtfs_raft::state_machine::FileMetadata {
             path: path.to_string(),
             volume_id: "default".to_string(),
-            chunk_size: MB10,
+            chunk_size: CHUNK,
             chunks: chunks
                 .iter()
                 .enumerate()
@@ -3537,7 +3538,7 @@ mod link_budget_wiring_tests {
                     chunk_hash: (*h).to_string(),
                     node_id: n.to_string(),
                     disk_id: 0,
-                    size_bytes: MB10,
+                    size_bytes: CHUNK,
                 })
                 .collect(),
             created_at_ms: 0,
@@ -3552,7 +3553,7 @@ mod link_budget_wiring_tests {
     }
 
     fn toro_link(s: &TaskScheduler) {
-        // 1 Mbps: 15 MB burst, so one 10 MB chunk fits and the second does not.
+        // 1 Mbps: the bucket holds two max chunks (134 MB), see CHUNK.
         s.set_links(vec![TieringLink { to_dc: "TORO".into(), max_mbps: 1 }]);
     }
 
@@ -3579,7 +3580,7 @@ mod link_budget_wiring_tests {
         use ScheduleOutcome::*;
         assert_eq!(out, vec![New, Throttled, New]);
         let st = &s.link_budget_status()[0];
-        assert_eq!((st.skipped_requests, st.skipped_bytes), (1, MB10));
+        assert_eq!((st.skipped_requests, st.skipped_bytes), (1, CHUNK));
     }
 
     /// A repair copy skipped for the link budget records nothing and is
@@ -3596,7 +3597,7 @@ mod link_budget_wiring_tests {
         }
         toro_link(s);
         // Drain the bucket to well below one chunk.
-        assert!(s.link_budget.lock().admit("leli", "toro", 15_000_000, now_millis()));
+        assert!(s.link_budget.lock().admit("leli", "toro", 50_000_000, now_millis()));
         let mut ms = MigrationState::default();
         s.check_under_replicated(&mut ms).await;
         assert!(ms.tasks.is_empty(), "throttled: no task recorded");

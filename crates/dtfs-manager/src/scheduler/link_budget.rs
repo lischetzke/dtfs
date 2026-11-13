@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use dtfs_common::config::TieringLink;
+use dtfs_common::config::{TieringLink, MAX_CHUNK_SIZE_BYTES};
 use serde::Serialize;
 use tracing::info;
 
@@ -14,6 +14,13 @@ use crate::precache::refill_tokens;
 pub(crate) const LINK_BURST_SECS: u64 = 120;
 /// At most one info line per DC per this window about skipped copies.
 const SKIP_LOG_EVERY_MS: u64 = 60_000;
+
+/// Bucket depth: the 120 s burst, but at least two max-size chunks,
+/// independent of the request. One chunk is not enough: a small copy taken
+/// from a full one-chunk bucket would leave a max chunk short forever.
+fn bucket_cap(mbps: u64) -> u64 {
+    (mbps * 125_000 * LINK_BURST_SECS).max(2 * MAX_CHUNK_SIZE_BYTES)
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct LinkBudget {
@@ -74,8 +81,9 @@ impl LinkBudget {
             .buckets
             .entry(dc.to_ascii_lowercase())
             .or_insert_with(|| Bucket { tokens: u64::MAX, at_ms: now_ms, ..Default::default() });
-        // A chunk larger than the burst must still fit eventually (min_cap).
-        b.tokens = refill_tokens(b.tokens, b.at_ms, now_ms, mbps, LINK_BURST_SECS, bytes);
+        // Not the request size as the cap: smaller copies would clip the
+        // balance back below a large chunk that is waiting.
+        b.tokens = refill_tokens(b.tokens, b.at_ms, now_ms, mbps, LINK_BURST_SECS, bucket_cap(mbps));
         b.at_ms = now_ms;
         if bytes <= b.tokens {
             b.tokens -= bytes;
@@ -113,8 +121,8 @@ impl LinkBudget {
                 LinkBacklog {
                     to_dc: l.to_dc.clone(),
                     max_mbps: l.max_mbps,
-                    // Untouched bucket: full burst.
-                    tokens_bytes: b.map_or(l.max_mbps * 125_000 * LINK_BURST_SECS, |b| b.tokens),
+                    // Untouched bucket: full.
+                    tokens_bytes: b.map_or(bucket_cap(l.max_mbps), |b| b.tokens),
                     skipped_requests: b.map_or(0, |b| b.skipped),
                     skipped_bytes: b.map_or(0, |b| b.skipped_bytes),
                 }
@@ -127,7 +135,8 @@ impl LinkBudget {
 mod tests {
     use super::*;
 
-    const BURST_1MBPS: u64 = 125_000 * LINK_BURST_SECS; // 15 MB
+    // The 1 Mbps burst (15 MB) is below two max chunks, so the bucket holds two.
+    const BURST_1MBPS: u64 = 2 * MAX_CHUNK_SIZE_BYTES;
 
     fn budget(links: &[(&str, u64)]) -> LinkBudget {
         LinkBudget::new(links.iter().map(|(d, m)| TieringLink { to_dc: (*d).into(), max_mbps: *m }).collect())
@@ -162,7 +171,27 @@ mod tests {
     #[test]
     fn chunk_larger_than_burst_still_fits_eventually() {
         let mut lb = budget(&[("leli", 1)]);
-        assert!(lb.admit("toro", "leli", BURST_1MBPS * 2, 1_000_000));
+        assert!(lb.admit("toro", "leli", MAX_CHUNK_SIZE_BYTES, 1_000_000));
+    }
+
+    /// 2 Mbps x 120 s = 30 MB burst < one 64 MiB chunk: smaller copies in
+    /// between must not cut the balance back below the large chunk.
+    #[test]
+    fn large_chunk_not_starved_by_smaller_ones() {
+        let big = MAX_CHUNK_SIZE_BYTES;
+        let mut lb = budget(&[("leli", 2)]);
+        let mut t = 1_000_000;
+        assert!(lb.admit("toro", "leli", big, t));
+        let mut admitted = false;
+        for _ in 0..360 {
+            t += 10_000;
+            assert!(lb.admit("toro", "leli", 1_000_000, t));
+            if lb.admit("toro", "leli", big, t) {
+                admitted = true;
+                break;
+            }
+        }
+        assert!(admitted, "64 MiB chunk never admitted within an hour at 2 Mbps");
     }
 
     #[test]
