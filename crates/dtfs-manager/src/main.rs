@@ -8,6 +8,7 @@ use tracing_subscriber::EnvFilter;
 mod alerts;
 mod api;
 mod audit;
+mod cache_stats;
 mod goal_check;
 mod membership;
 mod metadata;

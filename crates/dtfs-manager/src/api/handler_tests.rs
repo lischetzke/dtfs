@@ -1133,3 +1133,77 @@ async fn metrics_include_precache_gauges_for_seeded_status() {
     let (_, _, plain) = super::cluster::prometheus_metrics(State(h.state.clone())).await;
     assert!(!plain.contains("dtfs_precache"));
 }
+
+// ---- cache observability ---------------------------------------------------------
+
+/// A warm disk on an unreachable node plus a cold-only node.
+async fn seed_cache_nodes(h: &super::test_support::Harness) {
+    use dtfs_common::types::{DiskInfo, DiskStatus, DiskTier};
+    let disk = |tier| DiskInfo {
+        disk_id: 7,
+        uuid: String::new(),
+        mount_path: String::new(),
+        tier,
+        total_bytes: 1000,
+        used_bytes: 250,
+        status: DiskStatus::Healthy,
+    };
+    let mut warm = data_node(now_ms());
+    warm.hostname = "data-warm01".into();
+    warm.grpc_addr = "http://127.0.0.1:1".into();
+    warm.location = dtfs_common::topology::Location::new("lab", "toro", "r1", "data-warm01");
+    warm.disks = vec![disk(DiskTier::Warm)];
+    let mut cold = data_node(now_ms());
+    cold.disks = vec![disk(DiskTier::Cold)];
+    let mut sm = h.state.sm_data.write().await;
+    sm.nodes.insert(4, warm);
+    sm.nodes.insert(1, cold);
+}
+
+#[tokio::test]
+async fn cache_status_as_follower_is_409_not_the_leader() {
+    let h = super::test_support::harness().await;
+    let e = get_cache_status(State(h.state.clone())).await.unwrap_err();
+    assert_eq!(e.0, StatusCode::CONFLICT);
+    assert!(e.1.0["error"].as_str().unwrap().contains("not the leader"), "{:?}", e.1.0);
+}
+
+/// Hot/warm disks only; an unreachable data node gives null plus `oldest_error`.
+#[tokio::test]
+async fn cache_status_shape_and_unreachable_node_gives_null_plus_error() {
+    let h = super::test_support::leader_harness().await;
+    seed_cache_nodes(&h).await;
+    let j = get_cache_status(State(h.state.clone())).await.unwrap().0;
+    let t = &h.state.config.tiering;
+    assert_eq!(j["watermarks"], json!({"high_pct": t.cache_high_watermark_pct, "low_pct": t.cache_low_watermark_pct}));
+    let disks = j["disks"].as_array().unwrap();
+    assert_eq!(disks.len(), 1, "cold disk is not a cache disk: {j}");
+    let d = &disks[0];
+    assert_eq!((d["node_id"].as_u64(), d["disk_id"].as_u64(), d["tier"].as_str()), (Some(4), Some(7), Some("warm")));
+    assert_eq!((d["hostname"].as_str(), d["dc"].as_str()), (Some("data-warm01"), Some("toro")));
+    assert_eq!((d["total_bytes"].as_u64(), d["used_bytes"].as_u64(), d["used_pct"].as_f64()), (Some(1000), Some(250), Some(25.0)));
+    assert!(d["oldest_last_read_ms"].is_null() && d["oldest_last_read_age_secs"].is_null(), "{d}");
+    assert!(!d["oldest_error"].as_str().unwrap().is_empty(), "{d}");
+    assert!(j["counters"]["removed"]["evict_capacity"].is_u64(), "{j}");
+    assert!(j["counters"]["removed"]["retention"].is_u64() && j["counters"]["removed"]["idle_demote"].is_u64());
+    assert!(j["link_budget"].is_array());
+}
+
+/// /metrics renders the cached disk view the status call stored, plus the counters.
+#[tokio::test]
+async fn metrics_include_cache_series() {
+    let h = super::test_support::leader_harness().await;
+    seed_cache_nodes(&h).await;
+    let _ = get_cache_status(State(h.state.clone())).await.unwrap();
+    let (_, _, body) = super::cluster::prometheus_metrics(State(h.state.clone())).await;
+    for want in [
+        "dtfs_cache_disk_used_bytes{node=\"data-warm01\",disk=\"7\",dc=\"toro\",tier=\"warm\"} 250",
+        "dtfs_cache_disk_total_bytes{node=\"data-warm01\",disk=\"7\",dc=\"toro\",tier=\"warm\"} 1000",
+        "dtfs_cache_removed_total{reason=\"idle_demote\"}",
+        "dtfs_cache_fill_total",
+        "dtfs_link_admitted_bytes_total",
+        "dtfs_link_tokens_bytes",
+    ] {
+        assert!(body.contains(want), "missing {want}");
+    }
+}

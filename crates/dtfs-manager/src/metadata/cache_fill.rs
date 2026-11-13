@@ -352,6 +352,24 @@ mod tests {
         assert_eq!(e.code(), Code::FailedPrecondition, "hun at max after the fill");
     }
 
+    /// A registered fill counts one commit and the chunk's bytes for the reader DC;
+    /// an idempotent repeat and a refusal count nothing.
+    #[tokio::test]
+    async fn commit_cache_fill_counts_commit_and_bytes_per_dc() {
+        let (_h, svc) = service("").await;
+        let toro = || CommitCacheFillRequest { client_dc: "toro".into(), ..req(4, 7) };
+        let fill = || crate::cache_stats::STATS.counters().fill.get("toro").copied();
+        assert_eq!(fill(), None);
+        svc.commit_cache_fill(Request::new(toro())).await.unwrap();
+        assert_eq!(fill(), Some((1, 1024)));
+        svc.commit_cache_fill(Request::new(toro())).await.unwrap();
+        assert_eq!(fill(), Some((1, 1024)), "idempotent repeat is not a second commit");
+        let wrong_dc = CommitCacheFillRequest { client_dc: "hun".into(), ..req(4, 7) };
+        let e = svc.commit_cache_fill(Request::new(wrong_dc)).await.unwrap_err();
+        assert_eq!(e.code(), Code::FailedPrecondition);
+        assert_eq!(fill(), Some((1, 1024)), "refusal counts nothing");
+    }
+
     /// With a shared secret, an unstamped or wrongly bound request is refused.
     #[tokio::test]
     async fn commit_cache_fill_requires_mgr_rpc_auth() {

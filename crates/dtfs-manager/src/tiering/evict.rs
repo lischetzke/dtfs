@@ -602,6 +602,11 @@ impl TieringEngine {
             if result != "remove_failed" {
                 count += 1;
                 bytes += e.size_bytes;
+                crate::cache_stats::STATS.note_removed(if audit.0 == "cache.evict_capacity" {
+                    crate::cache_stats::Removed::EvictCapacity
+                } else {
+                    crate::cache_stats::Removed::Retention
+                });
             }
         }
         (count, bytes)
@@ -1334,5 +1339,105 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn live_node(dc: &str, disk_id: u32, tier: DiskTier) -> dtfs_raft::NodeInfo {
+        dtfs_raft::NodeInfo {
+            role: NodeRole::Data,
+            hostname: format!("h-{dc}"),
+            // Nothing listens here: the byte delete after the Raft remove fails fast.
+            grpc_addr: "http://127.0.0.1:1".into(),
+            location: Location::new("lab", dc, "r1", dc),
+            disks: vec![DiskInfo {
+                disk_id,
+                uuid: String::new(),
+                mount_path: String::new(),
+                tier,
+                total_bytes: 1000,
+                used_bytes: 900,
+                status: DiskStatus::Healthy,
+            }],
+            total_capacity: 1000,
+            used_capacity: 900,
+            health: HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        }
+    }
+
+    fn file_with(path: &str, rows: &[(u64, u32)]) -> dtfs_raft::state_machine::FileMetadata {
+        dtfs_raft::state_machine::FileMetadata {
+            path: path.into(),
+            volume_id: "default".into(),
+            chunk_size: 4 << 20,
+            chunks: rows
+                .iter()
+                .map(|(n, d)| dtfs_raft::ChunkLocationEntry {
+                    chunk_index: 0,
+                    chunk_hash: format!("h{path}"),
+                    node_id: n.to_string(),
+                    disk_id: *d,
+                    size_bytes: 10,
+                })
+                .collect(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            symlink_target: None,
+            logical_size: None,
+            is_directory: false,
+            cache_cooldown_until_ms: Default::default(),
+            ever_committed: None,
+            replica_added_at_ms: 0,
+        }
+    }
+
+    fn one_eviction(path: &str) -> CapacityEviction {
+        CapacityEviction {
+            chunk_id: format!("h{path}"),
+            last_read_ms: 1,
+            size_bytes: 10,
+            tier: DiskTier::Warm,
+            pass: 1,
+            rows: vec![EvictRow { file_path: path.into(), chunk_index: 0, enforce_anchor: None }],
+        }
+    }
+
+    /// Each removal reason bumps its own counter once per removed copy; a refused
+    /// Raft remove (last live replica) bumps nothing.
+    #[tokio::test]
+    async fn dispatch_removals_counts_by_reason_and_not_on_refusal() {
+        use crate::cache_stats::{Removed, STATS};
+        let h = crate::api::test_support::leader_harness().await;
+        {
+            let mut sm = h.state.sm_data.write().await;
+            sm.nodes.insert(1, live_node("leli", 1, DiskTier::Cold));
+            sm.nodes.insert(2, live_node("toro", 7, DiskTier::Warm));
+            for p in ["/cap", "/ret"] {
+                sm.files.insert(p.into(), file_with(p, &[(1, 1), (2, 7)]));
+            }
+            sm.files.insert("/last".into(), file_with("/last", &[(2, 7)]));
+        }
+        let engine = TieringEngine::new(h.state.config.tiering.clone(), h.state.scheduler.clone(), h.state.audit_log.clone(), h.state.sm_data.clone());
+        let d = DiskToEvict { node_id: 2, addr: "http://127.0.0.1:1".into(), disk_id: 7, total: 1000, used: 900 };
+        let none = HashSet::new();
+        let n = |r: Removed| STATS.counters().removed[r as usize];
+        let (cap0, ret0) = (n(Removed::EvictCapacity), n(Removed::Retention));
+
+        let (count, _) = engine.dispatch_removals(&d, &[one_eviction("/cap")], &none, false, ("cache.evict_capacity", "evicted")).await;
+        assert_eq!(count, 1);
+        assert_eq!((n(Removed::EvictCapacity), n(Removed::Retention)), (cap0 + 1, ret0));
+
+        let (count, _) = engine.dispatch_removals(&d, &[one_eviction("/ret")], &none, false, ("cache.demote", "retention_elapsed")).await;
+        assert_eq!(count, 1);
+        assert_eq!((n(Removed::EvictCapacity), n(Removed::Retention)), (cap0 + 1, ret0 + 1));
+
+        let (count, _) = engine.dispatch_removals(&d, &[one_eviction("/last")], &none, false, ("cache.evict_capacity", "evicted")).await;
+        assert_eq!(count, 0, "last live replica refused");
+        assert_eq!((n(Removed::EvictCapacity), n(Removed::Retention)), (cap0 + 1, ret0 + 1));
     }
 }

@@ -149,6 +149,12 @@ impl TieringEngine {
         }
     }
 
+    /// Runtime `(cache_high_watermark_pct, cache_low_watermark_pct)`.
+    pub(crate) async fn watermarks(&self) -> (u8, u8) {
+        let c = self.config.read().await;
+        (c.cache_high_watermark_pct, c.cache_low_watermark_pct)
+    }
+
     /// Snapshot of the last pre-cache pass (default status on a follower).
     pub(crate) fn precache_status(&self) -> crate::precache::PrecacheStatus {
         self.precache.lock().status.clone()
@@ -179,7 +185,18 @@ impl TieringEngine {
             self.precache_tick().await;
             self.capacity_evict_tick().await;
             self.retention_demote_tick().await;
+            self.refresh_cache_view().await;
         }
+    }
+
+    /// Leader only, at most once per `VIEW_REFRESH_MS`: the disk view `/metrics` renders.
+    async fn refresh_cache_view(&self) {
+        use crate::cache_stats::{collect_disks, STATS, VIEW_REFRESH_MS};
+        let now_ms = now_millis();
+        if !self.scheduler.is_leader() || now_ms.saturating_sub(STATS.view_refreshed_at_ms()) < VIEW_REFRESH_MS {
+            return;
+        }
+        STATS.set_view(now_ms, collect_disks(&self.state_data, &self.scheduler).await);
     }
 
     async fn precache_tick(&self) {
@@ -265,6 +282,8 @@ impl TieringEngine {
                         batch.new += 1;
                         batch.bytes += c.bytes;
                         scheduled.insert(pair);
+                        let dc = self.state_data.read().await.nodes.get(&c.target_node).map(|n| n.location.datacenter.clone());
+                        crate::cache_stats::STATS.note_scheduled(crate::cache_stats::Scheduled::Precache, &dc.unwrap_or_default());
                     }
                     ScheduleOutcome::AlreadyScheduled => {
                         batch.already += 1;
@@ -795,6 +814,7 @@ impl TieringEngine {
             if *o != crate::scheduler::ScheduleOutcome::New {
                 continue;
             }
+            crate::cache_stats::STATS.note_scheduled(crate::cache_stats::Scheduled::Promote, &p.target_dc);
             self.audit.log(
                 "tiering",
                 "cache.promote",
@@ -953,6 +973,7 @@ impl TieringEngine {
                     continue;
                 }
                 crate::scheduler::DelocateOutcome::Done => {
+                    crate::cache_stats::STATS.note_removed(crate::cache_stats::Removed::IdleDemote);
                     self.audit.log(
                         "tiering",
                         "cache.demote",
@@ -969,6 +990,7 @@ impl TieringEngine {
                         node = d.node_id,
                         "Bug AV demote: DeleteChunkReplica failed after Raft remove (orphan reaper will reclaim leftover bytes)"
                     );
+                    crate::cache_stats::STATS.note_removed(crate::cache_stats::Removed::IdleDemote);
                     self.audit.log(
                         "tiering",
                         "cache.demote",
@@ -4300,5 +4322,81 @@ mod precache_wiring_tests {
         let st = engine.precache.lock();
         assert!(st.protected.is_empty());
         assert_eq!(st.activity.len(), 1);
+    }
+
+    /// The idle demote counts a removed cache copy under `idle_demote`.
+    #[tokio::test]
+    async fn idle_demote_tick_counts_removed_copy() {
+        use dtfs_common::types::{
+            CacheFill, CacheTierConfig, DiskInfo, DiskStatus, HealthStatus, NodeRole, TierReplication, VolumeConfig,
+        };
+        let h = crate::api::test_support::leader_harness().await;
+        let mk = |dc: &str, disk_id: u32, tier: DiskTier| dtfs_raft::NodeInfo {
+            role: NodeRole::Data,
+            hostname: dc.into(),
+            grpc_addr: "http://127.0.0.1:1".into(),
+            location: dtfs_common::topology::Location::new("lab", dc, "r1", dc),
+            disks: vec![DiskInfo {
+                disk_id,
+                uuid: String::new(),
+                mount_path: String::new(),
+                tier,
+                total_bytes: 1 << 40,
+                used_bytes: 0,
+                status: DiskStatus::Healthy,
+            }],
+            total_capacity: 1 << 40,
+            used_capacity: 0,
+            health: HealthStatus::Healthy,
+            last_seen_ms: 0,
+            total_bytes_read: 0,
+            total_bytes_written: 0,
+            client_ip: None,
+            version: String::new(),
+            build_date: String::new(),
+            quarantine: None,
+        };
+        let row = |n: u64, d: u32| dtfs_raft::ChunkLocationEntry {
+            chunk_index: 0,
+            chunk_hash: "hx".into(),
+            node_id: n.to_string(),
+            disk_id: d,
+            size_bytes: 10,
+        };
+        {
+            let mut sm = h.state.sm_data.write().await;
+            let mut v = VolumeConfig::default();
+            v.mandatory_replicas = TierReplication { hot: 0, warm: 0, cold: 1, tape: 0 };
+            v.cache_replicas.warm = CacheTierConfig { min: 0, max: 1 };
+            v.cache_replicas.fill = CacheFill::OnRead;
+            v.cache_replicas.promote_window_secs = 60;
+            sm.volumes.insert("default".into(), v);
+            sm.nodes.insert(1, mk("leli", 1, DiskTier::Cold));
+            sm.nodes.insert(2, mk("toro", 7, DiskTier::Warm));
+            sm.files.insert(
+                "/x".into(),
+                dtfs_raft::state_machine::FileMetadata {
+                    path: "/x".into(),
+                    volume_id: "default".into(),
+                    chunk_size: 4 << 20,
+                    chunks: vec![row(1, 1), row(2, 7)],
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    symlink_target: None,
+                    logical_size: None,
+                    is_directory: false,
+                    cache_cooldown_until_ms: Default::default(),
+                    ever_committed: None,
+                    replica_added_at_ms: 0,
+                },
+            );
+        }
+        let engine = TieringEngine::new(h.state.config.tiering.clone(), h.state.scheduler.clone(), h.state.audit_log.clone(), h.state.sm_data.clone());
+        engine.leader_since_ms.store(1, std::sync::atomic::Ordering::Relaxed);
+        let idle = || crate::cache_stats::STATS.counters().removed[crate::cache_stats::Removed::IdleDemote as usize];
+        let before = idle();
+        engine.tick_av_cache().await.unwrap();
+        assert_eq!(h.state.sm_data.read().await.files["/x"].chunks.len(), 1, "warm copy de-located");
+        assert_eq!(idle(), before + 1);
     }
 }

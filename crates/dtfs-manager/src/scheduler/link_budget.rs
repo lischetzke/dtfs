@@ -38,6 +38,8 @@ struct Bucket {
     window_start_ms: u64,
     window_skipped: u64,
     window_bytes: u64,
+    admitted_cache: u64,
+    admitted_repair: u64,
 }
 
 /// Per-link state for `GET /api/v1/tiering/precache` (`link_budget_backlog`).
@@ -49,6 +51,10 @@ pub(crate) struct LinkBacklog {
     pub tokens_bytes: i64,
     pub skipped_requests: u64,
     pub skipped_bytes: u64,
+    /// Bytes debited for cache, pre-cache and migration copies (metered links only).
+    pub admitted_cache_bytes: u64,
+    /// Bytes debited for mandatory and anchor-lag repair.
+    pub admitted_repair_bytes: u64,
 }
 
 impl LinkBudget {
@@ -107,10 +113,12 @@ impl LinkBudget {
         let need = i64::try_from(bytes).unwrap_or(i64::MAX);
         if borrow {
             b.tokens = b.tokens.saturating_sub(need).max(-cap);
+            b.admitted_repair = b.admitted_repair.saturating_add(bytes);
             return true;
         }
         if need <= b.tokens {
             b.tokens -= need;
+            b.admitted_cache = b.admitted_cache.saturating_add(bytes);
             return true;
         }
         b.skipped += 1;
@@ -149,6 +157,8 @@ impl LinkBudget {
                     tokens_bytes: b.map_or(i64::try_from(bucket_cap(l.max_mbps)).unwrap_or(i64::MAX), |b| b.tokens),
                     skipped_requests: b.map_or(0, |b| b.skipped),
                     skipped_bytes: b.map_or(0, |b| b.skipped_bytes),
+                    admitted_cache_bytes: b.map_or(0, |b| b.admitted_cache),
+                    admitted_repair_bytes: b.map_or(0, |b| b.admitted_repair),
                 }
             })
             .collect()
@@ -247,6 +257,22 @@ mod tests {
         lb.reset();
         assert_eq!(lb.status()[0].tokens_bytes, BURST_1MBPS as i64);
         assert!(lb.admit("toro", "leli", BURST_1MBPS, 1_000_000));
+    }
+
+    /// Admitted bytes are counted per kind; a refused cache copy adds nothing.
+    #[test]
+    fn admitted_bytes_by_kind() {
+        let mut lb = budget(&[("leli", 1)]);
+        let t = 1_000_000;
+        assert!(lb.admit("toro", "leli", 1_000, t));
+        assert!(lb.admit("toro", "leli", 500, t));
+        assert!(!lb.admit("toro", "leli", BURST_1MBPS, t), "over budget");
+        lb.admit_repair("toro", "leli", 300, t);
+        let s = &lb.status()[0];
+        assert_eq!((s.admitted_cache_bytes, s.admitted_repair_bytes), (1_500, 300));
+        // Unmetered (same DC) copies are not counted.
+        assert!(lb.admit("leli", "leli", 9, t));
+        assert_eq!(lb.status()[0].admitted_cache_bytes, 1_500);
     }
 
     fn tokens(lb: &LinkBudget) -> i64 {

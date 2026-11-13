@@ -301,6 +301,16 @@ Reactive promotion waits for reads to reach a datacenter. Pre-caching copies the
 
 The manager `/metrics` endpoint exposes `dtfs_tier_migrations_completed_total`, `dtfs_migration_failed_total` and `dtfs_anchor_protected_total`; the audit log records `tier.promote`, `tier.demote`, `cache.flush_replica` and `cache.flush_refused`. See [Monitoring](../operations/monitoring.md).
 
+### Observing the cache
+
+`dtfs-cli cache status` (REST `GET /api/v1/cache/status`, leader only, 409 with a leader hint elsewhere) answers whether a cache site meets its goals:
+
+- Retention: `oldest_last_read_age_secs` per hot/warm disk is the age of the least recently read chunk, asked live from the data node. When it is at least the volume's `retention_secs` (for example 14 days), nothing on that disk was evicted before its retention: the retention goal holds. A smaller value on a disk at or above the high watermark means capacity eviction is reclaiming chunks younger than the goal, so the disk is too small for the working set. `null` with `oldest_error` means the node did not answer within 2 s or tracks no chunks.
+- Oldest-read-first eviction: `counters.removed` counts copies removed by `evict_capacity`, `retention` and `idle_demote`; `watermarks` shows the thresholds each disk's `used_pct` is judged against.
+- Bounded WAN fill: `counters.fill` (commits and bytes per reader DC) and `counters.scheduled` (promotions and pre-cache copies per target DC) show what was pulled in, and `link_budget` shows per `[[tiering.links]]` entry the balance, the bytes admitted for cache and for repair, and the copies skipped because the budget was empty.
+
+The counters are leader memory: they restart at 0 with the manager or on a leader change. `/metrics` exports the same data (`dtfs_cache_*`, `dtfs_link_*`; the disk gauges are refreshed by the leader every 60 s, never per scrape). There is no dashboard page.
+
 ### Pre-cache monitoring
 
 `dtfs-cli precache status` (REST `GET /api/v1/tiering/precache`, leader only, 409 with a leader hint elsewhere) shows per datacenter the room, desired and cached bytes, whether the cache is capacity-limited, the active series and cursors with their files, the pinned prefixes (prefix, datacenter, bytes, cached bytes, `truncated`), the last scheduled batch, `live_tasks` (all scheduler tasks) with `yielded_live_tasks` (the loop scheduled nothing because of them), `inflight_tasks` (pre-cache's own copies only), and volumes skipped because their policy no longer validates. The REST response also carries `link_budget_backlog` ([link budget](#link-budget)). `/metrics` carries `dtfs_precache_is_leader`, `dtfs_precache_inflight_tasks`, `dtfs_precache_live_tasks` and `dtfs_precache_{desired_bytes,cached_bytes,series_active,capacity_limited}{dc="..."}`. A `desired_bytes` that stays above `cached_bytes` with `capacity_limited` 1 means the cache tier is too small for the plan.

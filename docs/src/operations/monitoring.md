@@ -76,7 +76,16 @@ lagging.
 | `dtfs_migration_failed_total` | counter | Migration tasks that exhausted retries (audit ring) |
 | `dtfs_audit_log_in_memory` | gauge | Entries in the capped audit ring |
 
-The last three counters are derived from a bounded audit ring, so they can drop
+The leader also exports the cache series: `dtfs_cache_disk_used_bytes`,
+`dtfs_cache_disk_total_bytes` and `dtfs_cache_oldest_last_read_age_seconds`
+(`{node,disk,dc,tier}`, refreshed every 60 s), `dtfs_cache_removed_total{reason}`,
+`dtfs_cache_fill_total{dc}`, `dtfs_cache_fill_bytes_total{dc}`,
+`dtfs_cache_scheduled_total{dc,kind}`, `dtfs_link_admitted_bytes_total{to_dc,kind}`
+and `dtfs_link_tokens_bytes{to_dc}`. The counters live in leader memory and
+restart at 0 with the manager or on a leader change, so alert on `increase()`.
+See [Observing the cache](../storage/tiering.md#observing-the-cache).
+
+The last three counters above are derived from a bounded audit ring, so they can drop
 when old entries are evicted; alert on `increase()` over short windows, not on
 absolute values. A node in `Maintenance` is counted in none of the node gauges.
 Anything else (Raft lag, per-disk usage, scrub results) comes from the REST

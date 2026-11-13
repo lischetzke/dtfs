@@ -41,6 +41,7 @@ use crate::scheduler::TaskScheduler;
 use crate::webui;
 
 mod audit;
+mod cache;
 mod chunks;
 mod cluster;
 mod config;
@@ -51,6 +52,7 @@ mod raft;
 mod remove_dead;
 mod volumes;
 use audit::*;
+use cache::*;
 use chunks::*;
 pub(crate) use cluster::*;
 pub(crate) use config::*;
@@ -236,6 +238,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/chunks/{chunk_id}", get(get_chunk))
         .route("/api/v1/memory", get(get_memory))
         .route("/api/v1/tiering/precache", get(get_precache_status))
+        .route("/api/v1/cache/status", get(get_cache_status))
         // LIS-18 — shared-secret gate on mutating REST (fail closed when
         // `[cluster].shared_secret` is set). GET + probes exempt.
         .route_layer(middleware::from_fn_with_state(

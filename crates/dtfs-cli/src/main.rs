@@ -38,6 +38,12 @@ enum PrecacheCmd {
     Status,
 }
 
+#[derive(Subcommand, Debug)]
+enum CacheCmd {
+    /// Show cache disks (usage, oldest last read), eviction/fill counters and the link budget (use the leader's --manager; a follower answers 409)
+    Status,
+}
+
 #[derive(Debug, Clone, clap::ValueEnum)]
 enum OutputFormat {
     Table,
@@ -75,6 +81,10 @@ enum Commands {
     /// Predictive pre-caching observability
     #[command(subcommand)]
     Precache(PrecacheCmd),
+
+    /// Cache observability: retention, eviction, fill and link budget
+    #[command(subcommand)]
+    Cache(CacheCmd),
 
     /// Trigger a full scrub of all disks (the server has no per-target scrub)
     Scrub {
@@ -875,6 +885,7 @@ async fn main() -> anyhow::Result<()> {
             ).await?,
         },
         Commands::Precache(PrecacheCmd::Status) => cmd_precache_status(&api, &args.format).await?,
+        Commands::Cache(CacheCmd::Status) => cmd_cache_status(&api, &args.format).await?,
         Commands::Migrations(sub) => match sub {
             MigrationsCmd::Create {
                 path_prefix, target_tier, target_dc, allow_empty_prefix, max_tasks,
@@ -1997,6 +2008,100 @@ async fn cmd_precache_status(api: &ApiClient, format: &OutputFormat) -> anyhow::
     Ok(())
 }
 
+/// `dtfs-cli cache status`: tables, or the server JSON with `--format json`.
+/// A non-2xx answer (409 not the leader) prints the body and exits non-zero.
+async fn cmd_cache_status(api: &ApiClient, format: &OutputFormat) -> anyhow::Result<()> {
+    let (status, v) = api.get_with_status("/api/v1/cache/status").await?;
+    if !status.is_success() || matches!(format, OutputFormat::Json) {
+        println!("{}", serde_json::to_string_pretty(&v)?);
+    } else {
+        print!("{}", render_cache_status(&v));
+    }
+    if !status.is_success() {
+        anyhow::bail!("cache status failed: HTTP {}", status);
+    }
+    Ok(())
+}
+
+/// "14d 3h", "5h 2m", "42m", "30s"; the two largest non-zero units.
+fn format_age(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, secs % 86_400 / 3_600, secs % 3_600 / 60);
+    match (d, h, m) {
+        (0, 0, 0) => format!("{secs}s"),
+        (0, 0, m) => format!("{m}m"),
+        (0, h, m) => format!("{h}h {m}m"),
+        (d, h, _) => format!("{d}d {h}h"),
+    }
+}
+
+/// Pure table rendering of `GET /api/v1/cache/status`; tolerates missing fields.
+fn render_cache_status(v: &Value) -> String {
+    let mut out = format!(
+        "Watermarks: high {}%  low {}%
+
+{:<16} {:<8} {:<5} {:>7} {:>10}  {}
+",
+        v["watermarks"]["high_pct"].as_u64().unwrap_or(0),
+        v["watermarks"]["low_pct"].as_u64().unwrap_or(0),
+        "NODE", "DC", "TIER", "USED", "OLDEST READ", "NOTE",
+    );
+    for d in v["disks"].as_array().into_iter().flatten() {
+        let age = d["oldest_last_read_age_secs"].as_u64().map_or("-".to_string(), format_age);
+        out.push_str(&format!(
+            "{:<16} {:<8} {:<5} {:>6.1}% {:>10}  {}
+",
+            format!("{}/{}", d["hostname"].as_str().unwrap_or("?"), d["disk_id"].as_u64().unwrap_or(0)),
+            d["dc"].as_str().unwrap_or("?"),
+            d["tier"].as_str().unwrap_or("?"),
+            d["used_pct"].as_f64().unwrap_or(0.0),
+            age,
+            d["oldest_error"].as_str().map(|e| format!("oldest unknown: {e}")).unwrap_or_default(),
+        ));
+    }
+    let c = &v["counters"];
+    let r = &c["removed"];
+    out.push_str(&format!(
+        "
+Removed copies: capacity {}  retention {}  idle {}
+",
+        r["evict_capacity"].as_u64().unwrap_or(0),
+        r["retention"].as_u64().unwrap_or(0),
+        r["idle_demote"].as_u64().unwrap_or(0),
+    ));
+    for (dc, f) in c["fill"].as_object().into_iter().flatten() {
+        out.push_str(&format!(
+            "Fill {dc}: {} commits, {}
+",
+            f["commits"].as_u64().unwrap_or(0),
+            format_bytes(f["bytes"].as_u64().unwrap_or(0)),
+        ));
+    }
+    for (dc, s) in c["scheduled"].as_object().into_iter().flatten() {
+        out.push_str(&format!(
+            "Scheduled {dc}: promote {}  precache {}
+",
+            s["promote"].as_u64().unwrap_or(0),
+            s["precache"].as_u64().unwrap_or(0),
+        ));
+    }
+    out.push_str(&format!("
+{:<10} {:>6} {:>12} {:>12} {:>12} {:>9}
+", "LINK TO", "MBPS", "TOKENS", "CACHE SENT", "REPAIR SENT", "SKIPPED"));
+    for l in v["link_budget"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "{:<10} {:>6} {:>12} {:>12} {:>12} {:>9}
+",
+            l["to_dc"].as_str().unwrap_or("?"),
+            l["max_mbps"].as_u64().unwrap_or(0),
+            l["tokens_bytes"].as_i64().unwrap_or(0),
+            format_bytes(l["admitted_cache_bytes"].as_u64().unwrap_or(0)),
+            format_bytes(l["admitted_repair_bytes"].as_u64().unwrap_or(0)),
+            l["skipped_requests"].as_u64().unwrap_or(0),
+        ));
+    }
+    out
+}
+
 fn render_precache_group(out: &mut String, title: &str, groups: &Value) {
     let Some(gs) = groups.as_array().filter(|g| !g.is_empty()) else { return };
     out.push_str(&format!("
@@ -3030,6 +3135,50 @@ mod audit_co_tests {
         let msg = value["error"].as_str().map(str::to_string)
             .unwrap_or_else(|| value.to_string());
         assert_eq!(msg, "{\"leader\":null}");
+    }
+}
+
+#[cfg(test)]
+mod cache_status_tests {
+    use super::*;
+
+    #[test]
+    fn age_formats_two_largest_units() {
+        assert_eq!(format_age(0), "0s");
+        assert_eq!(format_age(59), "59s");
+        assert_eq!(format_age(60), "1m");
+        assert_eq!(format_age(3_599), "59m");
+        assert_eq!(format_age(3_600), "1h 0m");
+        assert_eq!(format_age(5 * 3_600 + 2 * 60 + 9), "5h 2m");
+        assert_eq!(format_age(86_399), "23h 59m");
+        assert_eq!(format_age(86_400), "1d 0h");
+        assert_eq!(format_age(14 * 86_400 + 3 * 3_600 + 59), "14d 3h");
+    }
+
+    #[test]
+    fn table_shows_age_error_counters_and_link() {
+        let v = serde_json::json!({
+            "watermarks": {"high_pct": 90, "low_pct": 80},
+            "disks": [
+                {"hostname": "warm01", "disk_id": 7, "dc": "toro", "tier": "warm", "used_pct": 85.25,
+                 "oldest_last_read_age_secs": 15 * 86_400, "oldest_error": null},
+                {"hostname": "warm02", "disk_id": 1, "dc": "nrb", "tier": "hot", "used_pct": 1.0,
+                 "oldest_last_read_age_secs": null, "oldest_error": "timeout"}
+            ],
+            "counters": {"removed": {"evict_capacity": 3, "retention": 2, "idle_demote": 1},
+                         "fill": {"toro": {"commits": 4, "bytes": 2048}},
+                         "scheduled": {"toro": {"promote": 5, "precache": 6}}},
+            "link_budget": [{"to_dc": "toro", "max_mbps": 40, "tokens_bytes": -7,
+                             "admitted_cache_bytes": 0, "admitted_repair_bytes": 0, "skipped_requests": 9}]
+        });
+        let t = render_cache_status(&v);
+        for want in ["high 90%  low 80%", "warm01/7", " 85.2%", "15d 0h", "oldest unknown: timeout",
+            "capacity 3  retention 2  idle 1", "Fill toro: 4 commits", "Scheduled toro: promote 5  precache 6", "-7"] {
+            assert!(t.contains(want), "missing {want:?}
+{t}");
+        }
+        // Missing fields do not panic.
+        assert!(render_cache_status(&serde_json::json!({})).contains("Watermarks"));
     }
 }
 

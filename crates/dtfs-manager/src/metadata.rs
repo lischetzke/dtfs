@@ -3297,6 +3297,7 @@ impl ManagerService for MetadataService {
             let sm = self.sm_data.read().await;
             cache_fill::check_cache_fill(&sm, &req)
         };
+        let fill_bytes = row.as_ref().ok().and_then(|r| r.as_ref()).map_or(0, |r| r.size_bytes);
         let row = match row {
             Ok(Some(row)) => row,
             Ok(None) => return Ok(Response::new(CommitCacheFillResponse {})),
@@ -3320,6 +3321,7 @@ impl ManagerService for MetadataService {
             tracing::debug!(path = %req.path, chunk = %req.chunk_id, error = %e, "cache fill not registered");
             Status::failed_precondition(format!("cache fill not registered: {e}"))
         })?;
+        crate::cache_stats::STATS.note_fill(&req.client_dc, fill_bytes);
         // Per chunk of a remote stream: debug; the audit row is the record.
         tracing::debug!(path = %req.path, chunk = %req.chunk_id, node_id = req.node_id, disk_id = req.disk_id, dc = %req.client_dc, "cache fill registered");
         if let Some(audit) = &self.audit {

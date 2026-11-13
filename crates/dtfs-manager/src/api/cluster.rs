@@ -802,6 +802,13 @@ pub(super) async fn prometheus_metrics(
     if let Some(p) = precache {
         body.push_str(&precache_metrics(&p));
     }
+    let (_, disks) = crate::cache_stats::STATS.view();
+    body.push_str(&crate::cache_stats::render_metrics(
+        crate::metadata::stamp_now_ms(),
+        &crate::cache_stats::STATS.counters(),
+        &disks,
+        &state.scheduler.link_budget_status(),
+    ));
 
     (
         axum::http::StatusCode::OK,
