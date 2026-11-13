@@ -138,6 +138,8 @@ listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
 #cache_high_watermark_pct = 0       # capacity eviction of LRU cache copies on hot/warm
 #cache_low_watermark_pct = 0        # disks; both 0 (off) or 0 < low < high <= 99
 #max_promotions_per_tick = 50       # new cache-promotion tasks per tiering tick, must be > 0
+#precache_reserve_pct = 10          # cache-tier share pre-cache never fills (no watermarks), 0..=50
+#precache_max_activity_keys = 1024  # (file, dc) read records kept for pre-cache, >= 64
 # Link budget: copies INTO to_dc from another DC share max_mbps (120 s burst).
 # None (default) = unlimited. One entry per DC, max_mbps > 0.
 #[[tiering.links]]

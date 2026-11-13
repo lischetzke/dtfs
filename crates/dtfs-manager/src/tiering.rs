@@ -202,9 +202,9 @@ impl TieringEngine {
     async fn precache_tick(&self) {
         use crate::precache::*;
         use crate::scheduler::ScheduleOutcome;
-        let (enabled, rate_mbps, low_pct) = {
+        let (enabled, rate_mbps, low_pct, reserve_pct) = {
             let c = self.config.read().await;
-            (c.enabled, c.precache_max_mbps, c.cache_low_watermark_pct)
+            (c.enabled, c.precache_max_mbps, c.cache_low_watermark_pct, c.precache_reserve_pct)
         };
         if !enabled {
             return;
@@ -224,7 +224,7 @@ impl TieringEngine {
         };
         let mut plan = {
             let sm = self.state_data.read().await;
-            plan_precache(&sm, &snap, now_ms, self.scheduler.placement_cfg(), low_pct)
+            plan_precache(&sm, &snap, now_ms, self.scheduler.placement_cfg(), low_pct, reserve_pct)
         };
         let view = self.scheduler.replication_task_view().await;
         plan.status.is_leader = true;
@@ -454,7 +454,8 @@ impl TieringEngine {
         profile.current_node = current_node;
         drop(stats);
 
-        crate::precache::note_read(&mut self.precache.lock().activity, file_path, chunk_id, &reads_by_dc, now_ms);
+        let max_keys = self.config.read().await.precache_max_activity_keys;
+        crate::precache::note_read(&mut self.precache.lock().activity, file_path, chunk_id, &reads_by_dc, now_ms, max_keys);
 
         // Bug AV (AV-4-1c fix) — feed per-(chunk, dc) reads into the
         // read-window store. The data-node's `harvest_per_chunk`

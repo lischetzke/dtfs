@@ -767,6 +767,14 @@ pub struct TieringConfig {
     /// Most NEW cache-promotion tasks one tiering tick creates. Must be > 0.
     #[serde(default = "default_max_promotions_per_tick")]
     pub max_promotions_per_tick: usize,
+    /// Share (percent) of a node's cache-tier capacity pre-caching never fills
+    /// while no watermarks are set. 0..=50.
+    #[serde(default = "default_precache_reserve_pct")]
+    pub precache_reserve_pct: u64,
+    /// (file, datacenter) read records the pre-cache keeps in leader memory;
+    /// the stalest 10% go at the cap. Must be >= 64.
+    #[serde(default = "default_precache_max_activity_keys")]
+    pub precache_max_activity_keys: usize,
     /// Per-DC copy budgets: every replication copy into `to_dc` from another
     /// DC (repair, anchor-lag, migration, promotion, pre-cache) shares one
     /// token bucket. Empty (default) = unlimited. Kept last: TOML tables
@@ -788,6 +796,14 @@ fn default_precache_max_mbps() -> u64 {
 
 fn default_max_promotions_per_tick() -> usize {
     50
+}
+
+fn default_precache_reserve_pct() -> u64 {
+    10
+}
+
+fn default_precache_max_activity_keys() -> usize {
+    1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -812,6 +828,15 @@ impl TieringConfig {
             ));
         }
         nonzero("[tiering] max_promotions_per_tick", self.max_promotions_per_tick as u64)?;
+        if self.precache_reserve_pct > 50 {
+            return Err(format!("[tiering] precache_reserve_pct ({}) must be 0..=50", self.precache_reserve_pct));
+        }
+        if self.precache_max_activity_keys < 64 {
+            return Err(format!(
+                "[tiering] precache_max_activity_keys ({}) must be >= 64",
+                self.precache_max_activity_keys
+            ));
+        }
         let mut seen = std::collections::HashSet::new();
         for l in &self.links {
             if l.to_dc.is_empty() {
@@ -1966,6 +1991,23 @@ mod tests {
         assert!(c.prune_interval_secs > 0);
         c.prune_interval_secs = 0;
         assert_eq!(nonzero("[cache] prune_interval_secs", c.prune_interval_secs).unwrap_err(), "[cache] prune_interval_secs must be > 0");
+    }
+
+    #[test]
+    fn tiering_precache_reserve_and_activity_keys_validate() {
+        let mut t: TieringConfig = toml::from_str("").unwrap();
+        assert_eq!((t.precache_reserve_pct, t.precache_max_activity_keys), (10, 1024));
+        for ok in [0, 50] {
+            t.precache_reserve_pct = ok;
+            assert!(t.validate().is_ok(), "{ok}");
+        }
+        t.precache_reserve_pct = 51;
+        assert_eq!(t.validate().unwrap_err(), "[tiering] precache_reserve_pct (51) must be 0..=50");
+        t.precache_reserve_pct = 10;
+        t.precache_max_activity_keys = 64;
+        assert!(t.validate().is_ok());
+        t.precache_max_activity_keys = 63;
+        assert_eq!(t.validate().unwrap_err(), "[tiering] precache_max_activity_keys (63) must be >= 64");
     }
 
     #[test]

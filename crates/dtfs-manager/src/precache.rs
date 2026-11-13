@@ -15,8 +15,6 @@ use std::ops::Bound;
 
 /// Distinct chunks remembered per (file, dc) before `overflow` is set.
 pub(crate) const MAX_ACTIVITY_CHUNKS: usize = 64;
-/// (file, dc) keys kept in the activity map; the stalest 10% go at the cap.
-pub(crate) const MAX_ACTIVITY_KEYS: usize = 1024;
 /// Header probes read the start of a file; chunks starting in the first 48 MiB
 /// never count as playing (12 chunks of 4 MiB). FUSE prefetch reads are
 /// reported as `scanner` and never reach the activity map at all.
@@ -189,12 +187,14 @@ pub(crate) struct FileActivity {
 }
 
 /// Records reads per (file, lowercased dc); empty and "unknown" DCs never promote, so are ignored.
+/// At `max_keys` (file, dc) keys the stalest 10% go.
 pub(crate) fn note_read(
     activity: &mut HashMap<(String, String), FileActivity>,
     file_path: &str,
     chunk_id: &str,
     reads_by_dc: &HashMap<String, u32>,
     now_ms: u64,
+    max_keys: usize,
 ) {
     for (dc, &n) in reads_by_dc {
         let dc = dc.to_lowercase();
@@ -202,13 +202,13 @@ pub(crate) fn note_read(
             continue;
         }
         let key = (file_path.to_string(), dc);
-        if !activity.contains_key(&key) && activity.len() >= MAX_ACTIVITY_KEYS {
+        if !activity.contains_key(&key) && activity.len() >= max_keys {
             let mut ages: Vec<((String, String), u64)> = activity
                 .iter()
                 .map(|(k, v)| (k.clone(), v.last_read_ms))
                 .collect();
             ages.sort_by_key(|(_, t)| *t);
-            for (k, _) in ages.into_iter().take(MAX_ACTIVITY_KEYS / 10) {
+            for (k, _) in ages.into_iter().take(max_keys / 10) {
                 activity.remove(&k);
             }
         }
@@ -235,8 +235,6 @@ pub(crate) const SIDECAR_MAX_BYTES: u64 = 16 << 20;
 pub(crate) const MAX_FILE_CURSORS_PER_DC: usize = 8;
 /// Directory entries scanned per listing.
 pub(crate) const MAX_DIR_ENTRIES: usize = 10_000;
-/// Share of a node's tier capacity pre-caching never fills.
-pub(crate) const PRECACHE_RESERVE_PCT: u64 = 10;
 /// Eligible files listed per pin per pass.
 pub(crate) const MAX_PIN_FILES: usize = 5000;
 /// Chunk entries one pass may walk under the SM read lock, cursors and pins together.
@@ -485,10 +483,10 @@ fn following<'a>(
 }
 
 /// Room pre-caching may use on one node's tier: (pooled free bytes minus the
-/// reserve share of the tier total, free bytes of the largest single disk).
-/// Both over serviceable, non-draining disks, minus headroom. A disk under the
-/// `[tiering]` low watermark is capped at the room below it instead of the reserve.
-fn node_room(info: &dtfs_raft::NodeInfo, tier: DiskTier, cfg: &PlacementConfig, low_pct: u8) -> (u64, u64) {
+/// `[tiering] precache_reserve_pct` share of the tier total, free bytes of the
+/// largest single disk). Both over serviceable, non-draining disks, minus headroom.
+/// A disk under the `[tiering]` low watermark is capped at the room below it instead of the reserve.
+fn node_room(info: &dtfs_raft::NodeInfo, tier: DiskTier, cfg: &PlacementConfig, low_pct: u8, reserve_pct: u64) -> (u64, u64) {
     let (mut avail, mut total, mut biggest) = (0u64, 0u64, 0u64);
     for d in info.disks.iter().filter(|d| {
         d.tier == tier
@@ -505,7 +503,7 @@ fn node_room(info: &dtfs_raft::NodeInfo, tier: DiskTier, cfg: &PlacementConfig, 
         avail = avail.saturating_add(free);
         biggest = biggest.max(free);
     }
-    (avail.saturating_sub(total.saturating_mul(PRECACHE_RESERVE_PCT) / 100), biggest)
+    (avail.saturating_sub(total.saturating_mul(reserve_pct) / 100), biggest)
 }
 
 struct Ctx<'a> {
@@ -513,6 +511,7 @@ struct Ctx<'a> {
     now_ms: u64,
     placement: &'a PlacementConfig,
     low_pct: u8,
+    reserve_pct: u64,
     room: HashMap<(u64, DiskTier), (u64, u64)>,
     seen: HashSet<(String, String)>,
     stopped: HashSet<String>,
@@ -534,9 +533,9 @@ const PIN_POS: u32 = u32::MAX;
 
 impl Ctx<'_> {
     fn room(&mut self, nid: u64, tier: DiskTier) -> u64 {
-        let (sm, cfg, low_pct) = (self.sm, self.placement, self.low_pct);
+        let (sm, cfg, low_pct, reserve_pct) = (self.sm, self.placement, self.low_pct, self.reserve_pct);
         let (pooled, biggest) = *self.room.entry((nid, tier)).or_insert_with(|| {
-            sm.nodes.get(&nid).map_or((0, 0), |n| node_room(n, tier, cfg, low_pct))
+            sm.nodes.get(&nid).map_or((0, 0), |n| node_room(n, tier, cfg, low_pct, reserve_pct))
         });
         pooled.min(biggest)
     }
@@ -800,8 +799,9 @@ pub(crate) fn plan_precache(
     now_ms: u64,
     placement: &PlacementConfig,
     low_watermark_pct: u8,
+    reserve_pct: u64,
 ) -> PrecachePlan {
-    plan_precache_budget(sm, snap, now_ms, placement, low_watermark_pct, MAX_PLAN_CHUNK_VISITS)
+    plan_precache_budget(sm, snap, now_ms, placement, low_watermark_pct, reserve_pct, MAX_PLAN_CHUNK_VISITS)
 }
 
 fn plan_precache_budget(
@@ -810,6 +810,7 @@ fn plan_precache_budget(
     now_ms: u64,
     placement: &PlacementConfig,
     low_pct: u8,
+    reserve_pct: u64,
     budget: usize,
 ) -> PrecachePlan {
     let mut plan = PrecachePlan::default();
@@ -942,6 +943,7 @@ fn plan_precache_budget(
         now_ms,
         placement,
         low_pct,
+        reserve_pct,
         room: HashMap::new(),
         seen: HashSet::new(),
         stopped: HashSet::new(),
@@ -1356,29 +1358,39 @@ mod tests {
     fn note_read_cases() {
         let dcs = |d: &str| HashMap::from([(d.to_string(), 1u32)]);
         let mut a = HashMap::new();
-        note_read(&mut a, "/f", "c0", &dcs("unknown"), 1);
-        note_read(&mut a, "/f", "c0", &dcs(""), 1);
+        note_read(&mut a, "/f", "c0", &dcs("unknown"), 1, 1024);
+        note_read(&mut a, "/f", "c0", &dcs(""), 1, 1024);
         assert!(a.is_empty());
 
-        note_read(&mut a, "/f", "c0", &dcs("TORO"), 1);
+        note_read(&mut a, "/f", "c0", &dcs("TORO"), 1, 1024);
         assert!(a.contains_key(&("/f".to_string(), "toro".to_string())));
 
         for i in 1..=64 {
-            note_read(&mut a, "/f", &format!("c{i}"), &dcs("toro"), 2);
+            note_read(&mut a, "/f", &format!("c{i}"), &dcs("toro"), 2, 1024);
         }
         let act = &a[&("/f".to_string(), "toro".to_string())];
         assert_eq!(act.chunk_ids.len(), 64);
         assert!(act.overflow, "the 65th distinct chunk sets overflow");
+    }
 
+    /// `[tiering] precache_max_activity_keys`: up to the cap nothing goes; one
+    /// new key past it drops the stalest cap/10 (64 -> 6).
+    #[test]
+    fn note_read_honours_configured_key_cap() {
+        let dcs = HashMap::from([("toro".to_string(), 1u32)]);
         let mut a = HashMap::new();
-        for i in 0..MAX_ACTIVITY_KEYS {
-            note_read(&mut a, &format!("/f{i}"), "c", &dcs("toro"), 10 + i as u64);
+        for i in 0..64 {
+            note_read(&mut a, &format!("/f{i}"), "c", &dcs, 10 + i as u64, 64);
         }
-        assert_eq!(a.len(), MAX_ACTIVITY_KEYS);
-        note_read(&mut a, "/new", "c", &dcs("toro"), 99_999);
-        assert!(!a.contains_key(&("/f0".to_string(), "toro".to_string())));
+        assert_eq!(a.len(), 64);
+        note_read(&mut a, "/f0", "c2", &dcs, 99_000, 64);
+        assert_eq!(a.len(), 64, "an existing key never evicts");
+        note_read(&mut a, "/new", "c", &dcs, 99_999, 64);
+        assert_eq!(a.len(), 59);
+        assert!(a.contains_key(&("/f0".to_string(), "toro".to_string())), "refreshed key survives");
+        assert!(!a.contains_key(&("/f6".to_string(), "toro".to_string())));
+        assert!(a.contains_key(&("/f7".to_string(), "toro".to_string())));
         assert!(a.contains_key(&("/new".to_string(), "toro".to_string())));
-        assert!(a.len() <= MAX_ACTIVITY_KEYS);
     }
 }
 
@@ -1490,9 +1502,12 @@ mod planner_tests {
             d.used_bytes = used;
         }
         fn plan(&self, reads: &[(&str, &str)]) -> PrecachePlan {
-            self.plan_low(reads, 0)
+            self.plan_with(reads, 0, 10)
         }
         fn plan_low(&self, reads: &[(&str, &str)], low_pct: u8) -> PrecachePlan {
+            self.plan_with(reads, low_pct, 10)
+        }
+        fn plan_with(&self, reads: &[(&str, &str)], low_pct: u8, reserve_pct: u64) -> PrecachePlan {
             let mut snap = PrecacheSnapshot::default();
             for (path, dc) in reads {
                 let a = FileActivity {
@@ -1502,7 +1517,7 @@ mod planner_tests {
                 };
                 snap.activity.insert((path.to_string(), dc.to_string()), a);
             }
-            plan_precache(&self.sm, &snap, NOW, &cfg(), low_pct)
+            plan_precache(&self.sm, &snap, NOW, &cfg(), low_pct, reserve_pct)
         }
     }
 
@@ -1547,7 +1562,7 @@ mod planner_tests {
             let mut snap = PrecacheSnapshot::default();
             let a = FileActivity { last_read_ms, chunk_ids: [format!("{S1}/E01.mkv#20")].into_iter().collect(), overflow: false };
             snap.activity.insert((format!("{S1}/E01.mkv"), "toro".to_string()), a);
-            plan_precache(&w.sm, &snap, NOW, &cfg(), 0)
+            plan_precache(&w.sm, &snap, NOW, &cfg(), 0, 10)
         };
         assert!(!plan_at(&w, NOW - 600_000).copies.is_empty(), "active at exactly the ttl");
         assert!(plan_at(&w, NOW - 600_001).copies.is_empty(), "expired 1 ms past the ttl");
@@ -1606,7 +1621,7 @@ mod planner_tests {
                 SeriesEntry { cursor: format!("/tv/{s}/E01.mkv"), last_read_ms: i as u64 + 1 },
             );
         }
-        let p = plan_precache(&w.sm, &snap, NOW, &cfg(), 0);
+        let p = plan_precache(&w.sm, &snap, NOW, &cfg(), 0, 10);
         let roots: Vec<&str> = p.series_lru.keys().map(|k| k.2.as_str()).collect();
         assert_eq!(roots, ["/tv/B", "/tv/C"]);
         let sroots: BTreeSet<_> = p.status.series.iter().filter_map(|s| s.root.clone()).collect();
@@ -1828,7 +1843,7 @@ mod planner_tests {
             overflow: false,
         };
         snap.activity.insert(("/tv/Show/Season 01/E01.mkv".into(), "toro".into()), a);
-        let p = plan_precache_budget(&w.sm, &snap, NOW, &cfg(), 0, 350);
+        let p = plan_precache_budget(&w.sm, &snap, NOW, &cfg(), 0, 10,350);
         let ps = &p.status.pins[0];
         assert!(ps.truncated, "budget exhausted mid-pin");
         let pinned = p.copies.iter().filter(|c| c.file_path.starts_with("/tv/Bluey")).count();
@@ -1836,7 +1851,7 @@ mod planner_tests {
         assert!(p.copies.iter().any(|c| c.file_path.starts_with("/tv/Show")), "cursor copies still planned");
         assert!(p.copies[0].file_path.starts_with("/tv/Show"), "cursor copies rank first");
         // Plenty of budget: nothing truncated.
-        let p = plan_precache_budget(&w.sm, &snap, NOW, &cfg(), 0, 1_000_000);
+        let p = plan_precache_budget(&w.sm, &snap, NOW, &cfg(), 0, 10,1_000_000);
         assert!(!p.status.pins[0].truncated);
         assert_eq!(p.copies.iter().filter(|c| c.file_path.starts_with("/tv/Bluey")).count(), 80);
     }
@@ -1850,7 +1865,7 @@ mod planner_tests {
         w.file("/b/y.mkv", 4, &[1]);
         pin(&mut w, "/a", "toro");
         pin(&mut w, "/b", "toro");
-        let p = plan_precache_budget(&w.sm, &PrecacheSnapshot::default(), NOW, &cfg(), 0, 4);
+        let p = plan_precache_budget(&w.sm, &PrecacheSnapshot::default(), NOW, &cfg(), 0, 10,4);
         assert_eq!(per_path(&p).keys().cloned().collect::<Vec<_>>(), ["/a/x.mkv"]);
         assert_eq!(p.status.pins.len(), 2);
         assert!(!p.status.pins[0].truncated && p.status.pins[1].truncated);
@@ -1868,7 +1883,7 @@ mod planner_tests {
         }
         pin(&mut w, "/big", "toro");
         let budget = 20 * 75;
-        let p = plan_precache_budget(&w.sm, &PrecacheSnapshot::default(), NOW, &cfg(), 0, budget);
+        let p = plan_precache_budget(&w.sm, &PrecacheSnapshot::default(), NOW, &cfg(), 0, 10,budget);
         assert!(p.status.dcs[0].capacity_limited);
         assert_eq!(p.copies.len(), 225);
         // Files after the one that hit the limit are not walked: desired stops near the room.
@@ -1886,6 +1901,19 @@ mod planner_tests {
         let toro = p.status.dcs.iter().find(|d| d.dc == "toro").unwrap();
         assert!(toro.capacity_limited);
         assert!(!toro.no_target);
+    }
+
+    /// `[tiering] precache_reserve_pct` sets the reserve: total 1000 MiB, used 300 MiB.
+    #[test]
+    fn configured_reserve_pct_sets_room() {
+        let mut w = show5();
+        w.set_disk(2, 1000 * MIB, 300 * MIB);
+        let r = &[("/tv/Show/Season 01/E01.mkv", "toro")];
+        assert_eq!(w.plan_with(r, 0, 0).copies.len(), 175, "no reserve: 700 MiB");
+        assert_eq!(w.plan_with(r, 0, 50).copies.len(), 50, "50%: 200 MiB");
+        // A disk under the low watermark ignores the reserve: ceiling 500 MiB -> 200 MiB.
+        assert_eq!(w.plan_with(r, 50, 50).copies.len(), 50);
+        assert_eq!(w.plan_with(r, 60, 50).copies.len(), 75, "low 60%: 300 MiB, reserve not applied");
     }
 
     #[test]
@@ -1955,7 +1983,7 @@ mod planner_tests {
             (path.into(), "toro".into()),
             FileActivity { last_read_ms: NOW, chunk_ids: ids, overflow: false },
         );
-        let p = plan_precache(&w.sm, &snap, NOW, &cfg(), 0);
+        let p = plan_precache(&w.sm, &snap, NOW, &cfg(), 0, 10);
         assert!(p.copies.is_empty());
         assert!(p.status.series.is_empty() && p.status.cursors.is_empty());
     }
@@ -2194,7 +2222,7 @@ mod planner_tests {
                     FileActivity { last_read_ms: NOW, chunk_ids: HashSet::new(), overflow: true },
                 );
             }
-            let p = plan_precache(&w.sm, &snap, NOW, &cfg(), 0);
+            let p = plan_precache(&w.sm, &snap, NOW, &cfg(), 0, 10);
             let dcs: BTreeSet<&str> = reads.iter().map(|(_, d)| d.as_str()).collect();
             let mut planned: BTreeMap<u64, u64> = BTreeMap::new();
             let mut seen = HashSet::new();
@@ -2362,7 +2390,7 @@ mod engine_tests {
     fn reset_leader_state_keeps_activity() {
         let mut st = PrecacheState::default();
         let reads = HashMap::from([("toro".to_string(), 1u32)]);
-        note_read(&mut st.activity, "/tv/a.mkv", "c1", &reads, 5);
+        note_read(&mut st.activity, "/tv/a.mkv", "c1", &reads, 5, 1024);
         st.protected.insert(("c1".into(), 2, 0));
         st.scheduled.insert(("c1".into(), 2));
         st.series_lru.insert(
