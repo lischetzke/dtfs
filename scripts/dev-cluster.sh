@@ -623,7 +623,7 @@ if cmd == "retention": # retention <path> <ta_epoch>
     sys.exit(rc)
 if cmd == "setup2":  # volumes fillvol (fill on_read) and linkvol (link-budget check)
     for v, kw in (("fillvol", {"promote_reads": 1000, "promote_window_secs": 600, "fill": "on_read"}),
-                  ("linkvol", {"promote_reads": 1, "promote_window_secs": 600, "fill": "on_promote"})):
+                  ("linkvol", {"promote_reads": 1, "promote_window_secs": 3600, "fill": "on_promote"})):
         if http(leader, "GET", "/api/v1/volumes/" + v)[0] != 200:
             post("/api/v1/volumes", {"name": v, "chunk_size_mb": 4, "anchor_datacenter": "leli"})
         post("/api/v1/volumes/%s/set-mandatory" % v, {"hot_replicas": 0, "warm_replicas": 0, "cold_replicas": 1})
@@ -652,7 +652,7 @@ if cmd == "fill":    # fill <path> <timeout_s>: data02 rows per chunk, cache.fil
     print("INFO: cache.fill audit rows (summed over the audit views of the 3 managers): %d" % na)
     sys.exit(rc)
 if cmd == "linkwatch":  # linkwatch <path> <t0_epoch> <max_s>
-    p = args[0]; t0 = float(args[1]); end = time.time() + int(args[2]); BURST = 30000000; RATE = 250000; CH = 4 << 20
+    p = args[0]; t0 = float(args[1]); end = time.time() + int(args[2]); BURST = 134217728; RATE = 250000; CH = 4 << 20  # bucket depth max(120 s, 2 x 64 MiB max chunk)
     series = []; anchors_ok = True; total = None
     print("  time    t(s)  data03 rows  data01 rows  mbps-model-max  backlog(nrb)")
     while True:
@@ -664,7 +664,7 @@ if cmd == "linkwatch":  # linkwatch <path> <t0_epoch> <max_s>
         series.append((t, n3)); print("  %s %5d  %11d  %11d  %14d  %s" % (now(), t, n3, n1, mx, json.dumps(bl[0]) if bl else "-"), flush=True)
         if n3 >= total - 1 or time.time() >= end: break
         time.sleep(15)
-    ck(all(n * CH <= BURST + RATE * t + 2 * CH for t, n in series), "data03 rows * 4 MiB never exceeded burst 30 MB + 250 KB/s * t + 2 chunks")
+    ck(all(n * CH <= BURST + RATE * t + 2 * CH for t, n in series), "data03 rows * 4 MiB never exceeded burst 128 MiB + 250 KB/s * t + 2 chunks")
     ck(all(b[1] >= a[1] for a, b in zip(series, series[1:])), "data03 row count never decreased (throttled copies are re-planned, not lost)")
     stall = max([0] + [b[0] - a[0] for a, b in zip(series, series[1:]) if b[1] == a[1] and b[1] < total - 1])
     ck(stall <= 90, "no stall: longest stretch without new data03 rows before completion %d s (<= 90)" % stall)
@@ -680,7 +680,7 @@ cmd_cache_check() {
   LOG="$(mktemp)"
   tlog() { echo "[$(date +%H:%M:%S)] $*"; }
   # py <args>: run a CACHE_PY stage in nfs-toro, tee to $LOG, RC=1 on non-zero exit
-  py() { docker exec -i -e DTFS_SECRET="$SECRET" dtfs-dev-nfs-toro python3 -c "$CACHE_PY" "$@" | tee -a "$LOG"; [ "${PIPESTATUS[0]}" = 0 ] || RC=1; }
+  py() { docker exec -i -e DTFS_SECRET="$SECRET" dtfs-dev-nfs-toro python3 -c "$CACHE_PY" "$@" | tee -a "$LOG"; [ "${PIPESTATUS[0]}" = 0 ] || { RC=1; echo "STAGE-ERROR: $1 exited non-zero" | tee -a "$LOG"; }; }
   sleep_until() { local d=$(( $1 - $(date +%s) )); [ $d -gt 0 ] && { tlog "waiting ${d}s until $2"; sleep $d; }; return 0; }
   nfsx() { docker exec dtfs-dev-nfs-toro sh -c "$1"; }
 
@@ -805,7 +805,7 @@ cmd_cache_check() {
   docker exec dtfs-dev-data02 rm -f /mnt/d0/junk
   # knfsd holds the FUSE mount while exported: a later docker rm -f leaves a zombie.
   nfsx 'umount /mnt/nfs; exportfs -ua; exportfs -f; rpc.nfsd 0'
-  grep -c '^FAIL' "$LOG" | grep -qx 0 || RC=1
+  [ "$(grep -c '^FAIL' "$LOG" || true)" = 0 ] || RC=1   # grep -c exits 1 on 0 matches (pipefail)
   tlog "cache-check finished in $(( (SECONDS - T0) / 60 )) min: $(grep -c '^PASS' "$LOG") PASS, $(grep -c '^FAIL' "$LOG") FAIL"
   exit $RC
 }
@@ -818,7 +818,7 @@ cmd_cache_check2() {
   pass() { echo "PASS: $*" | tee -a "$LOG"; }
   fail() { echo "FAIL: $*" | tee -a "$LOG"; RC=1; }
   # py2 <args>: run a CACHE_PY stage in a throwaway container on the dev net
-  py2() { docker run --rm -i --network $NET -e DTFS_SECRET="$SECRET" "$IMG" python3 -c "$CACHE_PY" "$@" | tee -a "$LOG"; [ "${PIPESTATUS[0]}" = 0 ] || RC=1; }
+  py2() { docker run --rm -i --network $NET -e DTFS_SECRET="$SECRET" "$IMG" python3 -c "$CACHE_PY" "$@" | tee -a "$LOG"; [ "${PIPESTATUS[0]}" = 0 ] || { RC=1; echo "STAGE-ERROR: $1 exited non-zero" | tee -a "$LOG"; }; }
   leli_bytes() { docker run --rm -i --network $NET -e DTFS_SECRET="$SECRET" "$IMG" python3 -c "$CACHE_PY" leli | awk '/^LELI/{print $2}'; }
   # fresh_client <name> <cfg>: new container = cold local cache
   fresh_client() { exists dtfs-dev-$1 && docker rm -f dtfs-dev-$1 >/dev/null; start_client $1 $2 0; }
@@ -853,16 +853,16 @@ cmd_cache_check2() {
   [ $D2 -le $CH ] && pass "second play: leli read $D2 B <= 1 chunk" || fail "second play: leli read $D2 B > 1 chunk"
   [ $D2 -ge $((CH / 2)) ] && [ $D2 -le $((CH + CH / 2)) ] && echo "INFO: second-play delta is about 1 chunk: chunk 0 (never filled, see the chunk 0 INFO line above)"
 
-  tlog "test 6: link budget (nrb). Writing G (160 MiB) via nrb FUSE client"
+  tlog "test 6: link budget (nrb). Writing G (288 MiB) via nrb FUSE client"
   fresh_client fuse-nrb fuse-nrb.toml
-  docker exec dtfs-dev-fuse-nrb dd if=/dev/urandom of=/mnt/dtfs/link-G bs=1M count=160 conv=fsync 2>/dev/null || { fail "writing G"; exit 1; }
+  docker exec dtfs-dev-fuse-nrb dd if=/dev/urandom of=/mnt/dtfs/link-G bs=1M count=288 conv=fsync 2>/dev/null || { fail "writing G"; exit 1; }
   fresh_client fuse-nrb fuse-nrb.toml
   sleep 10
   local TR; TR=$(date +%s)
   tlog "viewer read of G (t0 = $TR)"
   docker exec dtfs-dev-fuse-nrb dd if=/mnt/dtfs/link-G of=/dev/null bs=1M 2>&1 | tail -1
-  py2 linkwatch /link-G "$TR" 720
-  grep -c '^FAIL' "$LOG" | grep -qx 0 || RC=1
+  py2 linkwatch /link-G "$TR" 1080
+  [ "$(grep -c '^FAIL' "$LOG" || true)" = 0 ] || RC=1   # grep -c exits 1 on 0 matches (pipefail)
   tlog "cache-check2 finished in $(( (SECONDS - T0) / 60 )) min: $(grep -c '^PASS' "$LOG") PASS, $(grep -c '^FAIL' "$LOG") FAIL"
   exit $RC
 }
