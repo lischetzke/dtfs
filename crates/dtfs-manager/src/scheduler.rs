@@ -291,23 +291,12 @@ impl TaskScheduler {
         self.link_budget.lock().status()
     }
 
-    /// Debit the link budget for a copy of `chunk_id` (`bytes`) from `source`
-    /// to `target`; `false` = skip it this round, nothing recorded, re-planned
-    /// next tick.
-    pub(super) fn link_admit(
-        &self,
-        sm: &StateMachineData,
-        chunk_id: &str,
-        bytes: u64,
-        source: u64,
-        target: u64,
-    ) -> bool {
+    /// Debit the link budget for a repair copy (`bytes`) from `source` to
+    /// `target`. Never refused: repair borrows, cache copies wait
+    /// (`LinkBudget::admit_repair`).
+    pub(super) fn link_admit(&self, sm: &StateMachineData, bytes: u64, source: u64, target: u64) {
         let dc = |n: u64| sm.nodes.get(&n).map_or("", |i| i.location.datacenter.as_str());
-        let ok = self.link_budget.lock().admit(dc(source), dc(target), bytes, now_millis());
-        if !ok {
-            debug!(chunk_id, source, target, bytes, "link budget: copy skipped this round");
-        }
-        ok
+        self.link_budget.lock().admit_repair(dc(source), dc(target), bytes, now_millis());
     }
 
     /// Issue #157 — wire the `default` volume from `[defaults]` (main.rs).

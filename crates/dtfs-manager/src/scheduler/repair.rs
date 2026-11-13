@@ -287,11 +287,9 @@ impl TaskScheduler {
                         );
                         return;
                     }
-                    // Link budget spent: nothing recorded, re-planned next tick.
+                    // Repair is never refused by the link budget; it borrows.
                     let bytes = entries.first().map_or(0, |e| e.size_bytes);
-                    if !self.link_admit(&sm, &chunk_hash, bytes, source_node_id, target) {
-                        continue;
-                    }
+                    self.link_admit(&sm, bytes, source_node_id, target);
 
                     let now_ms = now_millis();
                     let task_id = format!("repl-{}", migration_state.next_task_id);
@@ -695,11 +693,9 @@ impl TaskScheduler {
                         );
                         break 'files;
                     }
-                    // Link budget spent: nothing recorded, re-planned next tick.
+                    // Repair is never refused by the link budget; it borrows.
                     let bytes = entries.first().map_or(0, |e| e.size_bytes);
-                    if !self.link_admit(&sm, &chunk_id, bytes, action.source_node, action.target_node) {
-                        continue;
-                    }
+                    self.link_admit(&sm, bytes, action.source_node, action.target_node);
                     // Source picks a healthy existing replica (any
                     // tier); the dispatcher tolerates cross-tier
                     // copies.

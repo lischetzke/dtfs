@@ -8,7 +8,6 @@ use dtfs_common::config::{TieringLink, MAX_CHUNK_SIZE_BYTES};
 use serde::Serialize;
 use tracing::info;
 
-use crate::precache::refill_tokens;
 
 /// Token-bucket depth in seconds of a link's `max_mbps` (same as pre-cache).
 pub(crate) const LINK_BURST_SECS: u64 = 120;
@@ -31,7 +30,8 @@ pub(crate) struct LinkBudget {
 
 #[derive(Debug, Default)]
 struct Bucket {
-    tokens: u64,
+    /// Negative while repair has borrowed (`admit_repair`).
+    tokens: i64,
     at_ms: u64,
     skipped: u64,
     skipped_bytes: u64,
@@ -46,7 +46,7 @@ struct Bucket {
 pub(crate) struct LinkBacklog {
     pub to_dc: String,
     pub max_mbps: u64,
-    pub tokens_bytes: u64,
+    pub tokens_bytes: i64,
     pub skipped_requests: u64,
     pub skipped_bytes: u64,
 }
@@ -71,22 +71,46 @@ impl LinkBudget {
 
     /// Debit `bytes` when the copy fits the target link's balance; `false` =
     /// skip it this round (the caller re-plans next tick). Unmetered = `true`.
+    /// For cache, pre-cache and path-migration copies.
     pub(crate) fn admit(&mut self, source_dc: &str, target_dc: &str, bytes: u64, now_ms: u64) -> bool {
+        self.debit(source_dc, target_dc, bytes, now_ms, false)
+    }
+
+    /// Mandatory and anchor-lag repair: always admitted, metered. The debit
+    /// may drive the balance negative (borrowing), so cache copies wait
+    /// until the debt is repaid. The debt is floored at one bucket depth;
+    /// repair beyond that is admitted without further debit, so a long
+    /// repair backlog cannot lock cache traffic out for longer than one
+    /// bucket refill after it ends.
+    pub(crate) fn admit_repair(&mut self, source_dc: &str, target_dc: &str, bytes: u64, now_ms: u64) {
+        self.debit(source_dc, target_dc, bytes, now_ms, true);
+    }
+
+    fn debit(&mut self, source_dc: &str, target_dc: &str, bytes: u64, now_ms: u64, borrow: bool) -> bool {
         let Some(link) = self.link_for(source_dc, target_dc) else {
             return true;
         };
         let (dc, mbps) = (link.to_dc.clone(), link.max_mbps);
-        // A new bucket starts full (refill caps it at the burst).
+        let cap = i64::try_from(bucket_cap(mbps)).unwrap_or(i64::MAX);
+        // A new bucket starts full (refill caps it).
         let b = self
             .buckets
             .entry(dc.to_ascii_lowercase())
-            .or_insert_with(|| Bucket { tokens: u64::MAX, at_ms: now_ms, ..Default::default() });
+            .or_insert_with(|| Bucket { tokens: i64::MAX, at_ms: now_ms, ..Default::default() });
         // Not the request size as the cap: smaller copies would clip the
         // balance back below a large chunk that is waiting.
-        b.tokens = refill_tokens(b.tokens, b.at_ms, now_ms, mbps, LINK_BURST_SECS, bucket_cap(mbps));
-        b.at_ms = now_ms;
-        if bytes <= b.tokens {
-            b.tokens -= bytes;
+        if now_ms >= b.at_ms {
+            let add = i128::from(mbps) * 125_000 * i128::from(now_ms - b.at_ms) / 1000;
+            b.tokens = (i128::from(b.tokens) + add).min(i128::from(cap)) as i64;
+            b.at_ms = now_ms;
+        }
+        let need = i64::try_from(bytes).unwrap_or(i64::MAX);
+        if borrow {
+            b.tokens = b.tokens.saturating_sub(need).max(-cap);
+            return true;
+        }
+        if need <= b.tokens {
+            b.tokens -= need;
             return true;
         }
         b.skipped += 1;
@@ -122,7 +146,7 @@ impl LinkBudget {
                     to_dc: l.to_dc.clone(),
                     max_mbps: l.max_mbps,
                     // Untouched bucket: full.
-                    tokens_bytes: b.map_or(bucket_cap(l.max_mbps), |b| b.tokens),
+                    tokens_bytes: b.map_or(i64::try_from(bucket_cap(l.max_mbps)).unwrap_or(i64::MAX), |b| b.tokens),
                     skipped_requests: b.map_or(0, |b| b.skipped),
                     skipped_bytes: b.map_or(0, |b| b.skipped_bytes),
                 }
@@ -221,7 +245,49 @@ mod tests {
         let mut lb = budget(&[("leli", 1)]);
         assert!(lb.admit("toro", "leli", BURST_1MBPS, 1_000_000));
         lb.reset();
-        assert_eq!(lb.status()[0].tokens_bytes, BURST_1MBPS);
+        assert_eq!(lb.status()[0].tokens_bytes, BURST_1MBPS as i64);
         assert!(lb.admit("toro", "leli", BURST_1MBPS, 1_000_000));
+    }
+
+    fn tokens(lb: &LinkBudget) -> i64 {
+        lb.status()[0].tokens_bytes
+    }
+
+    /// Repair is never refused: on an empty bucket it borrows (negative balance).
+    #[test]
+    fn repair_admitted_on_empty_bucket_goes_negative() {
+        let mut lb = budget(&[("leli", 1)]);
+        let t = 1_000_000;
+        assert!(lb.admit("toro", "leli", BURST_1MBPS, t));
+        lb.admit_repair("toro", "leli", 125_000, t);
+        assert_eq!(tokens(&lb), -125_000);
+        assert_eq!(lb.status()[0].skipped_requests, 0, "repair is never counted as skipped");
+    }
+
+    /// Cache copies wait until the debt is repaid and their size has refilled.
+    #[test]
+    fn cache_refused_while_negative_admitted_once_refilled() {
+        let mut lb = budget(&[("leli", 1)]);
+        let t = 1_000_000;
+        assert!(lb.admit("toro", "leli", BURST_1MBPS, t));
+        lb.admit_repair("toro", "leli", 125_000, t);
+        assert!(!lb.admit("toro", "leli", 1, t), "negative balance");
+        // 1 s at 1 Mbps repays the debt exactly: balance 0, still refused.
+        assert!(!lb.admit("toro", "leli", 1, t + 1_000));
+        // 1 s more: exactly the request's size.
+        assert!(lb.admit("toro", "leli", 125_000, t + 2_000));
+        assert_eq!(tokens(&lb), 0);
+    }
+
+    /// The debt is capped at one bucket depth so it cannot grow without bound.
+    #[test]
+    fn repair_debt_capped_at_one_bucket() {
+        let mut lb = budget(&[("leli", 1)]);
+        let t = 1_000_000;
+        assert!(lb.admit("toro", "leli", BURST_1MBPS, t));
+        lb.admit_repair("toro", "leli", 3 * BURST_1MBPS, t);
+        assert_eq!(tokens(&lb), -(BURST_1MBPS as i64));
+        lb.admit_repair("toro", "leli", 1, t); // still admitted at the floor
+        assert_eq!(tokens(&lb), -(BURST_1MBPS as i64));
     }
 }

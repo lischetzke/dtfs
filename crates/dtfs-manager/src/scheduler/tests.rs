@@ -3583,10 +3583,10 @@ mod link_budget_wiring_tests {
         assert_eq!((st.skipped_requests, st.skipped_bytes), (1, CHUNK));
     }
 
-    /// A repair copy skipped for the link budget records nothing and is
-    /// scheduled by the next round once the budget allows it.
+    /// Repair on a drained link is scheduled anyway and borrows: the balance
+    /// goes negative and a cache copy into the DC then waits.
     #[tokio::test]
-    async fn throttled_repair_is_replanned_next_round() {
+    async fn repair_on_drained_link_is_scheduled_and_borrows() {
         let h = crate::api::test_support::harness().await;
         let s = &h.state.scheduler;
         {
@@ -3596,16 +3596,16 @@ mod link_budget_wiring_tests {
             sm.files.insert("/f".into(), file("/f", &[("c1", 1)]));
         }
         toro_link(s);
-        // Drain the bucket to well below one chunk.
-        assert!(s.link_budget.lock().admit("leli", "toro", 50_000_000, now_millis()));
+        // Drain the bucket completely.
+        let full = s.link_budget_status()[0].tokens_bytes as u64;
+        assert!(s.link_budget.lock().admit("leli", "toro", full, now_millis()));
         let mut ms = MigrationState::default();
         s.check_under_replicated(&mut ms).await;
-        assert!(ms.tasks.is_empty(), "throttled: no task recorded");
-        assert_eq!(s.link_budget_status()[0].skipped_requests, 1);
-
-        s.link_budget.lock().reset(); // budget available again
-        s.check_under_replicated(&mut ms).await;
         let tasks: Vec<_> = ms.tasks.values().map(|t| (t.chunk_id.as_str(), t.source_node, t.target_node)).collect();
-        assert_eq!(tasks, vec![("c1", 1, 2)]);
+        assert_eq!(tasks, vec![("c1", 1, 2)], "repair is never refused by the link budget");
+        let st = &s.link_budget_status()[0];
+        assert!(st.tokens_bytes < 0, "repair borrowed: {}", st.tokens_bytes);
+        assert_eq!(st.skipped_requests, 0);
+        assert!(!s.link_budget.lock().admit("leli", "toro", 1, now_millis()), "cache waits for the debt");
     }
 }
