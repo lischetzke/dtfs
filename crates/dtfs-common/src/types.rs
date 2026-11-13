@@ -646,6 +646,10 @@ pub struct PrecachePolicy {
     /// (v0.1.16). 0 = the volume's `promote_window_secs`.
     #[serde(default)]
     pub cursor_ttl_secs: u64,
+    /// GiB cap on all pre-cache bytes (series, cursors and pins, cached plus
+    /// planned) the planner keeps per DC for this volume. 0 = no cap.
+    #[serde(default)]
+    pub max_gb_per_dc: u64,
 }
 
 /// Subtree `prefix` pinned to the cache of datacenter `datacenter`.
@@ -657,6 +661,8 @@ pub struct PrecachePin {
 
 /// Pins per volume.
 pub const MAX_PRECACHE_PINS: usize = 32;
+/// Upper bound of `PrecachePolicy::max_gb_per_dc` (1 PiB; keeps GiB-to-bytes from overflowing).
+pub const MAX_PRECACHE_GB_PER_DC: u64 = 1 << 20;
 
 impl PrecachePolicy {
     fn default_next_files() -> u32 { 2 }
@@ -685,6 +691,9 @@ impl PrecachePolicy {
             if p.datacenter.trim().is_empty() {
                 return Err(format!("pin '{}' needs a datacenter", p.prefix));
             }
+        }
+        if self.max_gb_per_dc > MAX_PRECACHE_GB_PER_DC {
+            return Err(format!("max_gb_per_dc must be at most {MAX_PRECACHE_GB_PER_DC} (1 PiB)"));
         }
         if self.mode == PrecacheMode::Off && self.pins.is_empty() {
             return Ok(());
@@ -721,6 +730,7 @@ impl Default for PrecachePolicy {
             max_series: Self::default_max_series(),
             pins: Vec::new(),
             cursor_ttl_secs: 0,
+            max_gb_per_dc: 0,
         }
     }
 }
@@ -1087,6 +1097,16 @@ mod tests {
         assert!(p.validate(&c, &m).unwrap_err().contains("next_files"));
     }
 
+    /// `max_gb_per_dc` is accepted up to 1 PiB, refused one above (also with mode off).
+    #[test]
+    fn precache_max_gb_per_dc_bound() {
+        let (c, m) = pc_warm_cache();
+        let p = PrecachePolicy { max_gb_per_dc: MAX_PRECACHE_GB_PER_DC, ..pc_plex() };
+        assert!(p.validate(&c, &m).is_ok());
+        let p = PrecachePolicy { max_gb_per_dc: MAX_PRECACHE_GB_PER_DC + 1, ..PrecachePolicy::default() };
+        assert_eq!(p.validate(&c, &m).unwrap_err(), "max_gb_per_dc must be at most 1048576 (1 PiB)");
+    }
+
     /// Removal of the dead `VolumeSchedules` knob deleted the
     /// `schedules` field from `VolumeConfig`. Serde ignores unknown
     /// fields by default (no `deny_unknown_fields` on `VolumeConfig`),
@@ -1234,7 +1254,7 @@ mod bug_av_types_tests {
         assert_eq!((c.effective_retention_secs(), p.effective_cursor_ttl_secs(&c)), (1_209_600, 86_400));
         let old: CacheReplication = serde_json::from_str(r#"{"promote_window_secs":60}"#).unwrap();
         let old_p: PrecachePolicy = serde_json::from_str(r#"{"mode":"plex"}"#).unwrap();
-        assert_eq!((old.retention_secs, old_p.cursor_ttl_secs), (0, 0));
+        assert_eq!((old.retention_secs, old_p.cursor_ttl_secs, old_p.max_gb_per_dc), (0, 0, 0));
         assert_eq!(old_p.effective_cursor_ttl_secs(&old), 60);
     }
 

@@ -426,6 +426,22 @@ fn v1_fixtures_default_retention_and_cursor_ttl() {
     assert_eq!((cfg.cache_replicas.retention_secs, cfg.precache.cursor_ttl_secs), (0, 0));
 }
 
+/// The v1 fixtures predate `precache.max_gb_per_dc`: it loads as 0 (no cap).
+#[test]
+fn v1_fixtures_default_precache_max_gb_per_dc() {
+    let snap = deserialize_snapshot(io::Cursor::new(SNAPSHOT_V1.as_bytes().to_vec())).unwrap();
+    assert_eq!(snap.volumes["default"].precache.max_gb_per_dc, 0);
+    let reqs: Vec<ClientRequest> = serde_json::from_str(REQUESTS_V1).unwrap();
+    let cfg = reqs
+        .iter()
+        .find_map(|r| match r {
+            ClientRequest::UpsertVolume { config, .. } => Some(config),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(cfg.precache.max_gb_per_dc, 0);
+}
+
 /// The v1 fixtures predate `cache_replicas.fill`: it loads as on_promote.
 #[test]
 fn v1_fixtures_default_cache_fill_on_promote() {

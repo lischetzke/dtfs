@@ -521,6 +521,11 @@ struct Ctx<'a> {
     dcs: BTreeMap<String, DcStatus>,
     /// Chunk entries walked so far this pass (see `MAX_PLAN_CHUNK_VISITS`).
     visits: usize,
+    /// `max_gb_per_dc`: bytes kept or planned per (volume id, dc), the (chunk, dc)
+    /// pairs already counted, and the (volume id, dc) pairs that hit the cap.
+    cap_used: HashMap<(dtfs_common::types::VolumeId, String), u64>,
+    cap_charged: HashSet<(String, String)>,
+    capped: HashSet<(dtfs_common::types::VolumeId, String)>,
 }
 
 /// `pos` of pinned files (ranked after every cursor copy).
@@ -533,6 +538,34 @@ impl Ctx<'_> {
             sm.nodes.get(&nid).map_or((0, 0), |n| node_room(n, tier, cfg, low_pct))
         });
         pooled.min(biggest)
+    }
+
+    /// True once `chunk_id` would push (volume, dc) past `max_gb_per_dc`; the first
+    /// refusal closes the pair for the rest of the pass, so planning stops in priority order.
+    fn cap_full(&mut self, vol: &VolumeConfig, dc: &str, chunk_id: &str, bytes: u64) -> bool {
+        let cap = vol.precache.max_gb_per_dc.saturating_mul(GIB);
+        if cap == 0 {
+            return false;
+        }
+        let key = (vol.id.clone(), dc.to_string());
+        if self.capped.contains(&key) {
+            return true;
+        }
+        if self.cap_charged.contains(&(chunk_id.to_string(), dc.to_string())) {
+            return false;
+        }
+        if self.cap_used.get(&key).copied().unwrap_or(0).saturating_add(bytes) > cap {
+            self.capped.insert(key);
+            return true;
+        }
+        false
+    }
+
+    /// Count a protected or planned chunk toward `max_gb_per_dc` (once per dc).
+    fn cap_charge(&mut self, vol: &VolumeConfig, dc: &str, chunk_id: &str, bytes: u64) {
+        if vol.precache.max_gb_per_dc > 0 && self.cap_charged.insert((chunk_id.to_string(), dc.to_string())) {
+            *self.cap_used.entry((vol.id.clone(), dc.to_string())).or_default() += bytes;
+        }
     }
 }
 
@@ -644,6 +677,10 @@ fn plan_file(
         }
         let entries = &by_idx[&idx];
         let (chunk_id, bytes) = (entries[0].chunk_hash.clone(), entries[0].size_bytes);
+        // Past the cap the rest stays unprotected: idle demote, retention and eviction reclaim it.
+        if ctx.cap_full(vol, dc, &chunk_id, bytes) {
+            break;
+        }
         fs.desired_bytes += bytes;
         ctx.dcs.get_mut(dc).expect("dc status").desired_bytes += bytes;
 
@@ -673,6 +710,7 @@ fn plan_file(
             .map(|(n, disk, _, _)| (*n, *disk))
             .collect();
         if !cached.is_empty() {
+            ctx.cap_charge(vol, dc, &chunk_id, bytes);
             fs.cached_bytes += bytes;
             ctx.dcs.get_mut(dc).expect("dc status").cached_bytes += bytes;
             for (n, disk) in cached {
@@ -737,6 +775,7 @@ fn plan_file(
             .min_by_key(|(n, _, _, t)| (tier_rank(*t), *n))
             .map(|(n, _, _, _)| *n)
             .expect("live non-empty");
+        ctx.cap_charge(vol, dc, &chunk_id, bytes);
         ctx.copies.push(PrecacheCopy {
             chunk_id,
             file_path: path.to_string(),
@@ -910,6 +949,9 @@ fn plan_precache_budget(
         pinned: HashSet::new(),
         dcs: BTreeMap::new(),
         visits: 0,
+        cap_used: HashMap::new(),
+        cap_charged: HashSet::new(),
+        capped: HashSet::new(),
     };
     let mut rank_run: (String, String, u32) = (String::new(), String::new(), 0);
     for g in groups {
@@ -994,8 +1036,8 @@ fn plan_precache_budget(
             ps.truncated = listed.len() > MAX_PIN_FILES;
             listed.truncate(MAX_PIN_FILES);
             for (path, fm) in listed {
-                // Budget spent or the DC is out of room: the rest of the pin is not walked.
-                if ctx.visits >= budget || ctx.stopped.contains(&dc) {
+                // Budget spent, the DC out of room or at max_gb_per_dc: the rest of the pin is not walked.
+                if ctx.visits >= budget || ctx.stopped.contains(&dc) || ctx.capped.contains(&(vol.id.clone(), dc.clone())) {
                     ps.truncated = true;
                     break;
                 }
@@ -1619,6 +1661,59 @@ mod planner_tests {
         assert!(p.copies.is_empty());
         assert!(p.protected.contains(&("/tv/Bluey/a.mkv#0".to_string(), 2, 0)));
         assert_eq!(p.status.pins[0].cached_bytes, 300 * MIB);
+    }
+
+    /// Series /tv/S (E02 already cached in toro) read in toro and nrb, plus a
+    /// cached pin in toro: 375 chunks wanted in toro, 300 in nrb.
+    fn capped_world(cap_gb: u64) -> PrecachePlan {
+        let mut w = world();
+        w.vol().precache.series_max_gb = 2;
+        w.vol().precache.max_gb_per_dc = cap_gb;
+        w.file("/tv/S/.plexmatch", 0, &[]);
+        for e in ["E01", "E03", "E04", "E05"] {
+            w.file(&format!("/tv/S/{e}.mkv"), 75, &[1]);
+        }
+        w.file("/tv/S/E02.mkv", 75, &[1, 2]);
+        w.file("/tv/Bluey/a.mkv", 75, &[1, 2]);
+        pin(&mut w, "/tv/Bluey", "toro");
+        w.plan(&[("/tv/S/E01.mkv", "toro"), ("/tv/S/E01.mkv", "nrb")])
+    }
+
+    fn copies_to(p: &PrecachePlan, node: u64) -> BTreeMap<String, usize> {
+        let mut m = BTreeMap::new();
+        for c in p.copies.iter().filter(|c| c.target_node == node) {
+            *m.entry(c.file_path.clone()).or_insert(0) += 1;
+        }
+        m
+    }
+
+    #[test]
+    fn max_gb_per_dc_zero_or_above_demand_plans_everything() {
+        for cap in [0, 2] {
+            let p = capped_world(cap);
+            assert_eq!(copies_to(&p, 2).values().sum::<usize>(), 225, "cap {cap}");
+            assert_eq!(copies_to(&p, 3).values().sum::<usize>(), 300, "cap {cap}");
+            assert!(p.protected.contains(&("/tv/S/E02.mkv#0".to_string(), 2, 0)));
+            assert!(p.pinned.contains(&("/tv/Bluey/a.mkv#0".to_string(), 2, 0)), "cap {cap}");
+        }
+    }
+
+    /// 1 GiB = 256 chunks per DC: toro keeps its 75 cached E02 chunks and plans
+    /// 181 more in priority order (E03, E04, the first 31 of E05); the pin, ranked
+    /// last, loses its protection. nrb has its own 256.
+    #[test]
+    fn max_gb_per_dc_stops_at_the_cap_counting_cached_copies() {
+        let p = capped_world(1);
+        let toro = copies_to(&p, 2);
+        assert_eq!(toro.values().sum::<usize>(), 181);
+        assert_eq!((toro["/tv/S/E03.mkv"], toro["/tv/S/E04.mkv"], toro["/tv/S/E05.mkv"]), (75, 75, 31));
+        let e05_max = p.copies.iter().filter(|c| c.target_node == 2 && c.file_path == "/tv/S/E05.mkv")
+            .map(|c| c.chunk_index).max();
+        assert_eq!(e05_max, Some(30));
+        assert!(p.protected.contains(&("/tv/S/E02.mkv#74".to_string(), 2, 0)));
+        assert!(!p.protected.contains(&("/tv/Bluey/a.mkv#0".to_string(), 2, 0)), "excess cached pin copy unprotected");
+        assert!(p.pinned.is_empty());
+        assert_eq!(copies_to(&p, 3).values().sum::<usize>(), 256);
     }
 
     #[test]

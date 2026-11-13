@@ -335,6 +335,9 @@ enum VolumesCmd {
         /// (0 = the volume's promote_window_secs).
         #[arg(long)]
         cursor_ttl_secs: Option<u64>,
+        /// GiB cap on all pre-cache bytes (series, cursors, pins) per DC (0 = no cap).
+        #[arg(long)]
+        max_gb_per_dc: Option<u64>,
     },
     /// Bug AV (AV-4-1a) — set or update the volume's
     /// `mandatory_replicas` (durability floor enforced by the
@@ -829,11 +832,14 @@ async fn main() -> anyhow::Result<()> {
             }
             VolumesCmd::SetPrecache {
                 volume_id, mode, next_files, next_max_gb, series_max_gb, max_series, pins, clear_pins,
-                cursor_ttl_secs,
+                cursor_ttl_secs, max_gb_per_dc,
             } => {
                 let mut body = set_precache_body(mode.as_deref(), next_files, next_max_gb, series_max_gb, max_series, &pins, clear_pins)?;
                 if let Some(v) = cursor_ttl_secs {
                     body["cursor_ttl_secs"] = v.into();
+                }
+                if let Some(v) = max_gb_per_dc {
+                    body["max_gb_per_dc"] = v.into();
                 }
                 cmd_volumes_set_precache(&api, &args.format, &volume_id, body).await?
             }
@@ -1474,6 +1480,7 @@ async fn cmd_volumes_set_precache(
             println!("  series_max_gb:  {}", c["series_max_gb"].as_u64().unwrap_or(0));
             println!("  max_series:     {}", c["max_series"].as_u64().unwrap_or(0));
             println!("  cursor_ttl_secs: {} (effective {})", c["cursor_ttl_secs"].as_u64().unwrap_or(0), c["effective_cursor_ttl_secs"].as_u64().unwrap_or(0));
+            println!("  max_gb_per_dc:  {}", c["max_gb_per_dc"].as_u64().unwrap_or(0));
             for p in c["pins"].as_array().into_iter().flatten() {
                 println!("  pin:            {}@{}", p["prefix"].as_str().unwrap_or(""), p["datacenter"].as_str().unwrap_or(""));
             }
@@ -2792,6 +2799,13 @@ mod audit_co_tests {
         let a = Args::try_parse_from(["dtfs-cli", "volumes", "set-cache", "v", "--fill", "on_read"]).unwrap();
         assert!(matches!(a.command, Commands::Volumes(VolumesCmd::SetCache { fill: Some(ref f), .. }) if f == "on_read"));
         assert!(Args::try_parse_from(["dtfs-cli", "volumes", "set-cache", "v", "--fill", "always"]).is_err());
+    }
+
+    #[test]
+    fn set_precache_max_gb_per_dc_parses_u64_only() {
+        let a = Args::try_parse_from(["dtfs-cli", "volumes", "set-precache", "v", "--max-gb-per-dc", "500"]).unwrap();
+        assert!(matches!(a.command, Commands::Volumes(VolumesCmd::SetPrecache { max_gb_per_dc: Some(500), .. })));
+        assert!(Args::try_parse_from(["dtfs-cli", "volumes", "set-precache", "v", "--max-gb-per-dc", "-1"]).is_err());
     }
 
     #[test]

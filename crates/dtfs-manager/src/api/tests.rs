@@ -1163,6 +1163,7 @@ mod bug_av_set_cache_tests {
         assert_eq!(v["cache_replicas"]["retention_secs"], 0);
         assert_eq!(v["cache_replicas"]["effective_retention_secs"], 14400);
         assert_eq!(v["precache"]["cursor_ttl_secs"], 0);
+        assert_eq!(v["precache"]["max_gb_per_dc"], 0);
         assert_eq!(v["precache"]["effective_cursor_ttl_secs"], 14400);
         cfg.cache_replicas.retention_secs = 86_400;
         cfg.precache.cursor_ttl_secs = 3_600;

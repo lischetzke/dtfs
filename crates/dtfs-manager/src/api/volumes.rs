@@ -208,8 +208,8 @@ fn volume_cas_check(
     Ok(())
 }
 
-/// A volume carrying a non-zero `retention_secs` / `cursor_ttl_secs` or
-/// `cache_replicas.fill = on_read` is
+/// A volume carrying a non-zero `retention_secs` / `cursor_ttl_secs` /
+/// `max_gb_per_dc` or `cache_replicas.fill = on_read` is
 /// proposed only while every manager is on v0.1.16: an older applier drops the
 /// unknown fields and its state diverges. Checked before EVERY `UpsertVolume`
 /// with a full config, not only where the fields change.
@@ -220,15 +220,16 @@ pub(crate) fn volume_fields_gate(
     if gate_open
         || (cfg.cache_replicas.retention_secs == 0
             && cfg.precache.cursor_ttl_secs == 0
+            && cfg.precache.max_gb_per_dc == 0
             && cfg.cache_replicas.fill == dtfs_common::types::CacheFill::OnPromote)
     {
         return Ok(());
     }
-    warn!(volume = %cfg.id, "volume upsert refused: retention_secs / cursor_ttl_secs / fill need every manager on v0.1.16");
+    warn!(volume = %cfg.id, "volume upsert refused: retention_secs / cursor_ttl_secs / max_gb_per_dc / fill need every manager on v0.1.16");
     Err((
         axum::http::StatusCode::CONFLICT,
         Json(json!({
-            "error": "retention_secs, cursor_ttl_secs and fill=on_read need every manager on v0.1.16 or later",
+            "error": "retention_secs, cursor_ttl_secs, max_gb_per_dc and fill=on_read need every manager on v0.1.16 or later",
             "min_version": "v0.1.16",
         })),
     ))
@@ -415,6 +416,7 @@ pub(crate) fn volume_config_to_json(
             "pins":          cfg.precache.pins,
             "cursor_ttl_secs": cfg.precache.cursor_ttl_secs,
             "effective_cursor_ttl_secs": cfg.precache.effective_cursor_ttl_secs(&cfg.cache_replicas),
+            "max_gb_per_dc": cfg.precache.max_gb_per_dc,
         },
     })
 }
@@ -564,6 +566,8 @@ pub(crate) struct SetPrecacheRequest {
     pub pins: Option<Vec<dtfs_common::types::PrecachePin>>,
     /// 0 = fall back to `cache_replicas.promote_window_secs`.
     pub cursor_ttl_secs: Option<u64>,
+    /// GiB cap on all pre-cache bytes per DC (0 = no cap).
+    pub max_gb_per_dc: Option<u64>,
 }
 
 /// Every pin DC must be the datacenter of some registered node (case-insensitive).
@@ -593,6 +597,7 @@ pub(crate) fn apply_set_precache(
     if let Some(v) = req.max_series { next.precache.max_series = v; }
     if let Some(v) = &req.pins { next.precache.pins = v.clone(); }
     if let Some(v) = req.cursor_ttl_secs { next.precache.cursor_ttl_secs = v; }
+    if let Some(v) = req.max_gb_per_dc { next.precache.max_gb_per_dc = v; }
     next.precache.validate(&next.cache_replicas, next.effective_mandatory_replicas())?;
     Ok(next)
 }

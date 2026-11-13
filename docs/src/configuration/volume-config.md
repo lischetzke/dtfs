@@ -83,6 +83,7 @@ Result: every chunk has one cold replica in `leli`; two reads from a datacenter 
 | `series_max_gb` | 20 | GiB budget per series (plex) |
 | `max_series` | 3 | series kept pre-cached per volume per datacenter (plex) |
 | `cursor_ttl_secs` | 0 (= `cache_replicas.promote_window_secs`) | how long a played file stays a cursor after its last read; non-zero needs every manager on v0.1.16 |
+| `max_gb_per_dc` | 0 (no cap) | GiB cap on everything this volume keeps pre-cached per datacenter (series, cursors and pins, already cached chunks included); planning stops at the cap in priority order and the rest loses protection; at most 1048576; non-zero needs every manager on v0.1.16 |
 | `pins` | `[]` | up to 32 `{prefix, datacenter}` entries: subtrees kept pre-cached in a datacenter whatever the mode (see [Tiering](../storage/tiering.md#pinned-prefixes)) |
 
 Constraints for any mode other than `off`: a cache tier with `cache_replicas.<tier>.max > 0` whose `mandatory_replicas.<tier>` is 0, and `cache_replicas.per_dc = true`. A pin prefix must start with `/` and must not be `/`; the pin datacenter must match a registered node's datacenter (case-insensitive, REST answers 400 otherwise). Pins alone (mode `off`) are valid and need the same cache tier and `per_dc`. Plex needs `series_max_gb` and `max_series` above 0; files needs `next_files` or `next_max_gb` above 0. The setting needs every manager on v0.1.16 or later (409 otherwise).

@@ -885,6 +885,11 @@ fn apply_set_precache_merges_and_refuses() {
     // Plex with series_max_gb 0.
     let e = apply_set_precache(&precache_vol("v"), &SetPrecacheRequest { series_max_gb: Some(0), ..plex_req() }).unwrap_err();
     assert!(e.contains("series_max_gb"), "{e}");
+    // max_gb_per_dc merges; above 1 PiB is refused.
+    let next = apply_set_precache(&precache_vol("v"), &SetPrecacheRequest { max_gb_per_dc: Some(500), ..plex_req() }).unwrap();
+    assert_eq!(next.precache.max_gb_per_dc, 500);
+    let e = apply_set_precache(&precache_vol("v"), &SetPrecacheRequest { max_gb_per_dc: Some((1 << 20) + 1), ..plex_req() }).unwrap_err();
+    assert_eq!(e, "max_gb_per_dc must be at most 1048576 (1 PiB)");
 }
 
 #[tokio::test]
@@ -937,6 +942,9 @@ async fn retention_and_cursor_ttl_need_v0_1_16() {
     assert!(e.1.0["error"].as_str().unwrap().contains("retention_secs"), "{:?}", e.1.0);
     let e = set_volume_precache_endpoint(State(h.state.clone()), p(), Json(ttl(3600))).await.unwrap_err();
     assert_v0_1_16_conflict(&e);
+    let cap = SetPrecacheRequest { max_gb_per_dc: Some(500), ..Default::default() };
+    let e = set_volume_precache_endpoint(State(h.state.clone()), p(), Json(cap)).await.unwrap_err();
+    assert_v0_1_16_conflict(&e);
     // retention 0 on a mixed cluster is not gated (noop here: already 0).
     let r = set_volume_cache_endpoint(State(h.state.clone()), p(), Json(ret(0))).await.unwrap();
     assert_eq!(r.0["changed"], false);
@@ -955,10 +963,11 @@ async fn upserts_carrying_retention_or_cursor_ttl_need_v0_1_16() {
     let h = harness().await;
     let p = || axum::extract::Path("v".to_string());
     let ws = || Json(SetWriteSafetyRequest { min_replicas_before_ack: None, write_timeout_secs: Some(60) });
-    for (retention, ttl) in [(1u64, 0u64), (0, 1)] {
+    for (retention, ttl, cap) in [(1u64, 0u64, 0u64), (0, 1, 0), (0, 0, 1)] {
         let mut v = precache_vol("v");
         v.cache_replicas.retention_secs = retention;
         v.precache.cursor_ttl_secs = ttl;
+        v.precache.max_gb_per_dc = cap;
         h.state.sm_data.write().await.volumes.insert("v".into(), v);
         let e = set_volume_write_safety_endpoint(State(h.state.clone()), p(), ws()).await.unwrap_err();
         assert_v0_1_16_conflict(&e);

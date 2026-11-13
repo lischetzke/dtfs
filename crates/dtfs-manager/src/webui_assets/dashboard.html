@@ -835,6 +835,10 @@
             <input id="ve-cursor-ttl" class="form-input" type="number" min="0" step="1">
         </div>
         <div class="modal-row">
+            <label for="ve-precache-max-gb">Pre-cache cap per datacenter (GiB, 0 = none)</label>
+            <input id="ve-precache-max-gb" class="form-input" type="number" min="0" step="1">
+        </div>
+        <div class="modal-row">
             <label for="ve-cooldown">Cooldown (seconds)</label>
             <input id="ve-cooldown" class="form-input" type="number" min="0" step="1">
         </div>
@@ -3038,6 +3042,9 @@
             const ttlEl = document.getElementById('ve-cursor-ttl');
             ttlEl.value = (v.precache && v.precache.cursor_ttl_secs) || 0;
             ttlEl.dataset.orig = ttlEl.value;
+            const capEl = document.getElementById('ve-precache-max-gb');
+            capEl.value = (v.precache && v.precache.max_gb_per_dc) || 0;
+            capEl.dataset.orig = capEl.value;
             document.getElementById('ve-cooldown').value = cr.cooldown_secs || '';
             // prefill mandatory replicas.
             const mr = v.mandatory_replicas || {};
@@ -3236,9 +3243,17 @@
         }
         lines.push(await post('set-cache', cacheBody));
         // Only on change: set-precache is refused (409) before v0.1.16.
+        const precacheBody = {};
         const ttlEl = document.getElementById('ve-cursor-ttl');
         if (ttlEl.value.trim() !== ttlEl.dataset.orig) {
-            lines.push(await post('set-precache', { cursor_ttl_secs: intOrNull('ve-cursor-ttl') }));
+            precacheBody.cursor_ttl_secs = intOrNull('ve-cursor-ttl');
+        }
+        const capEl = document.getElementById('ve-precache-max-gb');
+        if (capEl.value.trim() !== capEl.dataset.orig) {
+            precacheBody.max_gb_per_dc = intOrNull('ve-precache-max-gb');
+        }
+        if (Object.keys(precacheBody).length > 0) {
+            lines.push(await post('set-precache', precacheBody));
         }
 
         result.className = 'modal-result';
