@@ -445,7 +445,12 @@ Narrative and bug history: `docs/src/internals/invariants.md` § A.8
   chunk; `CACHE_FILL_MAX_INFLIGHT`, 2, workers; enqueue never awaits, no
   lock across an await), then `commit_cache_fill`. A fill dropped at a
   full queue or a failed put/commit unmarks the id, so a later viewer read
-  retries it. Failures at debug, one warn per kind per minute.
+  retries it. Failures at debug, one warn per kind per minute. The fh's
+  FIRST viewer transition also fills the previous chunk index on that fh
+  (`prev_chunk_to_fill`, `OpenFile.viewer_transition_seen`: chunk 0 or the
+  resume chunk was a scanner transition), same `fill_wanted` filter, bytes
+  only from the readahead memory cache (`cached_bytes`, sync; missing =
+  skipped, never fetched).
   `without_chunks` drops the target; write paths never fill.
 - Client `read_chunk` verifies the streamed bytes against the 64-hex
   chunk id (IntegrityFaultError on mismatch).

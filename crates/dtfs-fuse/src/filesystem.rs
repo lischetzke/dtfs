@@ -234,6 +234,22 @@ fn fill_wanted(viewer: bool, has_target: bool, any_replica_in_dc: bool, recently
     viewer && has_target && !any_replica_in_dc && !recently_filled
 }
 
+/// Fill on read for the fh's previous chunk: on its FIRST viewer transition,
+/// the chunk read before it (chunk 0 or the resume chunk, a scanner
+/// transition because the fh had read < 1 MiB) was never filled.
+fn prev_chunk_to_fill(viewer_transition: bool, first_viewer: bool, prev: Option<u32>, current: u32) -> Option<u32> {
+    match prev {
+        Some(p) if viewer_transition && first_viewer && p != current => Some(p),
+        _ => None,
+    }
+}
+
+/// A chunk's bytes if the readahead memory cache holds them under any
+/// candidate; never waits (no disk or network read).
+fn cached_bytes(readahead: &crate::readahead::ReadAheadEngine, candidates: &[String], chunk_id: &str) -> Option<Bytes> {
+    candidates.iter().find_map(|c| readahead.get_cached(c, chunk_id))
+}
+
 /// Bounded set of chunk ids, oldest evicted first.
 #[derive(Default)]
 struct RecentIds {
@@ -866,6 +882,9 @@ struct OpenFile {
     /// only on a miss, so the prefetch window advances continuously
     /// instead of stalling every `prefetch_chunks+1` chunks.
     last_read_chunk: Option<u32>,
+    /// A viewer transition (tracked, not scanner) happened on this fh; the
+    /// first one also fills the previous chunk (`prev_chunk_to_fill`).
+    viewer_transition_seen: bool,
     /// CR2-8-3 (FUSE-11) — cumulative bytes served by `read()` on THIS fh.
     /// Feeds `is_viewer_read` so the disk-cache atime hint reflects actual
     /// consumption on this handle rather than one kernel call's (~128 KB)
@@ -1434,6 +1453,7 @@ impl DtfsFilesystem {
                 lease_owner_id,
                 committed_any: committed_any_on_open(false),
                 last_read_chunk: None,
+                viewer_transition_seen: false,
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
                 eof_refetch_at: None,
@@ -1738,14 +1758,22 @@ impl DtfsFilesystem {
             // a genuinely new chunk index for THIS fh, before touching any
             // cache. Gates the cache-hit notify dedup below and the
             // prefetch-window advance after chunk_data is resolved.
-            let is_new_chunk_for_fh = match self.open_files.get_mut(&fh) {
+            let (is_new_chunk_for_fh, fill_prev) = match self.open_files.get_mut(&fh) {
                 Some(mut of) => {
                     let is_new = should_notify(of.last_read_chunk, chunk_idx as u32);
+                    let viewer_transition = is_new && !report_scanner && !untracked;
+                    let fill_prev = prev_chunk_to_fill(
+                        viewer_transition,
+                        !of.viewer_transition_seen,
+                        of.last_read_chunk,
+                        chunk_idx as u32,
+                    );
+                    of.viewer_transition_seen |= viewer_transition;
                     of.last_read_chunk = Some(chunk_idx as u32);
-                    is_new
+                    (is_new, fill_prev)
                 }
                 // fh closed concurrently mid-read — be conservative.
-                None => true,
+                None => (true, None),
             };
 
             // Try read-ahead in-memory cache first: any candidate's cache
@@ -2013,6 +2041,13 @@ impl DtfsFilesystem {
                     !untracked,
                 );
                 self.maybe_fill_on_read(&locations, chunk, chunk_idx as u64, &file_path, &chunk_data, !report_scanner && !untracked);
+                // The chunk read before this fh's first viewer transition was
+                // a scanner transition: fill it now if its bytes are in memory.
+                if let Some((p, prev_chunk)) = fill_prev.and_then(|p| locations.chunk_at(p as u64).map(|c| (p, c))) {
+                    if let Some(b) = cached_bytes(&self.readahead, &self.read_candidates(prev_chunk), &prev_chunk.chunk_id) {
+                        self.maybe_fill_on_read(&locations, prev_chunk, p as u64, &file_path, &b, true);
+                    }
+                }
             }
 
             // Extract the relevant byte range from this chunk.
@@ -3381,6 +3416,7 @@ impl DtfsFilesystem {
                 lease_owner_id: Some(owner_id),
                 committed_any,
                 last_read_chunk: None,
+                viewer_transition_seen: false,
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
                 eof_refetch_at: None,
@@ -5585,6 +5621,35 @@ mod fill_on_read_tests {
         wait_done(&done, 1).await;
     }
 
+    /// First viewer transition after a scanner one fills the previous chunk;
+    /// later transitions do not; an already-filled or in-DC previous chunk is
+    /// then refused by `fill_wanted`.
+    #[test]
+    fn prev_chunk_filled_only_on_first_viewer_transition() {
+        assert_eq!(prev_chunk_to_fill(true, true, Some(0), 1), Some(0), "chunk 0 after the first 1 MiB");
+        assert_eq!(prev_chunk_to_fill(true, true, Some(7), 8), Some(7), "resume chunk");
+        assert_eq!(prev_chunk_to_fill(true, false, Some(1), 2), None, "later transition");
+        assert_eq!(prev_chunk_to_fill(false, true, Some(0), 1), None, "scanner transition");
+        assert_eq!(prev_chunk_to_fill(true, true, None, 0), None, "first read of the fh");
+        assert_eq!(prev_chunk_to_fill(true, true, Some(3), 3), None, "same chunk");
+        // The previous chunk then goes through the same filter as any fill.
+        assert!(!fill_wanted(true, true, false, true), "previous chunk already filled");
+        assert!(!fill_wanted(true, true, true, false), "previous chunk has an in-DC replica");
+    }
+
+    /// The previous chunk's bytes come from the readahead memory cache only
+    /// (sync, never a fetch); missing = skipped.
+    #[test]
+    fn prev_chunk_bytes_from_memory_cache_only() {
+        use crate::readahead::{ReadAheadEngine, ReadAheadMode};
+        let engine = ReadAheadEngine::new(ReadAheadMode::Disabled, dtfs_client::client::DtfsClient::new(), 60, 1 << 20, 2);
+        let data = Bytes::from_static(b"chunk bytes");
+        engine.insert_cached("n:2", "cid", data.clone());
+        let cands = ["n:1".to_string(), "n:2".to_string()];
+        assert_eq!(cached_bytes(&engine, &cands, "cid"), Some(data), "found under any candidate");
+        assert_eq!(cached_bytes(&engine, &cands, "other"), None, "missing: skipped, not fetched");
+    }
+
     /// `remove` drops the id from both the set and the eviction order.
     #[test]
     fn recent_ids_remove() {
@@ -7300,6 +7365,7 @@ mod untracked_read_process_tests {
                 lease_owner_id: None,
                 committed_any: true,
                 last_read_chunk: None,
+                viewer_transition_seen: false,
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
                 eof_refetch_at: None,
@@ -7390,6 +7456,7 @@ mod async_commit_fs_tests {
                 lease_owner_id: None,
                 committed_any: true,
                 last_read_chunk: None,
+                viewer_transition_seen: false,
                 bytes_read_on_fh: 0,
                 holes_confirmed: None,
                 eof_refetch_at: None,
