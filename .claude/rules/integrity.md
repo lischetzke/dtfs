@@ -94,8 +94,10 @@ text there.
 
 - `mandatory_replicas.<tier>`: only `check_under_replicated` maintains
   them, counting only LIVE replicas (`live_replica_tier`).
-- `cache_replicas.<tier>.{min,max}`: only the tiering engine creates them;
-  the under-replication scheduler never backfills them. Pre-cache copies
+- `cache_replicas.<tier>.{min,max}`: only the tiering engine creates them,
+  plus fill on read via `CommitCacheFill` (validated in
+  `metadata/cache_fill.rs`: cache tier only, reader's DC, survivor disk,
+  below cache max); the under-replication scheduler never backfills them. Pre-cache copies
   (`precache.rs`, driven by `TieringEngine::run_precache`) are cache replicas
   made via `schedule_replications`; pre-cache never removes them, only the
   idle demote does (skipping protected ones; `flush_cache` overrides),
