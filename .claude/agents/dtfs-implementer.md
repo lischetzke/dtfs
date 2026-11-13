@@ -80,6 +80,52 @@ tests as covering the runtime path.
    when the caller says you work on master directly. Never
    `--no-verify`, never `--amend` a pushed commit, never bypass signing.
 
+## Known failure modes (each slipped past unit tests before)
+
+Check every one that applies before committing:
+
+- **Red first, always.** "The new API would not compile against the old
+  code" is not a reason to skip red: add the new signature with the old
+  behaviour (or a stub reproducing the bug), run red, then fix.
+- **Spec lists are hints.** Grep every call site of what you change; a
+  caller list in the task can be incomplete. Report the ones it missed.
+- **Stale inputs.** A loop that runs faster than its input refreshes
+  (heartbeat usage, persisted index, cached view) must not act twice on
+  the same stale value: record what it acted on and wait for a fresh,
+  post-action report.
+- **Bounded pages.** When you consume one page (`limit N`) of
+  candidates, handle a page that is entirely ineligible: page on, or prove
+  it cannot happen.
+- **Per-item gates.** A precondition for one item must not early-return
+  the whole batch; filter per item.
+- **Unknown = safe side.** Missing or unseeded state (first start after
+  upgrade, lost file) must default to the value that makes the consuming
+  action do nothing (e.g. unknown last-read = just read, not oldest).
+- **Drop when full.** A bounded spawn or queue that drops work must undo
+  any dedup or "done" mark, and you must say whether the dropped work is
+  ever retried. Prefer a byte-bounded queue over a silent drop.
+- **Thresholds compose.** When an admission limit and a removal trigger
+  act on the same resource, admission must be able to reach the trigger
+  (no dead band); planners that stop when `room < item` never reach it.
+- **First item of a sequence.** A classifier with a warm-up (bytes
+  consumed, reads seen) misclassifies the first item. Say what happens to
+  it and handle it.
+- **Leader-local / process-global state.** It is cleared or not exported
+  once the node stops being leader; a former leader must not keep
+  publishing it.
+- **Inserted items.** A new fn or const goes above the neighbour's `///`
+  block, never between another item's doc comment and its item.
+- **Docs and comments match code.** Re-read each sentence you wrote
+  against the code path (which loops, which guards, which exceptions such
+  as pins). Docs state current behaviour only.
+- **Shell harness.** Under `set -o pipefail`, `grep -c` exits 1 on zero
+  matches. A trailing `#` comment swallows the rest of a `;` line in
+  Python one-liners. A Raft leader restart may keep its leadership (stop
+  it until another leads). Run every edited harness path; `bash -n` is
+  not a test.
+- **Editing.** Source and scripts change only via `Edit`/`Write`, never a
+  scripted string replacement (Python, sed, perl).
+
 Must NOT: touch a second task in the same run; refactor beyond the
 fix; silently skip a required test layer; claim cluster-only behaviour
 was verified unless a dev-cluster run showed it.
