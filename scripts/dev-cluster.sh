@@ -47,6 +47,10 @@ Usage: scripts/dev-cluster.sh <command>
                     criterion. Needs DTFS_DEV_VERSION=v0.1.16 DTFS_DEV_CACHE=1 up
   cache-check2      fill-on-read (toro) and link-budget (nrb, 2 Mbps) check (~15 min):
                     PASS/FAIL per criterion. Needs DTFS_DEV_VERSION=v0.1.16 DTFS_DEV_CACHE=1 up
+  cache-check3      cache-only capacity eviction (toro fill client, 12 x 40 MiB read
+                    one by one into data02's 512 MiB tmpfs, 60/50 watermarks, ~8 min):
+                    usage reaches high, evicts oldest-read down to low, fills keep
+                    going. Needs DTFS_DEV_VERSION=v0.1.17 DTFS_DEV_CACHE=1 up
   down              remove all dtfs-dev-* containers, network and volumes
 
 Topology: mgr01/02/03 (leli/toro/nrb), data01 leli cold, data02 toro warm,
@@ -671,6 +675,40 @@ if cmd == "linkwatch":  # linkwatch <path> <t0_epoch> <max_s>
     ck(series[-1][1] >= total - 1, "all %d chunks (chunk 0 optional) reached data03 within the window (%d/%d after %d s)" % (total, series[-1][1], total, series[-1][0]))
     ck(anchors_ok, "every chunk kept its data01 row at every sample")
     sys.exit(rc)
+if cmd == "c3sample":  # c3sample <paths...>: leader fill commits (toro), evict_capacity, data02 rows per file
+    c = http(leader, "GET", "/api/v1/cache/status")[1].get("counters", {})
+    fill = c.get("fill", {}).get("toro", {}).get("commits", 0); ev = c.get("removed", {}).get("evict_capacity", 0)
+    print("%s %d %d %s" % (leader.split("//")[1].split(":")[0], fill, ev, " ".join(str(sum("data02" in x for x in (rows(p) or []))) for p in args))); sys.exit(0)
+if cmd == "c3judge":   # stdin: "S epoch used size leader fill evict c1..cN" samples and "F i fill" per-file marks
+    S = []; F = []
+    for line in sys.stdin:
+        w = line.split()
+        if w and w[0] == "S" and len(w) > 7: S.append((int(w[1]), int(w[2]), int(w[3]), w[4], int(w[5]), int(w[6]), [int(x) for x in w[7:]]))
+        elif w and w[0] == "F": F.append((int(w[1]), int(w[2]), int(w[3])))
+    if not S: print("FAIL: no samples"); sys.exit(1)
+    t0 = S[0][0]; n = len(S[0][6])
+    print("  t(s)  used%  leader  fill  evict_capacity  data02 rows per file (read order)")
+    for t, u, z, l, fl, ev, cs in S: print("  %4d  %5.1f  %-6s  %4d  %14d  %s" % (t - t0, 100.0 * u / z, l, fl, ev, " ".join("%2d" % x for x in cs)))
+    pct = [100.0 * u / z for _, u, z, _, _, _, _ in S]
+    ck(max(pct) >= 60, "max data02 usage %.1f%% >= 60%% (high watermark reached)" % max(pct))
+    ck(S[-1][5] > S[0][5], "evict_capacity counter increased (%d -> %d)" % (S[0][5], S[-1][5]))
+    ck(45 <= pct[-1] < 60, "usage settled at %.1f%% after eviction (45..60%%)" % pct[-1])
+    peak = [max(s[6][i] for s in S) for i in range(n)]
+    lost = [i for i in range(n) if S[-1][6][i] < peak[i]]
+    top = {i: next(k for k, s in enumerate(S) if s[6][i] == peak[i]) for i in lost}
+    first = {i: next(s[0] - t0 for s in S[top[i]:] if s[6][i] < peak[i]) for i in lost}
+    print("INFO: files that lost data02 rows (read order, 1-based) and first-loss t(s): %s" % {i + 1: first[i] for i in lost})
+    kept = [i for i in range(n) if i not in lost]
+    ck(bool(lost) and bool(kept) and max(lost) < min(kept) and n - 1 in kept,
+       "oldest-read files lost data02 copies first: losers %s precede kept %s, last file kept" % ([i + 1 for i in lost], [i + 1 for i in kept]))
+    # a read that starts while the last sample is at or above high gets no fill target (refused until eviction runs)
+    F.sort(); at_high = lambda t: max([s for s in S if s[0] <= t] or [S[0]], key=lambda s: s[0])
+    miss = [b[0] for a, b in zip(F, F[1:]) if b[1] <= a[1] and 100.0 * at_high(b[2])[1] / at_high(b[2])[2] < 60]
+    refused = [b[0] for a, b in zip(F, F[1:]) if b[1] <= a[1] and b[0] not in miss]
+    print("INFO: files read while data02 was at or above high (no fill, expected): %s" % refused)
+    ck(len(F) == n + 1 and not miss and F[-1][1] > F[-2][1],
+       "fill counter increased for every file read below high, the last included: %s (missing %s)" % ([f for _, f, _ in F], miss))
+    sys.exit(rc)
 print("unknown command " + cmd); sys.exit(2)
 '
 
@@ -867,6 +905,59 @@ cmd_cache_check2() {
   exit $RC
 }
 
+cmd_cache_check3() {
+  set +e
+  local LOG SER FLAG RC=0 T0=$SECONDS N=12 i P RS PATHS="" SPID
+  LOG="$(mktemp)"; SER="$(mktemp)"; FLAG="$(mktemp)"
+  tlog() { echo "[$(date +%H:%M:%S)] $*"; }
+  pass() { echo "PASS: $*" | tee -a "$LOG"; }
+  fail() { echo "FAIL: $*" | tee -a "$LOG"; RC=1; }
+  py2() { docker run --rm -i --network $NET -e DTFS_SECRET="$SECRET" "$IMG" python3 -c "$CACHE_PY" "$@" | tee -a "$LOG"; [ "${PIPESTATUS[0]}" = 0 ] || { RC=1; echo "STAGE-ERROR: $1 exited non-zero" | tee -a "$LOG"; }; }
+  fresh_client() { exists dtfs-dev-$1 && docker rm -f dtfs-dev-$1 >/dev/null; start_client $1 $2 0; }
+  c3() { docker run --rm -i --network $NET -e DTFS_SECRET="$SECRET" "$IMG" python3 -c "$CACHE_PY" c3sample $PATHS; }
+  # sample: "S epoch used size leader fill evict c1..cN" (data02 df + leader counters + rows)
+  sample() { local u z; read -r z u < <(docker exec dtfs-dev-data02 df -B1 --output=size,used /mnt/d0 | tail -1); echo "S $(date +%s) $u $z $(c3)" >> "$SER"; }
+  running dtfs-dev-mgr01 || die "cluster not up (run: DTFS_DEV_VERSION=v0.1.17 DTFS_DEV_CACHE=1 up)"
+  docker exec dtfs-dev-data02 df -T /mnt/d0 | grep -q tmpfs || die "data02 /mnt/d0 is not tmpfs: needs DTFS_DEV_CACHE=1 on a fresh down + up"
+  for i in $(seq -w 1 $N); do PATHS="$PATHS /evict-$i"; done
+
+  tlog "setup: volume fillvol (fill on_read, 60/50 watermarks, data02 512 MiB tmpfs)"
+  py2 setup2 || { fail "volume setup"; exit 1; }
+  tlog "test 7: cache-only capacity eviction. Writing $N x 40 MiB via the toro fill client"
+  fresh_client fuse-toro-fill fuse-toro-fill.toml
+  for P in $PATHS; do
+    docker exec dtfs-dev-fuse-toro-fill dd if=/dev/urandom of=/mnt/dtfs$P bs=1M count=40 conv=fsync 2>/dev/null || { fail "writing $P"; exit 1; }
+  done
+  # shellcheck disable=SC2086
+  py2 none $PATHS   # data02 holds only the cache copies added below, nothing mandatory
+  tlog "recreating the client (cold caches), settling 30 s"
+  fresh_client fuse-toro-fill fuse-toro-fill.toml
+  sleep 30
+  : > "$SER"; sample
+  echo "F 0 $(tail -1 "$SER" | cut -d' ' -f6) $(date +%s)" >> "$SER"
+  ( until [ -e "$FLAG.done" ]; do sleep 10; sample; done ) &
+  SPID=$!
+  i=0
+  for P in $PATHS; do
+    i=$((i + 1))
+    tlog "viewer read of $P ($i/$N)"; RS=$(date +%s)
+    docker exec dtfs-dev-fuse-toro-fill dd if=/mnt/dtfs$P of=/dev/null bs=1M 2>/dev/null || fail "reading $P"
+    sleep 20
+    echo "F $i $(c3 | cut -d' ' -f2) $RS" >> "$SER"
+  done
+  py2 fill "/evict-$N" 60
+  tlog "settling 90 s for the eviction rounds"
+  sleep 90
+  touch "$FLAG.done"; wait $SPID; sample
+  py2 c3judge < "$SER"
+  # shellcheck disable=SC2086
+  py2 anchors $PATHS
+  rm -f "$SER" "$FLAG" "$FLAG.done"
+  [ "$(grep -c '^FAIL' "$LOG" || true)" = 0 ] || RC=1   # grep -c exits 1 on 0 matches (pipefail)
+  tlog "cache-check3 finished in $(( (SECONDS - T0) / 60 )) min: $(grep -c '^PASS' "$LOG") PASS, $(grep -c '^FAIL' "$LOG") FAIL"
+  exit $RC
+}
+
 cmd_down() {
   local c; c="$(docker ps -aq --filter name=dtfs-dev-)"
   # shellcheck disable=SC2086
@@ -889,6 +980,7 @@ case "${1:-}" in
   precache-check) cmd_precache_check;;
   cache-check) cmd_cache_check;;
   cache-check2) cmd_cache_check2;;
+  cache-check3) cmd_cache_check3;;
   down) cmd_down;;
   -h|--help|help|"") usage;;
   *) usage >&2; exit 2;;
