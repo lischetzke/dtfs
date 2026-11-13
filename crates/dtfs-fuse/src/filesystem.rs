@@ -217,9 +217,13 @@ pub const CACHE_HIT_NOTIFY_MAX_INFLIGHT: usize = 8;
 /// one chunk's `Bytes` (refcounted, usually shared with the readahead cache).
 pub const LOCAL_CACHE_PUT_MAX_INFLIGHT: usize = 2;
 
-/// Bound on background fill-on-read copies (PutChunk + CommitCacheFill);
-/// each holds one chunk's `Bytes`. Full = the fill is dropped.
+/// Workers for background fill-on-read copies (PutChunk + CommitCacheFill);
+/// each holds one chunk's `Bytes`.
 pub const CACHE_FILL_MAX_INFLIGHT: usize = 2;
+
+/// Queued fill bytes in front of the workers; full = the fill is dropped.
+/// The bytes are mostly shared with readahead; this bounds burst memory.
+pub const CACHE_FILL_QUEUE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Chunk ids remembered as filled (or tried), so a re-read does not refill.
 const RECENTLY_FILLED_MAX: usize = 4096;
@@ -948,10 +952,11 @@ pub struct DtfsFilesystem {
     /// Bounds background disk-cache puts after a foreground miss
     /// (`LOCAL_CACHE_PUT_MAX_INFLIGHT`); a put without a permit is dropped.
     cache_put_permits: std::sync::Arc<tokio::sync::Semaphore>,
-    /// Bounds background fill-on-read copies (`CACHE_FILL_MAX_INFLIGHT`).
-    cache_fill_permits: std::sync::Arc<tokio::sync::Semaphore>,
-    /// Chunks filled or with a fill in flight (`RECENTLY_FILLED_MAX`); a
-    /// dropped or failed fill is unmarked (`spawn_fill`).
+    /// Background fill-on-read copies: `CACHE_FILL_QUEUE_BYTES` queued in
+    /// front of `CACHE_FILL_MAX_INFLIGHT` workers.
+    cache_fills: Arc<FillQueue>,
+    /// Chunks filled or with a fill queued/in flight (`RECENTLY_FILLED_MAX`);
+    /// a dropped or failed fill is unmarked (`FillQueue`).
     recently_filled: Arc<parking_lot::Mutex<RecentIds>>,
     /// CR-6-6 (FUSE-9) — single-flights foreground chunk-miss fetches by
     /// chunk_id (content-addressed, so any candidate node's fetch is
@@ -1075,6 +1080,7 @@ impl DtfsFilesystem {
             client_location.host, std::process::id()
         );
         let write_budget = write_budget_bytes(config.memory.hard_cap_mb, config.readahead.cache_mb);
+        let recently_filled = Arc::new(parking_lot::Mutex::new(RecentIds::default()));
 
         Self {
             client,
@@ -1093,8 +1099,8 @@ impl DtfsFilesystem {
             cache_put_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 LOCAL_CACHE_PUT_MAX_INFLIGHT,
             )),
-            cache_fill_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(CACHE_FILL_MAX_INFLIGHT)),
-            recently_filled: Arc::new(parking_lot::Mutex::new(RecentIds::default())),
+            cache_fills: FillQueue::new(recently_filled.clone(), CACHE_FILL_MAX_INFLIGHT, CACHE_FILL_QUEUE_BYTES),
+            recently_filled,
             foreground_inflight: DashMap::new(),
             known_locations: DashMap::new(),
             failed_replicas: DashMap::new(),
@@ -1543,7 +1549,8 @@ impl DtfsFilesystem {
         let client = self.client.clone();
         let (chunk_id, volume_id, path, client_dc, bytes) =
             (chunk.chunk_id.clone(), locations.volume_id.clone(), path.to_string(), dc.clone(), bytes.clone());
-        let spawned = spawn_fill(&self.recently_filled, &self.cache_fill_permits, &chunk.chunk_id, async move {
+        let len = bytes.len() as u64;
+        let queued = self.cache_fills.enqueue(&chunk.chunk_id, len, Box::pin(async move {
             let now = || SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
             let put = match client.write_chunk_bytes(&target.addr, &chunk_id, &volume_id, &target.tier, bytes).await {
                 Ok(p) => p,
@@ -1575,9 +1582,9 @@ impl DtfsFilesystem {
                 Err(e) => debug!(chunk_id = %chunk_id, node = %target.addr, error = %format!("{e:#}"), "cache fill commit failed"),
             }
             false
-        });
-        if !spawned {
-            debug!(chunk_id = %chunk.chunk_id, "cache fill skipped, bound full");
+        }));
+        if !queued {
+            debug!(chunk_id = %chunk.chunk_id, "cache fill skipped, queue full");
         }
     }
 
@@ -5400,29 +5407,81 @@ where
         .await
 }
 
-/// Spawns a fill of `id` (already marked in `recent`) via `spawn_bounded`.
-/// Unmarks `id` when the spawn is dropped (bound full) or the fill fails
-/// (`fut` -> false), so a later viewer read retries it. The lock is never
-/// held across an await.
-fn spawn_fill<F>(
-    recent: &Arc<parking_lot::Mutex<RecentIds>>,
-    permits: &Arc<tokio::sync::Semaphore>,
-    id: &str,
-    fut: F,
-) -> bool
-where
-    F: std::future::Future<Output = bool> + Send + 'static,
-{
-    let (r, owned) = (recent.clone(), id.to_string());
-    let spawned = spawn_bounded(permits, async move {
-        if !fut.await {
-            r.lock().remove(&owned);
-        }
-    });
-    if !spawned {
-        recent.lock().remove(id);
+type FillFut = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
+
+/// Fill-on-read FIFO in front of at most `workers` (`CACHE_FILL_MAX_INFLIGHT`)
+/// background tasks, bounded by queued bytes. Each id is already marked in
+/// `recent`; a fill dropped (queue full) or failed (`fut` -> false) is
+/// unmarked so a later viewer read retries it. Never awaits on enqueue; no
+/// lock is held across an await.
+struct FillQueue {
+    recent: Arc<parking_lot::Mutex<RecentIds>>,
+    permits: Arc<tokio::sync::Semaphore>,
+    max_bytes: u64,
+    /// Pending (id, bytes, fill) and the queued byte total.
+    pending: parking_lot::Mutex<(std::collections::VecDeque<(String, u64, FillFut)>, u64)>,
+}
+
+impl FillQueue {
+    fn new(recent: Arc<parking_lot::Mutex<RecentIds>>, workers: usize, max_bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            recent,
+            permits: Arc::new(tokio::sync::Semaphore::new(workers)),
+            max_bytes,
+            pending: parking_lot::Mutex::new((std::collections::VecDeque::new(), 0)),
+        })
     }
-    spawned
+
+    /// Queue a fill of `len` bytes; `false` = queue full, dropped and unmarked.
+    /// An empty queue always admits one entry, even one larger than the cap.
+    fn enqueue(self: &Arc<Self>, id: &str, len: u64, fut: FillFut) -> bool {
+        {
+            let mut p = self.pending.lock();
+            if !p.0.is_empty() && p.1.saturating_add(len) > self.max_bytes {
+                drop(p);
+                self.recent.lock().remove(id);
+                return false;
+            }
+            p.0.push_back((id.to_string(), len, fut));
+            p.1 += len;
+        }
+        self.start_worker();
+        true
+    }
+
+    fn pop(&self) -> Option<(String, FillFut)> {
+        let mut p = self.pending.lock();
+        let (id, len, fut) = p.0.pop_front()?;
+        p.1 -= len;
+        Some((id, fut))
+    }
+
+    /// Start a worker if one is free. A worker drains the queue, releases
+    /// its permit and re-checks: an enqueue that found no free permit pushed
+    /// before that release, so its entry is never stranded.
+    fn start_worker(self: &Arc<Self>) {
+        let Ok(permit) = self.permits.clone().try_acquire_owned() else { return };
+        let q = self.clone();
+        tokio::spawn(async move {
+            let mut permit = Some(permit);
+            loop {
+                if let Some((id, fut)) = q.pop() {
+                    if !fut.await {
+                        q.recent.lock().remove(&id);
+                    }
+                    continue;
+                }
+                drop(permit.take());
+                if q.pending.lock().0.is_empty() {
+                    return;
+                }
+                match q.permits.clone().try_acquire_owned() {
+                    Ok(p) => permit = Some(p),
+                    Err(_) => return,
+                }
+            }
+        });
+    }
 }
 
 /// Spawns `fut` only if `permits` has a free permit (held until `fut` ends);
@@ -5471,44 +5530,59 @@ mod fill_on_read_tests {
         assert!(r.contains("c2"));
     }
 
-    fn marked(id: &str) -> Arc<parking_lot::Mutex<RecentIds>> {
-        let r = Arc::new(parking_lot::Mutex::new(RecentIds::default()));
-        r.lock().insert(id, RECENTLY_FILLED_MAX);
-        r
+    use std::sync::atomic::AtomicUsize;
+
+    fn job(done: &Arc<AtomicUsize>, ok: bool) -> FillFut {
+        let d = done.clone();
+        Box::pin(async move {
+            d.fetch_add(1, Ordering::SeqCst);
+            ok
+        })
     }
 
-    /// Wait until the single permit is back (the spawned fill has ended).
-    async fn drained(permits: &Arc<tokio::sync::Semaphore>) {
-        let _p = tokio::time::timeout(std::time::Duration::from_secs(1), permits.acquire())
-            .await
-            .expect("fill task ended")
-            .unwrap();
+    async fn wait_done(done: &Arc<AtomicUsize>, n: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while done.load(Ordering::SeqCst) < n {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all queued fills processed");
     }
 
-    /// A fill dropped because the bound is full leaves the id unmarked, so a
-    /// later viewer read retries it.
+    /// A burst under the byte cap is queued in front of 2 workers and every
+    /// fill runs (a failed one is unmarked); the over-cap one is dropped and
+    /// unmarked.
     #[tokio::test]
-    async fn dropped_fill_spawn_unmarks_id() {
-        let recent = marked("c1");
-        let permits = Arc::new(tokio::sync::Semaphore::new(0));
-        assert!(!spawn_fill(&recent, &permits, "c1", async { true }));
-        assert!(!recent.lock().contains("c1"), "dropped fill still marked");
+    async fn fill_queue_runs_burst_under_cap_drops_over_cap() {
+        let recent = Arc::new(parking_lot::Mutex::new(RecentIds::default()));
+        for i in 0..6 {
+            recent.lock().insert(&format!("c{i}"), RECENTLY_FILLED_MAX);
+        }
+        let q = FillQueue::new(recent.clone(), 2, 50);
+        let done = Arc::new(AtomicUsize::new(0));
+        // No await in between: the workers have not popped anything yet.
+        for i in 0..5 {
+            assert!(q.enqueue(&format!("c{i}"), 10, job(&done, i != 3)), "c{i} under the cap");
+        }
+        assert!(!q.enqueue("c5", 10, job(&done, true)), "over the byte cap");
+        assert!(!recent.lock().contains("c5"), "dropped fill still marked");
+        wait_done(&done, 5).await;
+        tokio::task::yield_now().await;
+        let r = recent.lock();
+        assert!(r.contains("c0") && r.contains("c4"));
+        assert!(!r.contains("c3"), "failed fill still marked");
     }
 
-    /// A failed put or commit (fill future -> false) unmarks the id; a
-    /// registered fill stays marked.
+    /// One chunk larger than the cap is admitted when the queue is empty.
     #[tokio::test]
-    async fn failed_fill_unmarks_id_success_keeps_it() {
-        let recent = marked("c1");
-        let permits = Arc::new(tokio::sync::Semaphore::new(1));
-        assert!(spawn_fill(&recent, &permits, "c1", async { false }));
-        drained(&permits).await;
-        assert!(!recent.lock().contains("c1"), "failed fill still marked");
-
-        let recent = marked("c2");
-        assert!(spawn_fill(&recent, &permits, "c2", async { true }));
-        drained(&permits).await;
-        assert!(recent.lock().contains("c2"));
+    async fn fill_queue_admits_one_oversized_when_empty() {
+        let recent = Arc::new(parking_lot::Mutex::new(RecentIds::default()));
+        let q = FillQueue::new(recent, 2, 10);
+        let done = Arc::new(AtomicUsize::new(0));
+        assert!(q.enqueue("big", 100, job(&done, true)));
+        assert!(!q.enqueue("next", 1, job(&done, true)), "queue holds the oversized one");
+        wait_done(&done, 1).await;
     }
 
     /// `remove` drops the id from both the set and the eviction order.
