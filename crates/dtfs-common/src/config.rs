@@ -757,11 +757,11 @@ pub struct TieringConfig {
     pub precache_max_mbps: u64,
     /// Capacity eviction: a hot/warm disk at or above this filesystem usage
     /// (percent) has its least recently read cache copies evicted down to
-    /// `cache_low_watermark_pct`. 0 (default) = off.
+    /// `cache_low_watermark_pct`; fill, promotions and pre-cache admit below
+    /// it. 0 (default) = off.
     #[serde(default)]
     pub cache_high_watermark_pct: u8,
-    /// Eviction target, and the ceiling promotions and pre-cache plan against
-    /// while watermarks are set. 0 (default) = off.
+    /// Eviction target while watermarks are set. 0 (default) = off.
     #[serde(default)]
     pub cache_low_watermark_pct: u8,
     /// Most NEW cache-promotion tasks one tiering tick creates. Must be > 0.

@@ -202,9 +202,9 @@ impl TieringEngine {
     async fn precache_tick(&self) {
         use crate::precache::*;
         use crate::scheduler::ScheduleOutcome;
-        let (enabled, rate_mbps, low_pct, reserve_pct) = {
+        let (enabled, rate_mbps, high_pct, reserve_pct) = {
             let c = self.config.read().await;
-            (c.enabled, c.precache_max_mbps, c.cache_low_watermark_pct, c.precache_reserve_pct)
+            (c.enabled, c.precache_max_mbps, admission_ceiling_pct(&c), c.precache_reserve_pct)
         };
         if !enabled {
             return;
@@ -224,7 +224,7 @@ impl TieringEngine {
         };
         let mut plan = {
             let sm = self.state_data.read().await;
-            plan_precache(&sm, &snap, now_ms, self.scheduler.placement_cfg(), low_pct, reserve_pct)
+            plan_precache(&sm, &snap, now_ms, self.scheduler.placement_cfg(), high_pct, reserve_pct)
         };
         let view = self.scheduler.replication_task_view().await;
         plan.status.is_leader = true;
@@ -1034,7 +1034,7 @@ impl TieringEngine {
         &self,
         now_ms: u64,
     ) -> TickSnapshot {
-        let low_pct = self.config.read().await.cache_low_watermark_pct;
+        let high_pct = admission_ceiling_pct(&*self.config.read().await);
         // Materialise the lookup tables once.
         let sm = self.state_data.read().await;
 
@@ -1054,7 +1054,7 @@ impl TieringEngine {
                 if !seen_tiers.insert(disk.tier) {
                     continue;
                 }
-                let view = node_selection_view(*id, info, disk.tier, self.scheduler.placement_cfg(), low_pct);
+                let view = node_selection_view(*id, info, disk.tier, self.scheduler.placement_cfg(), high_pct);
                 if view.has_target_tier_disk {
                     node_views.push(view);
                 }
@@ -1269,7 +1269,7 @@ impl TieringEngine {
         exclude_node: u64,
         reads_by_dc: &HashMap<String, u32>,
     ) -> Option<u64> {
-        let low_pct = self.config.read().await.cache_low_watermark_pct;
+        let high_pct = admission_ceiling_pct(&*self.config.read().await);
         let sm = self.state_data.read().await;
 
         // Score each candidate node: prefer nodes in DCs where the chunk is
@@ -1282,7 +1282,7 @@ impl TieringEngine {
                     && info.health == dtfs_common::types::HealthStatus::Healthy
                     && info.disks.iter().any(|d| {
                         d.tier == target_tier
-                            && room_below_low_watermark(d.tier, d.total_bytes, d.used_bytes, low_pct).map_or(true, |r| r > 0)
+                            && room_below_high_watermark(d.tier, d.total_bytes, d.used_bytes, high_pct).map_or(true, |r| r > 0)
                     })
             })
             .max_by_key(|(_, info)| {
@@ -1794,14 +1794,14 @@ pub(crate) fn node_selection_view(
     info: &dtfs_raft::NodeInfo,
     target_tier: DiskTier,
     cfg: &dtfs_common::config::PlacementConfig,
-    low_watermark_pct: u8,
+    high_watermark_pct: u8,
 ) -> NodeSelectionView {
     use dtfs_common::types::{DiskStatus, HealthStatus};
     let has_target_tier_disk = info.disks.iter().any(|d| {
         d.tier == target_tier
             && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed)
             && cfg.has_room(d.total_bytes, d.used_bytes)
-            && room_below_low_watermark(d.tier, d.total_bytes, d.used_bytes, low_watermark_pct).map_or(true, |r| r > 0)
+            && room_below_high_watermark(d.tier, d.total_bytes, d.used_bytes, high_watermark_pct).map_or(true, |r| r > 0)
     });
     // Any health state that means "don't place a new replica here".
     // `draining` is the selector's catch-all exclusion flag.
@@ -1823,14 +1823,23 @@ pub(crate) fn node_selection_view(
     }
 }
 
+/// Usage ceiling (pct) cache admission (fill, promotion, pre-cache) plans a
+/// hot/warm disk up to.
+/// Eviction starts at the same high, so usage oscillates between low and high.
+pub(crate) fn admission_ceiling_pct(c: &TieringConfig) -> u8 {
+    c.cache_high_watermark_pct
+}
+
 /// Bytes a cache copy may still add to a hot/warm disk before its usage reaches
-/// `[tiering] cache_low_watermark_pct` (saturating). `None` = no watermark limit:
-/// watermarks off, a cold/tape disk, or capacity not reported yet.
-pub(crate) fn room_below_low_watermark(tier: DiskTier, total_bytes: u64, used_bytes: u64, low_pct: u8) -> Option<u64> {
-    if low_pct == 0 || total_bytes == 0 || !matches!(tier, DiskTier::Hot | DiskTier::Warm) {
+/// `[tiering] cache_high_watermark_pct` (saturating). `None` = no watermark limit:
+/// watermarks off, a cold/tape disk, or capacity not reported yet. Admission
+/// runs while this is > 0: overshoot is at most one chunk per copy admitted on
+/// the last reported usage (a fill target covers one file lookup's reads).
+pub(crate) fn room_below_high_watermark(tier: DiskTier, total_bytes: u64, used_bytes: u64, high_pct: u8) -> Option<u64> {
+    if high_pct == 0 || total_bytes == 0 || !matches!(tier, DiskTier::Hot | DiskTier::Warm) {
         return None;
     }
-    let ceiling = (total_bytes as u128 * low_pct as u128 / 100) as u64;
+    let ceiling = (total_bytes as u128 * high_pct as u128 / 100) as u64;
     Some(ceiling.saturating_sub(used_bytes))
 }
 
@@ -3682,27 +3691,67 @@ mod audit_co_tests {
         assert!(node_selection_view(11, &roomy, DiskTier::Warm, &no_headroom(), 0).has_target_tier_disk);
     }
 
-    /// With watermarks set, a warm disk at the low watermark is no promotion
+    /// With watermarks set, a warm disk at the high watermark is no promotion
     /// target; one byte below it is. Off (0) or a cold disk: unchanged.
     #[test]
-    fn low_watermark_limits_promotion_target() {
+    fn high_watermark_limits_promotion_target() {
         let at = |tier: DiskTier, used: u64| {
             let mut d = disk(0, tier, DiskStatus::Healthy);
             d.used_bytes = used;
             node(10, "toro", HealthStatus::Healthy, vec![d])
         };
-        // total 1000, low 80% -> ceiling 800.
+        // total 1000, high 80% -> ceiling 800.
         let v = node_selection_view(10, &at(DiskTier::Warm, 799), DiskTier::Warm, &no_headroom(), 80);
-        assert!(v.has_target_tier_disk, "room below low accepted");
+        assert!(v.has_target_tier_disk, "room below high accepted");
         assert_eq!(select_promotion_target(&[v], "toro"), Some(10));
         let v = node_selection_view(10, &at(DiskTier::Warm, 800), DiskTier::Warm, &no_headroom(), 80);
-        assert!(!v.has_target_tier_disk, "would cross low");
+        assert!(!v.has_target_tier_disk, "at high");
         assert_eq!(select_promotion_target(&[v], "toro"), None);
         assert!(node_selection_view(10, &at(DiskTier::Warm, 800), DiskTier::Warm, &no_headroom(), 0).has_target_tier_disk);
         assert!(node_selection_view(10, &at(DiskTier::Cold, 800), DiskTier::Cold, &no_headroom(), 80).has_target_tier_disk);
-        assert_eq!(room_below_low_watermark(DiskTier::Hot, 1_000, 900, 80), Some(0));
-        assert_eq!(room_below_low_watermark(DiskTier::Hot, 1_000, 100, 80), Some(700));
-        assert_eq!(room_below_low_watermark(DiskTier::Tape, 1_000, 100, 80), None);
+        assert_eq!(room_below_high_watermark(DiskTier::Hot, 1_000, 900, 80), Some(0));
+        assert_eq!(room_below_high_watermark(DiskTier::Hot, 1_000, 100, 80), Some(700));
+        assert_eq!(room_below_high_watermark(DiskTier::Tape, 1_000, 100, 80), None);
+    }
+
+    /// Reactive promotion with `[tiering]` watermarks (high, low) and node 10's
+    /// 1000 GiB warm disk at `used_pct`: (find_target_node, in the tick snapshot).
+    async fn promotion_target(high: u8, low: u8, used_pct: u64) -> (Option<u64>, bool) {
+        let h = crate::api::test_support::harness().await;
+        let mut d = disk(0, DiskTier::Warm, DiskStatus::Healthy);
+        (d.total_bytes, d.used_bytes) = (1000 << 30, used_pct * (10 << 30));
+        h.state.sm_data.write().await.nodes.insert(10, node(10, "toro", HealthStatus::Healthy, vec![d]));
+        let mut cfg = h.state.config.tiering.clone();
+        (cfg.cache_high_watermark_pct, cfg.cache_low_watermark_pct) = (high, low);
+        let engine = TieringEngine::new(cfg, h.state.scheduler.clone(), h.state.audit_log.clone(), h.state.sm_data.clone());
+        let reactive = engine.find_target_node(DiskTier::Warm, 0, &HashMap::new()).await;
+        let snap = engine.build_av_cache_snapshot(0).await;
+        (reactive, snap.nodes.iter().any(|v| v.node_id == 10))
+    }
+
+    #[tokio::test]
+    async fn promotion_admits_between_low_and_high() {
+        assert_eq!(promotion_target(80, 50, 60).await, (Some(10), true));
+        assert_eq!(promotion_target(80, 50, 79).await, (Some(10), true), "one point below high");
+    }
+
+    #[tokio::test]
+    async fn promotion_refused_at_and_above_high() {
+        assert_eq!(promotion_target(80, 50, 80).await, (None, false), "exactly at high");
+        assert_eq!(promotion_target(80, 50, 90).await, (None, false));
+    }
+
+    #[tokio::test]
+    async fn promotion_unchanged_with_watermarks_off() {
+        assert_eq!(promotion_target(0, 0, 90).await, (Some(10), true));
+    }
+
+    #[test]
+    fn admission_ceiling_is_high_watermark() {
+        let mut c: TieringConfig = toml::from_str("").unwrap();
+        assert_eq!(admission_ceiling_pct(&c), 0, "off");
+        (c.cache_high_watermark_pct, c.cache_low_watermark_pct) = (85, 75);
+        assert_eq!(admission_ceiling_pct(&c), 85);
     }
 
     /// CO-4-5 — a Failed/Removed disk of the target tier doesn't count.

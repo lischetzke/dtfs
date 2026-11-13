@@ -484,10 +484,11 @@ fn following<'a>(
 
 /// Room pre-caching may use on one node's tier: (pooled free bytes minus the
 /// `[tiering] precache_reserve_pct` share of the tier total, free bytes of the
-/// largest single disk). Both over serviceable, non-draining disks, minus headroom.
-/// A disk under the `[tiering]` low watermark is capped at the room below it instead of the reserve.
-fn node_room(info: &dtfs_raft::NodeInfo, tier: DiskTier, cfg: &PlacementConfig, low_pct: u8, reserve_pct: u64) -> (u64, u64) {
-    let (mut avail, mut total, mut biggest) = (0u64, 0u64, 0u64);
+/// largest single disk, true when the `[tiering]` high watermark binds). Both over
+/// serviceable, non-draining disks, minus headroom. A disk under the high watermark
+/// is capped at the room below it instead of the reserve.
+fn node_room(info: &dtfs_raft::NodeInfo, tier: DiskTier, cfg: &PlacementConfig, high_pct: u8, reserve_pct: u64) -> (u64, u64, bool) {
+    let (mut avail, mut total, mut biggest, mut capped) = (0u64, 0u64, 0u64, false);
     for d in info.disks.iter().filter(|d| {
         d.tier == tier
             && !matches!(d.status, DiskStatus::Failed | DiskStatus::Removed | DiskStatus::Draining)
@@ -496,23 +497,26 @@ fn node_room(info: &dtfs_raft::NodeInfo, tier: DiskTier, cfg: &PlacementConfig, 
             .total_bytes
             .saturating_sub(d.used_bytes)
             .saturating_sub(cfg.headroom_bytes(d.total_bytes));
-        match crate::tiering::room_below_low_watermark(d.tier, d.total_bytes, d.used_bytes, low_pct) {
-            Some(r) => free = free.min(r),
+        match crate::tiering::room_below_high_watermark(d.tier, d.total_bytes, d.used_bytes, high_pct) {
+            Some(r) => {
+                capped |= r <= free;
+                free = free.min(r);
+            }
             None => total = total.saturating_add(d.total_bytes),
         }
         avail = avail.saturating_add(free);
         biggest = biggest.max(free);
     }
-    (avail.saturating_sub(total.saturating_mul(reserve_pct) / 100), biggest)
+    (avail.saturating_sub(total.saturating_mul(reserve_pct) / 100), biggest, capped)
 }
 
 struct Ctx<'a> {
     sm: &'a StateMachineData,
     now_ms: u64,
     placement: &'a PlacementConfig,
-    low_pct: u8,
+    high_pct: u8,
     reserve_pct: u64,
-    room: HashMap<(u64, DiskTier), (u64, u64)>,
+    room: HashMap<(u64, DiskTier), (u64, u64, bool)>,
     seen: HashSet<(String, String)>,
     stopped: HashSet<String>,
     copies: Vec<PrecacheCopy>,
@@ -533,11 +537,22 @@ const PIN_POS: u32 = u32::MAX;
 
 impl Ctx<'_> {
     fn room(&mut self, nid: u64, tier: DiskTier) -> u64 {
-        let (sm, cfg, low_pct, reserve_pct) = (self.sm, self.placement, self.low_pct, self.reserve_pct);
-        let (pooled, biggest) = *self.room.entry((nid, tier)).or_insert_with(|| {
-            sm.nodes.get(&nid).map_or((0, 0), |n| node_room(n, tier, cfg, low_pct, reserve_pct))
+        self.room_capped(nid, tier).0
+    }
+
+    fn room_capped(&mut self, nid: u64, tier: DiskTier) -> (u64, bool) {
+        let (sm, cfg, high_pct, reserve_pct) = (self.sm, self.placement, self.high_pct, self.reserve_pct);
+        let (pooled, biggest, capped) = *self.room.entry((nid, tier)).or_insert_with(|| {
+            sm.nodes.get(&nid).map_or((0, 0, false), |n| node_room(n, tier, cfg, high_pct, reserve_pct))
         });
-        pooled.min(biggest)
+        (pooled.min(biggest), capped)
+    }
+
+    /// A copy of `bytes` fits; under the high watermark the last one may overshoot it
+    /// (room > 0), so usage reaches high and eviction runs.
+    fn fits(&mut self, nid: u64, tier: DiskTier, bytes: u64) -> bool {
+        let (room, capped) = self.room_capped(nid, tier);
+        room >= bytes || (capped && room > 0)
     }
 
     /// True once `chunk_id` would push (volume, dc) past `max_gb_per_dc`; the first
@@ -604,13 +619,13 @@ fn ensure_dc(ctx: &mut Ctx, elig: &[DiskTier], dc: &str) {
     if ctx.dcs.contains_key(dc) {
         return;
     }
-    let (sm, placement, low_pct) = (ctx.sm, ctx.placement, ctx.low_pct);
+    let (sm, placement, high_pct) = (ctx.sm, ctx.placement, ctx.high_pct);
     let tier = elig
         .iter()
         .copied()
         .find(|t| {
             sm.nodes.iter().any(|(id, n)| {
-                let v = node_selection_view(*id, n, *t, placement, low_pct);
+                let v = node_selection_view(*id, n, *t, placement, high_pct);
                 v.datacenter.eq_ignore_ascii_case(dc) && v.has_target_tier_disk && !v.draining
             })
         })
@@ -736,7 +751,8 @@ fn plan_file(
                 if !info.location.datacenter.eq_ignore_ascii_case(dc) {
                     continue;
                 }
-                let mut v = node_selection_view(*nid, info, tier, ctx.placement, ctx.low_pct);
+                // Watermark off here: `fits` applies it, so a DC at high reports capacity_limited.
+                let mut v = node_selection_view(*nid, info, tier, ctx.placement, 0);
                 // Same rule as `survivor_replica_tier`: such a copy would not count as cached.
                 if info.quarantine.is_some() || info.health == dtfs_common::types::HealthStatus::Maintenance {
                     v.draining = true;
@@ -746,7 +762,7 @@ fn plan_file(
             }
             let mut gated = views.clone();
             for v in gated.iter_mut() {
-                if v.has_target_tier_disk && ctx.room(v.node_id, tier) < bytes {
+                if v.has_target_tier_disk && !ctx.fits(v.node_id, tier, bytes) {
                     v.has_target_tier_disk = false;
                 }
             }
@@ -768,8 +784,8 @@ fn plan_file(
         };
         let left = ctx.room.get_mut(&(target, tier)).expect("room initialised");
         // shortcut: the copy is charged to the largest disk, the real pick may differ.
-        left.0 -= bytes;
-        left.1 -= bytes;
+        left.0 = left.0.saturating_sub(bytes);
+        left.1 = left.1.saturating_sub(bytes);
         let source = live
             .iter()
             .min_by_key(|(n, _, _, t)| (tier_rank(*t), *n))
@@ -798,10 +814,10 @@ pub(crate) fn plan_precache(
     snap: &PrecacheSnapshot,
     now_ms: u64,
     placement: &PlacementConfig,
-    low_watermark_pct: u8,
+    high_watermark_pct: u8,
     reserve_pct: u64,
 ) -> PrecachePlan {
-    plan_precache_budget(sm, snap, now_ms, placement, low_watermark_pct, reserve_pct, MAX_PLAN_CHUNK_VISITS)
+    plan_precache_budget(sm, snap, now_ms, placement, high_watermark_pct, reserve_pct, MAX_PLAN_CHUNK_VISITS)
 }
 
 fn plan_precache_budget(
@@ -809,7 +825,7 @@ fn plan_precache_budget(
     snap: &PrecacheSnapshot,
     now_ms: u64,
     placement: &PlacementConfig,
-    low_pct: u8,
+    high_pct: u8,
     reserve_pct: u64,
     budget: usize,
 ) -> PrecachePlan {
@@ -942,7 +958,7 @@ fn plan_precache_budget(
         sm,
         now_ms,
         placement,
-        low_pct,
+        high_pct,
         reserve_pct,
         room: HashMap::new(),
         seen: HashSet::new(),
@@ -1504,10 +1520,10 @@ mod planner_tests {
         fn plan(&self, reads: &[(&str, &str)]) -> PrecachePlan {
             self.plan_with(reads, 0, 10)
         }
-        fn plan_low(&self, reads: &[(&str, &str)], low_pct: u8) -> PrecachePlan {
-            self.plan_with(reads, low_pct, 10)
+        fn plan_high(&self, reads: &[(&str, &str)], high_pct: u8) -> PrecachePlan {
+            self.plan_with(reads, high_pct, 10)
         }
-        fn plan_with(&self, reads: &[(&str, &str)], low_pct: u8, reserve_pct: u64) -> PrecachePlan {
+        fn plan_with(&self, reads: &[(&str, &str)], high_pct: u8, reserve_pct: u64) -> PrecachePlan {
             let mut snap = PrecacheSnapshot::default();
             for (path, dc) in reads {
                 let a = FileActivity {
@@ -1517,7 +1533,7 @@ mod planner_tests {
                 };
                 snap.activity.insert((path.to_string(), dc.to_string()), a);
             }
-            plan_precache(&self.sm, &snap, NOW, &cfg(), low_pct, reserve_pct)
+            plan_precache(&self.sm, &snap, NOW, &cfg(), high_pct, reserve_pct)
         }
     }
 
@@ -1911,25 +1927,74 @@ mod planner_tests {
         let r = &[("/tv/Show/Season 01/E01.mkv", "toro")];
         assert_eq!(w.plan_with(r, 0, 0).copies.len(), 175, "no reserve: 700 MiB");
         assert_eq!(w.plan_with(r, 0, 50).copies.len(), 50, "50%: 200 MiB");
-        // A disk under the low watermark ignores the reserve: ceiling 500 MiB -> 200 MiB.
+        // A disk under the high watermark ignores the reserve: ceiling 500 MiB -> 200 MiB.
         assert_eq!(w.plan_with(r, 50, 50).copies.len(), 50);
         assert_eq!(w.plan_with(r, 60, 50).copies.len(), 75, "low 60%: 300 MiB, reserve not applied");
     }
 
     #[test]
-    fn low_watermark_caps_room_instead_of_reserve() {
+    fn high_watermark_caps_room_instead_of_reserve() {
         let mut w = show5();
-        // total 1000 MiB, low 50% => ceiling 500 MiB. used 300 MiB => room 200 MiB = 50 chunks.
+        // total 1000 MiB, high 50% => ceiling 500 MiB. used 300 MiB => room 200 MiB = 50 chunks.
         w.set_disk(2, 1000 * MIB, 300 * MIB);
-        let p = w.plan_low(&[("/tv/Show/Season 01/E01.mkv", "toro")], 50);
+        let p = w.plan_high(&[("/tv/Show/Season 01/E01.mkv", "toro")], 50);
         assert_eq!(p.copies.len(), 50);
         assert!(p.status.dcs.iter().find(|d| d.dc == "toro").unwrap().capacity_limited);
-        // Exactly one chunk below low: one copy.
+        // Exactly one chunk below high: one copy.
         w.set_disk(2, 1000 * MIB, 500 * MIB - CHUNK);
-        assert_eq!(w.plan_low(&[("/tv/Show/Season 01/E01.mkv", "toro")], 50).copies.len(), 1);
-        // A copy would cross low: nothing, capacity_limited.
+        assert_eq!(w.plan_high(&[("/tv/Show/Season 01/E01.mkv", "toro")], 50).copies.len(), 1);
+    }
+
+    /// 0 < room below high < one chunk: the last chunk is planned (it may overshoot
+    /// high, so usage reaches high and eviction runs).
+    #[test]
+    fn last_chunk_below_high_overshoots() {
+        let mut w = show5();
         w.set_disk(2, 1000 * MIB, 500 * MIB - CHUNK + 1);
-        let p = w.plan_low(&[("/tv/Show/Season 01/E01.mkv", "toro")], 50);
+        let p = w.plan_high(&[("/tv/Show/Season 01/E01.mkv", "toro")], 50);
+        assert_eq!(p.copies.len(), 1, "room CHUNK-1 > 0: one overshooting copy");
+        assert!(p.status.dcs.iter().find(|d| d.dc == "toro").unwrap().capacity_limited);
+        w.set_disk(2, 1000 * MIB, 500 * MIB - 1);
+        assert_eq!(w.plan_high(&[("/tv/Show/Season 01/E01.mkv", "toro")], 50).copies.len(), 1, "room 1 byte");
+    }
+
+    /// At or above high: nothing planned and the DC reports capacity_limited.
+    #[test]
+    fn at_high_plans_nothing_and_is_capacity_limited() {
+        let mut w = show5();
+        for used in [500 * MIB, 600 * MIB] {
+            w.set_disk(2, 1000 * MIB, used);
+            let p = w.plan_high(&[("/tv/Show/Season 01/E01.mkv", "toro")], 50);
+            assert!(p.copies.is_empty(), "used {used}");
+            let toro = p.status.dcs.iter().find(|d| d.dc == "toro").unwrap();
+            assert!(toro.capacity_limited && !toro.no_target, "used {used}: {toro:?}");
+        }
+    }
+
+    /// The overshoot is past the watermark only: a disk whose headroom binds
+    /// before high gets no copy that does not fit.
+    #[test]
+    fn overshoot_never_crosses_placement_headroom() {
+        let mut w = show5();
+        // headroom 100 MiB: free after headroom CHUNK-1, high 95% leaves 50 MiB+.
+        w.set_disk(2, 1000 * MIB, 900 * MIB - CHUNK + 1);
+        let mut snap = PrecacheSnapshot::default();
+        let a = FileActivity {
+            last_read_ms: NOW,
+            chunk_ids: ["/tv/Show/Season 01/E01.mkv#20".to_string()].into_iter().collect(),
+            overflow: false,
+        };
+        snap.activity.insert(("/tv/Show/Season 01/E01.mkv".into(), "toro".into()), a);
+        let pc = PlacementConfig { min_free_bytes: 100 * MIB, min_free_pct: 0.0, ..Default::default() };
+        assert!(plan_precache(&w.sm, &snap, NOW, &pc, 95, 10).copies.is_empty());
+    }
+
+    /// Watermarks off: room below one chunk above the reserve plans nothing (no overshoot).
+    #[test]
+    fn watermarks_off_never_overshoots() {
+        let mut w = show5();
+        w.set_disk(2, 1000 * MIB, 1000 * MIB - 100 * MIB - CHUNK + 1);
+        let p = w.plan_high(&[("/tv/Show/Season 01/E01.mkv", "toro")], 0);
         assert!(p.copies.is_empty());
         assert!(p.status.dcs.iter().find(|d| d.dc == "toro").unwrap().capacity_limited);
     }

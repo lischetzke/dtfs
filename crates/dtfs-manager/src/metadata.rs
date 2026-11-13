@@ -1875,7 +1875,7 @@ impl ManagerService for MetadataService {
                 &file.volume_id,
                 &req.client_dc,
                 &self.config.placement,
-                self.config.tiering.cache_low_watermark_pct,
+                crate::tiering::admission_ceiling_pct(&self.config.tiering),
             )
         };
         let (fill_node_id, fill_node_addr, fill_tier) = match fill {

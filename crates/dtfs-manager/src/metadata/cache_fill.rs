@@ -28,14 +28,14 @@ fn node_is_survivor(n: &dtfs_raft::NodeInfo) -> bool {
 /// volume not on_read, empty `client_dc`, no cache tier, or no eligible node
 /// in the DC. Eligibility is the promotion target selection
 /// (`node_selection_view` + `select_promotion_target`: not draining, a tier
-/// disk with room, below the low watermark; most free, then lowest id) plus
+/// disk with room, below the high watermark; most free, then lowest id) plus
 /// survivor. Hottest cache tier first. Pure, no I/O.
 pub(crate) fn cache_fill_target(
     sm: &StateMachineData,
     volume_id: &str,
     client_dc: &str,
     pcfg: &PlacementConfig,
-    low_pct: u8,
+    high_pct: u8,
 ) -> Option<(u64, String, DiskTier)> {
     if client_dc.is_empty() {
         return None;
@@ -49,7 +49,7 @@ pub(crate) fn cache_fill_target(
             .nodes
             .iter()
             .filter(|(_, n)| node_is_survivor(n) && !n.grpc_addr.is_empty())
-            .map(|(id, n)| crate::tiering::node_selection_view(*id, n, t, pcfg, low_pct))
+            .map(|(id, n)| crate::tiering::node_selection_view(*id, n, t, pcfg, high_pct))
             .collect();
         let id = crate::tiering::select_promotion_target(&views, client_dc)?;
         Some((id, sm.nodes[&id].grpc_addr.clone(), t))
@@ -225,8 +225,8 @@ mod tests {
         sm
     }
 
-    fn target(sm: &StateMachineData, dc: &str, low: u8) -> Option<(u64, String, DiskTier)> {
-        cache_fill_target(sm, "default", dc, &PlacementConfig::default(), low)
+    fn target(sm: &StateMachineData, dc: &str, high: u8) -> Option<(u64, String, DiskTier)> {
+        cache_fill_target(sm, "default", dc, &PlacementConfig::default(), high)
     }
 
     #[test]
@@ -242,8 +242,8 @@ mod tests {
     #[test]
     fn no_fill_target_without_node_in_dc_or_room_or_cache_tier_or_on_read_or_dc() {
         assert_eq!(target(&sm(), "nrb", 0), None, "no node in the DC");
-        assert_eq!(target(&sm(), "hun", 5), None, "both hun disks above the low watermark");
-        assert_eq!(target(&sm(), "hun", 25).map(|t| t.0), Some(2), "below low: eligible");
+        assert_eq!(target(&sm(), "hun", 5), None, "both hun disks above the high watermark");
+        assert_eq!(target(&sm(), "hun", 25).map(|t| t.0), Some(2), "below high: eligible");
         let mut s = sm();
         s.volumes.get_mut("default").unwrap().mandatory_replicas.warm = 1;
         assert_eq!(target(&s, "hun", 0), None, "warm is mandatory, not a cache tier");
@@ -334,6 +334,36 @@ mod tests {
             dtfs_common::tls::TlsContext::plaintext(),
         );
         (h, svc)
+    }
+
+    /// GetFileLocations fill target node for a hun reader with `[tiering]`
+    /// watermarks (high, low); 0 = no target.
+    async fn fill_node(high: u8, low: u8) -> u64 {
+        let (_h, mut svc) = service("").await;
+        (svc.config.tiering.cache_high_watermark_pct, svc.config.tiering.cache_low_watermark_pct) = (high, low);
+        let r = dtfs_proto::dtfs::manager::GetFileLocationsRequest {
+            path: "/m.mkv".into(),
+            omit_chunks: false,
+            client_dc: "hun".into(),
+        };
+        svc.get_file_locations(Request::new(r)).await.unwrap().into_inner().fill_node_id
+    }
+
+    /// Fill admits a disk up to the HIGH watermark (node 2 is at 10%, node 3 at 30%).
+    #[tokio::test]
+    async fn fill_target_admits_between_low_and_high() {
+        assert_eq!(fill_node(20, 5).await, 2, "10% is between low 5 and high 20: admitted");
+        assert_eq!(fill_node(11, 5).await, 2, "one point below high: admitted");
+    }
+
+    #[tokio::test]
+    async fn fill_target_refused_at_high() {
+        assert_eq!(fill_node(10, 5).await, 0, "node 2 exactly at high, node 3 above: no target");
+    }
+
+    #[tokio::test]
+    async fn fill_target_unchanged_with_watermarks_off() {
+        assert_eq!(fill_node(0, 0).await, 2);
     }
 
     /// The handler registers the row through Raft; a repeat is a no-op.
