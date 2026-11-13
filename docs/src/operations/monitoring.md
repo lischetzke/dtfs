@@ -81,8 +81,10 @@ The leader also exports the cache series: `dtfs_cache_disk_used_bytes`,
 (`{node,disk,dc,tier}`, refreshed every 60 s), `dtfs_cache_removed_total{reason}`,
 `dtfs_cache_fill_total{dc}`, `dtfs_cache_fill_bytes_total{dc}`,
 `dtfs_cache_scheduled_total{dc,kind}`, `dtfs_link_admitted_bytes_total{to_dc,kind}`
-and `dtfs_link_tokens_bytes{to_dc}`. The counters live in leader memory and
-restart at 0 with the manager or on a leader change, so alert on `increase()`.
+and `dtfs_link_tokens_bytes{to_dc}`. The counters are per manager process:
+they restart at 0 with the manager, a new leader starts from 0 and a former
+leader's counters stop moving, so alert on `increase()` per instance. Only the
+current leader exports the `dtfs_cache_disk_*` and oldest-age gauges.
 See [Observing the cache](../storage/tiering.md#observing-the-cache).
 
 The last three counters above are derived from a bounded audit ring, so they can drop

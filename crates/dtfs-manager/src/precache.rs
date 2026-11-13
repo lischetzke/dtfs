@@ -677,7 +677,7 @@ fn plan_file(
         }
         let entries = &by_idx[&idx];
         let (chunk_id, bytes) = (entries[0].chunk_hash.clone(), entries[0].size_bytes);
-        // Past the cap the rest stays unprotected: idle demote, retention and eviction reclaim it.
+        // Past the cap the rest stays unprotected: idle demote, retention and eviction reclaim it (pins: only the idle demote, evict.rs refuses pinned paths).
         if ctx.cap_full(vol, dc, &chunk_id, bytes) {
             break;
         }

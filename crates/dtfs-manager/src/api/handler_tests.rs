@@ -1216,3 +1216,18 @@ async fn metrics_include_cache_series() {
         assert!(body.contains(want), "missing {want}");
     }
 }
+
+/// A non-leader (e.g. a former leader) exports no disk gauges, though the
+/// process-wide view still holds the last leader-time snapshot.
+#[tokio::test]
+async fn metrics_on_non_leader_export_no_disk_series() {
+    let l = super::test_support::leader_harness().await;
+    seed_cache_nodes(&l).await;
+    let _ = get_cache_status(State(l.state.clone())).await.unwrap();
+    assert!(!crate::cache_stats::STATS.view().1.is_empty(), "view populated");
+    let f = super::test_support::harness().await;
+    let (_, _, body) = super::cluster::prometheus_metrics(State(f.state.clone())).await;
+    assert!(!body.contains("dtfs_cache_disk_used_bytes{"), "non-leader exported disk series");
+    assert!(!body.contains("dtfs_cache_oldest_last_read_age_seconds{"));
+    assert!(body.contains("dtfs_cache_removed_total{reason=\"idle_demote\"}"), "counters still exported");
+}

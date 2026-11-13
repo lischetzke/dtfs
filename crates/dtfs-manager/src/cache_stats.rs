@@ -206,7 +206,7 @@ pub(crate) async fn collect_disks(sm: &RwLock<StateMachineData>, sched: &TaskSch
 }
 
 /// `dtfs_cache_*` and `dtfs_link_*` series. Disk series come from the cached
-/// view (leader only; empty on a follower), so a scrape never fans out RPCs.
+/// view (the caller passes none on a non-leader), so a scrape never fans out RPCs.
 pub(crate) fn render_metrics(now_ms: u64, c: &Counters, disks: &[DiskRow], links: &[LinkBacklog]) -> String {
     use std::fmt::Write;
     let mut o = String::new();

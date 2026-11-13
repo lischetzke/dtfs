@@ -802,7 +802,8 @@ pub(super) async fn prometheus_metrics(
     if let Some(p) = precache {
         body.push_str(&precache_metrics(&p));
     }
-    let (_, disks) = crate::cache_stats::STATS.view();
+    // A former leader's view is frozen (its age gauge would grow forever): only the leader exports disks.
+    let disks = if state.scheduler.is_leader() { crate::cache_stats::STATS.view().1 } else { Vec::new() };
     body.push_str(&crate::cache_stats::render_metrics(
         crate::metadata::stamp_now_ms(),
         &crate::cache_stats::STATS.counters(),
