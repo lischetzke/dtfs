@@ -17,12 +17,13 @@ use std::ops::Bound;
 pub(crate) const MAX_ACTIVITY_CHUNKS: usize = 64;
 /// (file, dc) keys kept in the activity map; the stalest 10% go at the cap.
 pub(crate) const MAX_ACTIVITY_KEYS: usize = 1024;
-/// FUSE readahead (default 8 prefetch chunks; measured on the dev cluster: a
-/// one-chunk `dd` reaches chunk index 9) and header probes touch the first
-/// chunks; only later reads count as playing.
-pub(crate) const PLAY_SKIP_HEAD_CHUNKS: u64 = 12;
-/// Tail probes (index containers) touch the last chunks.
-pub(crate) const PLAY_SKIP_TAIL_CHUNKS: u64 = 2;
+/// Header probes read the start of a file; chunks starting in the first 48 MiB
+/// never count as playing (12 chunks of 4 MiB). FUSE prefetch reads are
+/// reported as `scanner` and never reach the activity map at all.
+pub(crate) const PLAY_SKIP_HEAD_BYTES: u64 = 48 << 20;
+/// Tail probes (index containers) read the end: chunks holding the last 8 MiB
+/// never count (2 chunks of 4 MiB, 1 chunk of 64 MiB).
+pub(crate) const PLAY_SKIP_TAIL_BYTES: u64 = 8 << 20;
 
 fn runs(s: &str) -> Vec<(bool, &str)> {
     let mut out = Vec::new();
@@ -172,11 +173,11 @@ pub(crate) fn head_chunk_indexes(chunk_sizes: &[(u64, u64)], head_bytes: u64) ->
 }
 
 /// A read beyond the header probe and before the tail probe, or many distinct chunks, means playback.
-pub(crate) fn is_played(chunk_count: u64, read_indexes: &BTreeSet<u64>, overflow: bool) -> bool {
-    overflow
-        || read_indexes
-            .iter()
-            .any(|&i| i >= PLAY_SKIP_HEAD_CHUNKS && i + PLAY_SKIP_TAIL_CHUNKS < chunk_count)
+/// A file no longer than head + tail (rounded up to whole chunks) never plays by position.
+pub(crate) fn is_played(chunk_count: u64, chunk_size: u64, read_indexes: &BTreeSet<u64>, overflow: bool) -> bool {
+    let cs = chunk_size.max(1);
+    let (head, tail) = (PLAY_SKIP_HEAD_BYTES.div_ceil(cs), PLAY_SKIP_TAIL_BYTES.div_ceil(cs));
+    overflow || read_indexes.iter().any(|&i| i >= head && i + tail < chunk_count)
 }
 
 /// Recent reads of one file in one DC.
@@ -852,7 +853,7 @@ fn plan_precache_budget(
             .map(|c| c.chunk_index)
             .collect();
         let count = fm.chunks.iter().map(|c| c.chunk_index).collect::<BTreeSet<_>>().len() as u64;
-        if !is_played(count, &read, act.overflow) {
+        if !is_played(count, fm.chunk_size, &read, act.overflow) {
             continue;
         }
         let dc = dc.to_lowercase();
@@ -1319,12 +1320,36 @@ mod tests {
     #[test]
     fn is_played_cases() {
         let s = |v: &[u64]| v.iter().copied().collect::<BTreeSet<u64>>();
-        assert!(!is_played(20, &s(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]), false));
-        assert!(!is_played(20, &s(&[0, 19]), false));
-        assert!(is_played(20, &s(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 12]), false));
-        assert!(!is_played(20, &s(&[18]), false));
-        assert!(is_played(20, &s(&[]), true));
-        assert!(!is_played(14, &s(&[12]), false));
+        let c = 4 << 20;
+        assert!(!is_played(20, c, &s(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]), false));
+        assert!(!is_played(20, c, &s(&[0, 19]), false));
+        assert!(is_played(20, c, &s(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 12]), false));
+        assert!(!is_played(20, c, &s(&[18]), false));
+        assert!(is_played(20, c, &s(&[17]), false));
+        assert!(is_played(20, c, &s(&[]), true));
+        assert!(!is_played(14, c, &s(&[12]), false));
+        assert!(!is_played(14, c, &s(&[13]), false));
+        assert!(is_played(15, c, &s(&[12]), false), "15 chunks (over 56 MiB) is the 4 MiB floor");
+    }
+
+    /// The same byte positions decide at any chunk size: the first 48 MiB and
+    /// the chunks holding the last 8 MiB never count.
+    #[test]
+    fn is_played_uses_byte_positions() {
+        let s = |v: &[u64]| v.iter().copied().collect::<BTreeSet<u64>>();
+        let mib = 1u64 << 20;
+        // 1 MiB chunks, 100 MiB file: index 48 starts at 48 MiB, 92.. are the last 8 MiB.
+        assert!(!is_played(100, mib, &s(&[47]), false));
+        assert!(is_played(100, mib, &s(&[48]), false));
+        assert!(is_played(100, mib, &s(&[91]), false));
+        assert!(!is_played(100, mib, &s(&[92]), false));
+        // Floor: 56 chunks (head + tail) never play, 57 do.
+        assert!(!is_played(56, mib, &(0..56).collect(), false));
+        assert!(is_played(57, mib, &s(&[48]), false));
+        // 64 MiB chunks: index 1 (64 MiB) is past the head, the last chunk is tail.
+        assert!(is_played(3, 64 * mib, &s(&[1]), false));
+        assert!(!is_played(3, 64 * mib, &s(&[0, 2]), false));
+        assert!(!is_played(2, 64 * mib, &s(&[0, 1]), false), "128 MiB or less never plays");
     }
 
     #[test]
