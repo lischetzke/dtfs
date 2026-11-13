@@ -45,6 +45,8 @@ Usage: scripts/dev-cluster.sh <command>
                     cluster built with DTFS_DEV_VERSION=v0.1.16 (else 409)
   cache-check       cache retention/eviction/scanner check (~45 min): PASS/FAIL per
                     criterion. Needs DTFS_DEV_VERSION=v0.1.16 DTFS_DEV_CACHE=1 up
+  cache-check2      fill-on-read (toro) and link-budget (nrb, 2 Mbps) check (~15 min):
+                    PASS/FAIL per criterion. Needs DTFS_DEV_VERSION=v0.1.16 DTFS_DEV_CACHE=1 up
   down              remove all dtfs-dev-* containers, network and volumes
 
 Topology: mgr01/02/03 (leli/toro/nrb), data01 leli cold, data02 toro warm,
@@ -116,7 +118,7 @@ mode = "disabled"
 anchor_datacenter = "leli"
 [tiering]
 precache_max_mbps = 200
-$([ "${DTFS_DEV_CACHE:-}" = 1 ] && printf 'evaluation_interval_secs = 20\ncache_high_watermark_pct = 60\ncache_low_watermark_pct = 50\n')
+$([ "${DTFS_DEV_CACHE:-}" = 1 ] && printf 'evaluation_interval_secs = 20\ncache_high_watermark_pct = 60\ncache_low_watermark_pct = 50\n[[tiering.links]]\nto_dc = "nrb"\nmax_mbps = 2\n')
 [monitoring]
 $([ "${DTFS_DEV_CACHE:-}" = 1 ] && printf '[placement]
 min_free_bytes = 1048576
@@ -188,6 +190,8 @@ write_configs() {
   if [ "${DTFS_DEV_CACHE:-}" = 1 ]; then
     fuse_cfg nfs02_cln true toro wan | put_cfg nfs-toro.toml
     fuse_cfg fuse03_cln false leli bulk 1 | put_cfg fuse-bulk.toml
+    fuse_cfg fuse04_cln false toro fillvol | put_cfg fuse-toro-fill.toml
+    fuse_cfg fuse05_cln false nrb linkvol | put_cfg fuse-nrb.toml
   fi
 }
 
@@ -617,6 +621,56 @@ if cmd == "retention": # retention <path> <ta_epoch>
         time.sleep(30); last = "data02" in (rows(p) or [{"data02"}])[-1]
     ck(not last, "last chunk of %s lost its data02 row within one poll of the middle chunks (tA+11 scan did not refresh it)" % p)
     sys.exit(rc)
+if cmd == "setup2":  # volumes fillvol (fill on_read) and linkvol (link-budget check)
+    for v, kw in (("fillvol", {"promote_reads": 1000, "promote_window_secs": 600, "fill": "on_read"}),
+                  ("linkvol", {"promote_reads": 1, "promote_window_secs": 600, "fill": "on_promote"})):
+        if http(leader, "GET", "/api/v1/volumes/" + v)[0] != 200:
+            post("/api/v1/volumes", {"name": v, "chunk_size_mb": 4, "anchor_datacenter": "leli"})
+        post("/api/v1/volumes/%s/set-mandatory" % v, {"hot_replicas": 0, "warm_replicas": 0, "cold_replicas": 1})
+        post("/api/v1/volumes/%s/set-anchor" % v, {"datacenter": "leli", "required_tier": "cold"})
+        post("/api/v1/volumes/%s/set-cache" % v, dict({"warm_min": 1, "warm_max": 1, "per_dc": True}, **kw))
+    print("volumes fillvol and linkvol configured"); sys.exit(0)
+if cmd == "leli":    # data01 cumulative bytes read (heartbeat counter)
+    d = [n for n in http(leader, "GET", "/api/v1/nodes")[1] if n.get("hostname") == "data01"]
+    print("LELI %d" % d[0]["total_bytes_read"]); sys.exit(0)
+if cmd == "fill":    # fill <path> <timeout_s>: data02 rows per chunk, cache.fill audit rows
+    p = args[0]; end = time.time() + int(args[1]); r = None
+    while time.time() < end:
+        r = rows(p)
+        n = sum("data02" in c for c in r[1:]) if r else 0
+        print("  %s %s data02 rows on chunks 1..%d: %d" % (now(), p, len(r) - 1 if r else -1, n), flush=True)
+        if r and n == len(r) - 1: break
+        time.sleep(5)
+    r = rows(p) or []
+    miss = [i for i, c in enumerate(r) if i > 0 and "data02" not in c]
+    ck(len(r) > 1 and not miss, "%s: every chunk except chunk 0 has a data02 row (%d/%d, missing %s)" % (p, len(r) - 1 - len(miss), len(r) - 1, miss))
+    print("INFO: chunk 0 of %s has a data02 row: %s" % (p, bool(r) and "data02" in r[0]))
+    na = 0
+    for m in ("mgr01", "mgr02", "mgr03"):
+        try: na += len(http("http://%s:9402" % m, "GET", "/api/v1/audit?action=cache.fill&limit=1000")[1])
+        except (OSError, TypeError): pass
+    print("INFO: cache.fill audit rows (summed over the audit views of the 3 managers): %d" % na)
+    sys.exit(rc)
+if cmd == "linkwatch":  # linkwatch <path> <t0_epoch> <max_s>
+    p = args[0]; t0 = float(args[1]); end = time.time() + int(args[2]); BURST = 30000000; RATE = 250000; CH = 4 << 20
+    series = []; anchors_ok = True; total = None
+    print("  time    t(s)  data03 rows  data01 rows  mbps-model-max  backlog(nrb)")
+    while True:
+        r = rows(p) or []; total = len(r); t = time.time() - t0
+        n3 = sum("data03" in c for c in r); n1 = sum("data01" in c for c in r)
+        anchors_ok = anchors_ok and total > 0 and n1 == total
+        bl = [b for b in http(leader, "GET", "/api/v1/tiering/precache")[1].get("link_budget_backlog", []) if (b.get("to_dc") or "").lower() == "nrb"]
+        mx = (BURST + RATE * t + 2 * CH) // CH
+        series.append((t, n3)); print("  %s %5d  %11d  %11d  %14d  %s" % (now(), t, n3, n1, mx, json.dumps(bl[0]) if bl else "-"), flush=True)
+        if n3 >= total - 1 or time.time() >= end: break
+        time.sleep(15)
+    ck(all(n * CH <= BURST + RATE * t + 2 * CH for t, n in series), "data03 rows * 4 MiB never exceeded burst 30 MB + 250 KB/s * t + 2 chunks")
+    ck(all(b[1] >= a[1] for a, b in zip(series, series[1:])), "data03 row count never decreased (throttled copies are re-planned, not lost)")
+    stall = max([0] + [b[0] - a[0] for a, b in zip(series, series[1:]) if b[1] == a[1] and b[1] < total - 1])
+    ck(stall <= 90, "no stall: longest stretch without new data03 rows before completion %d s (<= 90)" % stall)
+    ck(series[-1][1] >= total - 1, "all %d chunks (chunk 0 optional) reached data03 within the window (%d/%d after %d s)" % (total, series[-1][1], total, series[-1][0]))
+    ck(anchors_ok, "every chunk kept its data01 row at every sample")
+    sys.exit(rc)
 print("unknown command " + cmd); sys.exit(2)
 '
 
@@ -756,6 +810,63 @@ cmd_cache_check() {
   exit $RC
 }
 
+cmd_cache_check2() {
+  set +e
+  local LOG RC=0 T0=$SECONDS
+  LOG="$(mktemp)"
+  tlog() { echo "[$(date +%H:%M:%S)] $*"; }
+  pass() { echo "PASS: $*" | tee -a "$LOG"; }
+  fail() { echo "FAIL: $*" | tee -a "$LOG"; RC=1; }
+  # py2 <args>: run a CACHE_PY stage in a throwaway container on the dev net
+  py2() { docker run --rm -i --network $NET -e DTFS_SECRET="$SECRET" "$IMG" python3 -c "$CACHE_PY" "$@" | tee -a "$LOG"; [ "${PIPESTATUS[0]}" = 0 ] || RC=1; }
+  leli_bytes() { docker run --rm -i --network $NET -e DTFS_SECRET="$SECRET" "$IMG" python3 -c "$CACHE_PY" leli | awk '/^LELI/{print $2}'; }
+  # fresh_client <name> <cfg>: new container = cold local cache
+  fresh_client() { exists dtfs-dev-$1 && docker rm -f dtfs-dev-$1 >/dev/null; start_client $1 $2 0; }
+  running dtfs-dev-mgr01 || die "cluster not up (run: DTFS_DEV_VERSION=v0.1.16 DTFS_DEV_CACHE=1 up)"
+  docker exec dtfs-dev-mgr01 grep -q 'tiering.links' /etc/dtfs/mgr01.toml || die "mgr01.toml has no [[tiering.links]]: needs DTFS_DEV_CACHE=1 up"
+  docker exec dtfs-dev-data02 df -T /mnt/d0 | grep -q tmpfs || die "data02 /mnt/d0 is not tmpfs: needs DTFS_DEV_CACHE=1 on a fresh down + up"
+
+  tlog "setup: volumes fillvol and linkvol"
+  py2 setup2 || { fail "volume setup"; exit 1; }
+
+  tlog "test 5: fill on read (toro). Writing F (64 MiB) via toro FUSE client"
+  fresh_client fuse-toro-fill fuse-toro-fill.toml
+  docker exec dtfs-dev-fuse-toro-fill dd if=/dev/urandom of=/mnt/dtfs/fill-F bs=1M count=64 conv=fsync 2>/dev/null || { fail "writing F"; exit 1; }
+  tlog "recreating the client (cold caches), settling 30 s"
+  fresh_client fuse-toro-fill fuse-toro-fill.toml
+  sleep 30
+  local B0 B1 B2 B3 D1 D2 SZ=67108864 CH=4194304
+  B0="$(leli_bytes)"
+  tlog "first play of F (leli bytes read before: $B0)"
+  docker exec dtfs-dev-fuse-toro-fill dd if=/mnt/dtfs/fill-F of=/dev/null bs=1M 2>&1 | tail -1
+  sleep 20; B1="$(leli_bytes)"; D1=$((B1 - B0))
+  echo "INFO: data01 total_bytes_read delta during first play: $D1 bytes (file $SZ, limit $((SZ + 2 * CH)))"
+  [ $D1 -le $((SZ + 2 * CH)) ] && pass "first play: leli read $D1 B <= file size + 2 chunks (no second WAN copy)" || fail "first play: leli read $D1 B > $((SZ + 2 * CH))"
+  tlog "waiting up to 60 s for the fills to register"
+  py2 fill /fill-F 60
+  tlog "recreating the client again (cold local cache) and replaying F"
+  fresh_client fuse-toro-fill fuse-toro-fill.toml
+  sleep 30; B2="$(leli_bytes)"
+  docker exec dtfs-dev-fuse-toro-fill dd if=/mnt/dtfs/fill-F of=/dev/null bs=1M 2>&1 | tail -1
+  sleep 20; B3="$(leli_bytes)"; D2=$((B3 - B2))
+  echo "INFO: data01 total_bytes_read delta during second play: $D2 bytes (4 MiB chunk = $CH)"
+  [ $D2 -le $CH ] && pass "second play: leli read $D2 B <= 1 chunk" || fail "second play: leli read $D2 B > 1 chunk"
+  [ $D2 -ge $((CH / 2)) ] && [ $D2 -le $((CH + CH / 2)) ] && echo "INFO: second-play delta is about 1 chunk: chunk 0 (never filled, see the chunk 0 INFO line above)"
+
+  tlog "test 6: link budget (nrb). Writing G (160 MiB) via nrb FUSE client"
+  fresh_client fuse-nrb fuse-nrb.toml
+  docker exec dtfs-dev-fuse-nrb dd if=/dev/urandom of=/mnt/dtfs/link-G bs=1M count=160 conv=fsync 2>/dev/null || { fail "writing G"; exit 1; }
+  fresh_client fuse-nrb fuse-nrb.toml
+  sleep 10
+  local TR; TR=$(date +%s)
+  tlog "viewer read of G (t0 = $TR)"
+  docker exec dtfs-dev-fuse-nrb dd if=/mnt/dtfs/link-G of=/dev/null bs=1M 2>&1 | tail -1
+  py2 linkwatch /link-G "$TR" 720
+  grep -c '^FAIL' "$LOG" | grep -qx 0 || RC=1
+  tlog "cache-check2 finished in $(( (SECONDS - T0) / 60 )) min: $(grep -c '^PASS' "$LOG") PASS, $(grep -c '^FAIL' "$LOG") FAIL"
+  exit $RC
+}
+
 cmd_down() {
   local c; c="$(docker ps -aq --filter name=dtfs-dev-)"
   # shellcheck disable=SC2086
@@ -777,6 +888,7 @@ case "${1:-}" in
   big-file) shift; cmd_big_file "$@";;
   precache-check) cmd_precache_check;;
   cache-check) cmd_cache_check;;
+  cache-check2) cmd_cache_check2;;
   down) cmd_down;;
   -h|--help|help|"") usage;;
   *) usage >&2; exit 2;;
