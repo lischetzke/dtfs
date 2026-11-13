@@ -242,6 +242,12 @@ impl RecentIds {
         self.set.contains(id)
     }
 
+    fn remove(&mut self, id: &str) {
+        if self.set.remove(id) {
+            self.order.retain(|x| x != id);
+        }
+    }
+
     /// Insert; at `cap` the oldest id is dropped.
     fn insert(&mut self, id: &str, cap: usize) {
         if !self.set.insert(id.to_string()) {
@@ -944,8 +950,9 @@ pub struct DtfsFilesystem {
     cache_put_permits: std::sync::Arc<tokio::sync::Semaphore>,
     /// Bounds background fill-on-read copies (`CACHE_FILL_MAX_INFLIGHT`).
     cache_fill_permits: std::sync::Arc<tokio::sync::Semaphore>,
-    /// Chunks filled (or tried) recently (`RECENTLY_FILLED_MAX`).
-    recently_filled: parking_lot::Mutex<RecentIds>,
+    /// Chunks filled or with a fill in flight (`RECENTLY_FILLED_MAX`); a
+    /// dropped or failed fill is unmarked (`spawn_fill`).
+    recently_filled: Arc<parking_lot::Mutex<RecentIds>>,
     /// CR-6-6 (FUSE-9) — single-flights foreground chunk-miss fetches by
     /// chunk_id (content-addressed, so any candidate node's fetch is
     /// interchangeable). The first reader to miss becomes the Owner and
@@ -1087,7 +1094,7 @@ impl DtfsFilesystem {
                 LOCAL_CACHE_PUT_MAX_INFLIGHT,
             )),
             cache_fill_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(CACHE_FILL_MAX_INFLIGHT)),
-            recently_filled: parking_lot::Mutex::new(RecentIds::default()),
+            recently_filled: Arc::new(parking_lot::Mutex::new(RecentIds::default())),
             foreground_inflight: DashMap::new(),
             known_locations: DashMap::new(),
             failed_replicas: DashMap::new(),
@@ -1536,7 +1543,7 @@ impl DtfsFilesystem {
         let client = self.client.clone();
         let (chunk_id, volume_id, path, client_dc, bytes) =
             (chunk.chunk_id.clone(), locations.volume_id.clone(), path.to_string(), dc.clone(), bytes.clone());
-        let spawned = spawn_bounded(&self.cache_fill_permits, async move {
+        let spawned = spawn_fill(&self.recently_filled, &self.cache_fill_permits, &chunk.chunk_id, async move {
             let now = || SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
             let put = match client.write_chunk_bytes(&target.addr, &chunk_id, &volume_id, &target.tier, bytes).await {
                 Ok(p) => p,
@@ -1546,7 +1553,7 @@ impl DtfsFilesystem {
                     } else {
                         debug!(chunk_id = %chunk_id, node = %target.addr, error = %format!("{e:#}"), "cache fill put failed");
                     }
-                    return;
+                    return false;
                 }
             };
             let req = dtfs_proto::dtfs::manager::CommitCacheFillRequest {
@@ -1558,12 +1565,16 @@ impl DtfsFilesystem {
                 client_dc,
             };
             match client.commit_cache_fill(req).await {
-                Ok(()) => debug!(chunk_id = %chunk_id, node = %target.addr, "cache fill registered"),
+                Ok(()) => {
+                    debug!(chunk_id = %chunk_id, node = %target.addr, "cache fill registered");
+                    return true;
+                }
                 Err(e) if fill_warn_due(&FILL_COMMIT_WARNED, now()) => {
                     warn!(chunk_id = %chunk_id, node = %target.addr, error = %format!("{e:#}"), "cache fill commit failed (further failures this minute at debug)")
                 }
                 Err(e) => debug!(chunk_id = %chunk_id, node = %target.addr, error = %format!("{e:#}"), "cache fill commit failed"),
             }
+            false
         });
         if !spawned {
             debug!(chunk_id = %chunk.chunk_id, "cache fill skipped, bound full");
@@ -5389,6 +5400,31 @@ where
         .await
 }
 
+/// Spawns a fill of `id` (already marked in `recent`) via `spawn_bounded`.
+/// Unmarks `id` when the spawn is dropped (bound full) or the fill fails
+/// (`fut` -> false), so a later viewer read retries it. The lock is never
+/// held across an await.
+fn spawn_fill<F>(
+    recent: &Arc<parking_lot::Mutex<RecentIds>>,
+    permits: &Arc<tokio::sync::Semaphore>,
+    id: &str,
+    fut: F,
+) -> bool
+where
+    F: std::future::Future<Output = bool> + Send + 'static,
+{
+    let (r, owned) = (recent.clone(), id.to_string());
+    let spawned = spawn_bounded(permits, async move {
+        if !fut.await {
+            r.lock().remove(&owned);
+        }
+    });
+    if !spawned {
+        recent.lock().remove(id);
+    }
+    spawned
+}
+
 /// Spawns `fut` only if `permits` has a free permit (held until `fut` ends);
 /// returns false and drops `fut` when the bound is full, never waiting.
 fn spawn_bounded<F>(permits: &Arc<tokio::sync::Semaphore>, fut: F) -> bool
@@ -5433,6 +5469,61 @@ mod fill_on_read_tests {
         r.insert("c4", 3); // repeat: no growth, no eviction
         assert_eq!(r.order.len(), 3);
         assert!(r.contains("c2"));
+    }
+
+    fn marked(id: &str) -> Arc<parking_lot::Mutex<RecentIds>> {
+        let r = Arc::new(parking_lot::Mutex::new(RecentIds::default()));
+        r.lock().insert(id, RECENTLY_FILLED_MAX);
+        r
+    }
+
+    /// Wait until the single permit is back (the spawned fill has ended).
+    async fn drained(permits: &Arc<tokio::sync::Semaphore>) {
+        let _p = tokio::time::timeout(std::time::Duration::from_secs(1), permits.acquire())
+            .await
+            .expect("fill task ended")
+            .unwrap();
+    }
+
+    /// A fill dropped because the bound is full leaves the id unmarked, so a
+    /// later viewer read retries it.
+    #[tokio::test]
+    async fn dropped_fill_spawn_unmarks_id() {
+        let recent = marked("c1");
+        let permits = Arc::new(tokio::sync::Semaphore::new(0));
+        assert!(!spawn_fill(&recent, &permits, "c1", async { true }));
+        assert!(!recent.lock().contains("c1"), "dropped fill still marked");
+    }
+
+    /// A failed put or commit (fill future -> false) unmarks the id; a
+    /// registered fill stays marked.
+    #[tokio::test]
+    async fn failed_fill_unmarks_id_success_keeps_it() {
+        let recent = marked("c1");
+        let permits = Arc::new(tokio::sync::Semaphore::new(1));
+        assert!(spawn_fill(&recent, &permits, "c1", async { false }));
+        drained(&permits).await;
+        assert!(!recent.lock().contains("c1"), "failed fill still marked");
+
+        let recent = marked("c2");
+        assert!(spawn_fill(&recent, &permits, "c2", async { true }));
+        drained(&permits).await;
+        assert!(recent.lock().contains("c2"));
+    }
+
+    /// `remove` drops the id from both the set and the eviction order.
+    #[test]
+    fn recent_ids_remove() {
+        let mut r = RecentIds::default();
+        r.insert("a", 2);
+        r.insert("b", 2);
+        r.remove("a");
+        r.remove("missing");
+        assert!(!r.contains("a"), "removed id still marked");
+        assert_eq!(r.order.len(), 1);
+        r.insert("c", 2);
+        assert!(!r.contains("a") && r.contains("b") && r.contains("c"));
+        assert_eq!(r.order.len(), 2);
     }
 
     /// One warn per kind per minute: due at 60 s after the last, not before.
