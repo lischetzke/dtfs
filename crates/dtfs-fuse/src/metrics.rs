@@ -98,6 +98,7 @@ fn errno_idx(errno: i32) -> usize {
     ERRNOS.iter().position(|(e, _)| *e == errno).unwrap_or(ERRNOS.len())
 }
 
+#[cfg(test)]
 pub fn errno_label(errno: i32) -> &'static str {
     ERRNOS.get(errno_idx(errno)).map_or("other", |(_, l)| l)
 }
