@@ -260,25 +260,26 @@ pub struct MethodObs {
     pub errors: CodeCounters,
 }
 
-const MAX_METHODS: usize = 32;
+/// DataService RPCs (proto/data.proto). The label comes from the request
+/// path before auth, so anything else is `other`: callers cannot mint labels.
+const KNOWN_METHODS: &[&str] = &[
+    "PutChunk", "GetChunk", "DeleteChunk", "ReplicateChunk", "VerifyChunk",
+    "GetDiskStatus", "ReportStats", "RecordCacheHit", "ListChunks", "ListOldestChunks",
+];
 
-/// Last path segment of a gRPC path (`/pkg.Service/Method`).
-pub fn method_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+/// Method label for a gRPC path (`/pkg.Service/Method`): a known DataService
+/// method name, else `other`.
+pub fn method_name(path: &str) -> &'static str {
+    let last = path.rsplit('/').next().unwrap_or(path);
+    KNOWN_METHODS.iter().copied().find(|m| *m == last).unwrap_or("other")
 }
 
 pub(crate) fn method(path: &str) -> Arc<MethodObs> {
     static METHODS: OnceLock<DashMap<String, Arc<MethodObs>>> = OnceLock::new();
     let methods = METHODS.get_or_init(DashMap::new);
-    let mut name = method_name(path);
+    let name = method_name(path);
     if let Some(m) = methods.get(name) {
         return m.clone();
-    }
-    if methods.len() >= MAX_METHODS {
-        name = "other";
-        if let Some(m) = methods.get(name) {
-            return m.clone();
-        }
     }
     methods
         .entry(name.to_string())
@@ -424,6 +425,14 @@ mod tests {
     fn method_name_takes_last_segment() {
         assert_eq!(method_name("/dtfs.data.DataService/PutChunk"), "PutChunk");
         assert_eq!(method_name("PutChunk"), "PutChunk");
+        assert_eq!(method_name("/dtfs.data.DataService/ListOldestChunks"), "ListOldestChunks");
+    }
+
+    #[test]
+    fn method_name_unknown_path_is_other() {
+        assert_eq!(method_name("/dtfs.data.DataService/Evil1"), "other");
+        assert_eq!(method_name("/x/putchunk"), "other");
+        assert_eq!(method_name(""), "other");
     }
 
     #[test]
