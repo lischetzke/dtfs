@@ -712,7 +712,7 @@
     {
       "id": 11,
       "type": "timeseries",
-      "title": "gRPC requests by method, inflight, put rejects",
+      "title": "gRPC requests, errors by method and code, inflight, put rejects",
       "description": "",
       "datasource": {
         "type": "influxdb",
@@ -771,6 +771,18 @@
           },
           "refId": "B",
           "hide": false,
+          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_grpc_errors_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\", \"code\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "error  $tag_node $tag_method $tag_code"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
           "query": "SELECT mean(\"value\") FROM \"dtfs_data_grpc_inflight\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
@@ -781,7 +793,7 @@
             "type": "influxdb",
             "uid": "${DS}"
           },
-          "refId": "C",
+          "refId": "D",
           "hide": false,
           "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_put_rejects_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"code\" fill(null)",
           "rawQuery": true,
@@ -793,7 +805,7 @@
             "type": "influxdb",
             "uid": "${DS}"
           },
-          "refId": "D",
+          "refId": "E",
           "hide": false,
           "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_put_shed_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,

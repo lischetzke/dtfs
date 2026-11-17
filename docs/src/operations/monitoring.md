@@ -177,6 +177,8 @@ sampled every 5 s.
 | `raft_forwarded` | C | `op` | Forwards by ClientRequest variant |
 | `raft_current_term`, `raft_last_log_index`, `raft_last_applied`, `raft_snapshot_index` | G | | Raft positions |
 | `raft_apply_lag` | G | | `last_log_index - last_applied` of this manager |
+| `raft_follower_lag` | G | `peer` | Leader only (0 elsewhere): `last_log_index` minus that follower's matched index |
+| `raft_millis_since_quorum_ack` | G | | Leader only (0 elsewhere): ms since the last quorum acknowledgement |
 | `raft_is_leader`, `raft_has_leader` | G | | 1/0 |
 | `raft_leader_changes` | C | | Leader changes seen by this manager |
 | `grpc_server_requests`, `grpc_server_errors` | C | `method` (+`code` on errors) | ManagerService / Raft transport calls |
@@ -235,6 +237,7 @@ sampled every 5 s.
 | `data_grpc_requests_total` | C | `method` | gRPC requests |
 | `data_grpc_latency_us` | H | `method` | gRPC latency |
 | `data_grpc_inflight` | G | `method` | In-flight gRPC calls |
+| `data_grpc_errors_total` | C | `method`, `code` | gRPC calls that returned an error, by status code |
 
 **FUSE client** (`role=fuse`; the client library metrics are pushed by the same process)
 
