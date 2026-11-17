@@ -107,6 +107,14 @@ Add a `[metrics]` block with one or more `[[metrics.servers]]` to `manager.toml`
 FUSE pages point there). The push carries the global tags `role` (`manager`, `data`,
 `fuse`), `node` (`[node].hostname`, for FUSE `[location].host`) and `dc`.
 
+`[metrics]` is per process, read at startup only, and not distributed through the
+cluster: a process without its own `[[metrics.servers]]` pushes nothing, and there is
+no proxying through the managers. Every host whose metrics you want needs the block and
+a direct network path to the InfluxDB server. Configure all managers, not one: the
+leader-only series (`raft_follower_lag`, `raft_millis_since_quorum_ack`, scheduler
+gauges) come from whichever manager is leader and go blank when leadership moves to an
+unconfigured one.
+
 ### Line protocol
 
 - Measurement `dtfs_<name>`; tags are `role`, `node`, `dc` plus the metric's own labels
