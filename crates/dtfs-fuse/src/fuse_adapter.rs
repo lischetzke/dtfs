@@ -26,6 +26,7 @@ use futures_util::StreamExt;
 use tracing::{debug, warn};
 
 use crate::filesystem::{DtfsFilesystem, FileAttr as DtfsAttr, OpenFlags};
+use crate::metrics::{timed, Op};
 
 // Kernel TTLs for cached attributes and directory entries.
 //
@@ -545,6 +546,7 @@ impl Filesystem for DtfsFuse3Adapter {
         parent: u64,
         name: &OsStr,
     ) -> FuseResult<ReplyEntry> {
+        timed(Op::Lookup, async {
         let path = match dot_lookup_target(&self.inodes.path_for(parent)?, &name.to_string_lossy())
         {
             Some(p) => p,
@@ -563,6 +565,8 @@ impl Filesystem for DtfsFuse3Adapter {
             // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
             Err(e) => Err(cluster_err_to_errno(&e)),
         }
+        })
+        .await
     }
 
     async fn forget(&self, _req: Request, inode: u64, nlookup: u64) {
@@ -586,6 +590,7 @@ impl Filesystem for DtfsFuse3Adapter {
         _fh: Option<u64>,
         _flags: u32,
     ) -> FuseResult<ReplyAttr> {
+        timed(Op::Getattr, async {
         let path = self.inodes.path_for(inode)?;
         debug!("fuse3:getattr {} (ino={})", path, inode);
         match self.fs.lookup(&path).await {
@@ -596,6 +601,8 @@ impl Filesystem for DtfsFuse3Adapter {
             // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
             Err(e) => Err(cluster_err_to_errno(&e)),
         }
+        })
+        .await
     }
 
     async fn setattr(
@@ -605,6 +612,7 @@ impl Filesystem for DtfsFuse3Adapter {
         fh: Option<u64>,
         set_attr: SetAttr,
     ) -> FuseResult<ReplyAttr> {
+        timed(Op::Setattr, async {
         let path = self.inodes.path_for(inode)?;
 
         // F-020: persist `chmod`-requested mode in the process-local override
@@ -637,6 +645,8 @@ impl Filesystem for DtfsFuse3Adapter {
             // CO-4-16: ENOENT only on genuine NotFound; transient -> EIO.
             Err(e) => Err(cluster_err_to_errno(&e)),
         }
+        })
+        .await
     }
 
     async fn open(
@@ -645,6 +655,7 @@ impl Filesystem for DtfsFuse3Adapter {
         inode: u64,
         flags: u32,
     ) -> FuseResult<ReplyOpen> {
+        timed(Op::Open, async {
         let path = self.inodes.path_for(inode)?;
         debug!("fuse3:open {} (ino={}, flags={:#x})", path, inode, flags);
         let open_flags = Self::decode_open_flags(flags);
@@ -677,6 +688,8 @@ impl Filesystem for DtfsFuse3Adapter {
                 Err(open_err_to_errno(&e))
             }
         }
+        })
+        .await
     }
 
     async fn release(
@@ -689,10 +702,13 @@ impl Filesystem for DtfsFuse3Adapter {
         _flush: bool,
     ) -> FuseResult<()> {
         debug!("fuse3:release fh={}", fh);
-        self.fs.release(fh).await.map_err(|e| {
-            warn!(fh, error = %e, "fuse3 release failed");
-            Errno::from(libc::EIO)
+        timed(Op::Release, async {
+            self.fs.release(fh).await.map_err(|e| {
+                warn!(fh, error = %e, "fuse3 release failed");
+                Errno::from(libc::EIO)
+            })
         })
+        .await
     }
 
     async fn read(
@@ -707,13 +723,16 @@ impl Filesystem for DtfsFuse3Adapter {
             "fuse3:read ino={} fh={} offset={} size={}",
             inode, fh, offset, size
         );
-        match self.fs.read(fh, offset, size).await {
-            Ok(data) => Ok(ReplyData { data }),
-            Err(e) => {
-                warn!(fh, error = %e, "fuse3 read failed");
-                Err(Errno::from(libc::EIO))
+        timed(Op::Read, async {
+            match self.fs.read(fh, offset, size).await {
+                Ok(data) => Ok(ReplyData { data }),
+                Err(e) => {
+                    warn!(fh, error = %e, "fuse3 read failed");
+                    Err(Errno::from(libc::EIO))
+                }
             }
-        }
+        })
+        .await
     }
 
     async fn write(
@@ -733,13 +752,16 @@ impl Filesystem for DtfsFuse3Adapter {
             offset,
             data.len()
         );
-        match self.fs.write(fh, offset, data).await {
-            Ok(written) => Ok(ReplyWrite { written }),
-            Err(e) => {
-                warn!(fh, error = %e, "fuse3 write failed");
-                Err(Errno::from(libc::EIO))
+        timed(Op::Write, async {
+            match self.fs.write(fh, offset, data).await {
+                Ok(written) => Ok(ReplyWrite { written }),
+                Err(e) => {
+                    warn!(fh, error = %e, "fuse3 write failed");
+                    Err(Errno::from(libc::EIO))
+                }
             }
-        }
+        })
+        .await
     }
 
     async fn flush(
@@ -757,10 +779,13 @@ impl Filesystem for DtfsFuse3Adapter {
         // the inode blocked without end (a mount hang with no cluster
         // fault). Same shape as the F_UNLCK arm of `setlk`.
         self.release_posix_locks_for_owner(inode, lock_owner).await;
-        self.fs.flush(fh).await.map_err(|e| {
-            warn!(fh, error = %e, "fuse3 flush failed");
-            Errno::from(libc::EIO)
+        timed(Op::Flush, async {
+            self.fs.flush(fh).await.map_err(|e| {
+                warn!(fh, error = %e, "fuse3 flush failed");
+                Errno::from(libc::EIO)
+            })
         })
+        .await
     }
 
     /// Durable flush handler. SQLite (and every database/log writer) calls
@@ -778,10 +803,13 @@ impl Filesystem for DtfsFuse3Adapter {
         _datasync: bool,
     ) -> FuseResult<()> {
         debug!("fuse3:fsync fh={}", fh);
-        self.fs.fsync(fh).await.map_err(|e| {
-            warn!(fh, error = %e, "fuse3 fsync failed");
-            Errno::from(libc::EIO)
+        timed(Op::Fsync, async {
+            self.fs.fsync(fh).await.map_err(|e| {
+                warn!(fh, error = %e, "fuse3 fsync failed");
+                Errno::from(libc::EIO)
+            })
         })
+        .await
     }
 
     /// POSIX advisory byte-range lock check (`fcntl(F_GETLK)`) — F-031.
@@ -915,6 +943,7 @@ impl Filesystem for DtfsFuse3Adapter {
         mode: u32,
         _umask: u32,
     ) -> FuseResult<ReplyEntry> {
+        timed(Op::Mkdir, async {
         let path = self.child_path(parent, name)?;
         debug!("fuse3:mkdir {} (mode={:#o})", path, mode);
         match self.fs.mkdir(&path).await {
@@ -934,6 +963,8 @@ impl Filesystem for DtfsFuse3Adapter {
                 Err(cluster_err_to_errno(&e))
             }
         }
+        })
+        .await
     }
 
     async fn unlink(
@@ -942,6 +973,7 @@ impl Filesystem for DtfsFuse3Adapter {
         parent: u64,
         name: &OsStr,
     ) -> FuseResult<()> {
+        timed(Op::Unlink, async {
         let path = self.child_path(parent, name)?;
         debug!("fuse3:unlink {}", path);
         // Snapshot the inode (if any) before we drop the path mapping, so we
@@ -965,6 +997,8 @@ impl Filesystem for DtfsFuse3Adapter {
                 Err(cluster_err_to_errno(&e))
             }
         }
+        })
+        .await
     }
 
     async fn rmdir(
@@ -973,6 +1007,7 @@ impl Filesystem for DtfsFuse3Adapter {
         parent: u64,
         name: &OsStr,
     ) -> FuseResult<()> {
+        timed(Op::Rmdir, async {
         let path = self.child_path(parent, name)?;
         debug!("fuse3:rmdir {}", path);
         match self.fs.unlink(&path).await {
@@ -986,6 +1021,8 @@ impl Filesystem for DtfsFuse3Adapter {
                 Err(cluster_err_to_errno(&e))
             }
         }
+        })
+        .await
     }
 
     /// FUSE_MKNOD: what knfsd's vfs_create sends for an NFS CREATE. Namespace
@@ -1036,6 +1073,7 @@ impl Filesystem for DtfsFuse3Adapter {
         mode: u32,
         flags: u32,
     ) -> FuseResult<ReplyCreated> {
+        timed(Op::Create, async {
         let path = self.child_path(parent, name)?;
         debug!("fuse3:create {} (mode={:#o})", path, mode);
         match self.fs.create(&path, mode).await {
@@ -1074,6 +1112,8 @@ impl Filesystem for DtfsFuse3Adapter {
                 Err(cluster_err_to_errno(&e))
             }
         }
+        })
+        .await
     }
 
     async fn opendir(
@@ -1125,7 +1165,8 @@ impl Filesystem for DtfsFuse3Adapter {
         fh: u64,
         offset: i64,
     ) -> FuseResult<ReplyDirectory<Self::DirEntryStream<'a>>> {
-        let path = self.inodes.path_for(inode)?;
+        timed(Op::Readdir, async {
+        let path =self.inodes.path_for(inode)?;
         debug!("fuse3:readdir {} (ino={}, offset={})", path, inode, offset);
 
         // CR-1-6 (FUSE-4/CO-4-16): a manager blip during a Plex library
@@ -1169,6 +1210,8 @@ impl Filesystem for DtfsFuse3Adapter {
         Ok(ReplyDirectory {
             entries: futures_util::stream::iter(items),
         })
+        })
+        .await
     }
 
     type DirEntryPlusStream<'a>
@@ -1184,7 +1227,8 @@ impl Filesystem for DtfsFuse3Adapter {
         offset: u64,
         _lock_owner: u64,
     ) -> FuseResult<ReplyDirectoryPlus<Self::DirEntryPlusStream<'a>>> {
-        let path = self.inodes.path_for(inode)?;
+        timed(Op::Readdirplus, async {
+        let path =self.inodes.path_for(inode)?;
         debug!("fuse3:readdirplus {} (ino={}, offset={})", path, inode, offset);
         // CR-1-6 (FUSE-4/CO-4-16): same rationale as readdir above.
         let entries = self.listing(fh, &path).await?;
@@ -1236,6 +1280,8 @@ impl Filesystem for DtfsFuse3Adapter {
                 })
                 .boxed(),
         })
+        })
+        .await
     }
 
     /// `statvfs` — return cluster-aware total/used/free capacity so
@@ -1342,6 +1388,7 @@ impl Filesystem for DtfsFuse3Adapter {
         new_parent: u64,
         new_name: &OsStr,
     ) -> FuseResult<()> {
+        timed(Op::Rename, async {
         let from = self.child_path(parent, name)?;
         let to = self.child_path(new_parent, new_name)?;
         debug!("fuse3:rename {} -> {}", from, to);
@@ -1358,6 +1405,8 @@ impl Filesystem for DtfsFuse3Adapter {
                 Err(cluster_err_to_errno(&e))
             }
         }
+        })
+        .await
     }
 
     /// `symlink(2)` — F-035. Manager stores the link target string as

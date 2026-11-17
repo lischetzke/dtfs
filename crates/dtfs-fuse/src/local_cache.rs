@@ -415,9 +415,12 @@ impl LocalChunkCache {
         Ok(removed)
     }
 
-    #[cfg(test)]
     pub fn current_bytes(&self) -> u64 {
         self.total_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
     }
 
     #[cfg(test)]

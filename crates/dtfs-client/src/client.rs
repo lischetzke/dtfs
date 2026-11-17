@@ -119,6 +119,29 @@ const PUT_CHUNK_MAX_BACKOFF_MS: u64 = 8_000;
 /// check, so one dead target held each chunk for the whole 15.75 s ladder.
 const PUT_CHUNK_UNAVAILABLE_MAX_RETRIES: u32 = 2;
 
+/// Issue #159 - handles cached once, so the RPC paths take no registry lock.
+struct ClientMetrics {
+    allocate_us: Arc<dtfs_common::metrics::Histogram>,
+    allocate_fail: Arc<dtfs_common::metrics::Counter>,
+    commit_us: Arc<dtfs_common::metrics::Histogram>,
+    commit_fail: Arc<dtfs_common::metrics::Counter>,
+    put_retries: Arc<dtfs_common::metrics::Counter>,
+}
+
+fn client_metrics() -> &'static ClientMetrics {
+    static M: std::sync::OnceLock<ClientMetrics> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        use dtfs_common::metrics::{counter, histogram};
+        ClientMetrics {
+            allocate_us: histogram("client_allocate_chunks_us", &[]),
+            allocate_fail: counter("client_allocate_chunks_failures", &[]),
+            commit_us: histogram("client_commit_chunk_locations_us", &[]),
+            commit_fail: counter("client_commit_chunk_locations_failures", &[]),
+            put_retries: counter("client_put_chunk_retries", &[]),
+        }
+    })
+}
+
 /// Decide how long to back off before retry on a put_chunk failure.
 /// Returns `None` when the caller should give up (non-retryable status
 /// or attempts exhausted). The long ladder is for memory shedding only; a
@@ -611,13 +634,19 @@ impl DtfsClient {
                 .load(std::sync::atomic::Ordering::Relaxed)
                 .then_some(true),
         };
+        let t0 = std::time::Instant::now();
         let response = self
             .call_manager("allocate_chunks", false, |mut c| {
                 let r = self.stamp_mgr_mutation("AllocateChunks", &request.path, request.clone());
                 async move { c.allocate_chunks(r).await }
             })
-            .await?;
-        Ok(response.into_inner())
+            .await;
+        let m = client_metrics();
+        m.allocate_us.observe_duration(t0.elapsed());
+        if response.is_err() {
+            m.allocate_fail.inc();
+        }
+        Ok(response?.into_inner())
     }
 
     /// Persist chunk locations to the manager metadata (Raft) after successful writes.
@@ -641,6 +670,7 @@ impl DtfsClient {
             chunks: commits,
             lease_id: lease_id.to_string(),
         };
+        let t0 = std::time::Instant::now();
         let response = self
             .call_manager("commit_chunk_locations", false, |mut c| {
                 let r = self.stamp_mgr_mutation(
@@ -650,8 +680,13 @@ impl DtfsClient {
                 );
                 async move { c.commit_chunk_locations(r).await }
             })
-            .await?;
-        let inner = response.into_inner();
+            .await;
+        let m = client_metrics();
+        m.commit_us.observe_duration(t0.elapsed());
+        if response.is_err() {
+            m.commit_fail.inc();
+        }
+        let inner = response?.into_inner();
         if inner.lease_conflict {
             anyhow::bail!(
                 "commit_chunk_locations rejected: write lease no longer held ({})",
@@ -866,6 +901,7 @@ impl DtfsClient {
                             code = ?status.code(),
                             "put_chunk transient error, retrying after backoff"
                         );
+                        client_metrics().put_retries.inc();
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue;

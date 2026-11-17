@@ -16,6 +16,7 @@ use dtfs_common::config::{self, FuseConfig};
 mod filesystem;
 mod fuse_adapter;
 mod local_cache;
+mod metrics;
 mod readahead;
 mod writebuf;
 

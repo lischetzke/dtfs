@@ -53,6 +53,16 @@ impl ReadAheadMode {
         }
     }
 
+    /// Config name of the mode (the `fuse_readahead_mode` label).
+    fn name(&self) -> &'static str {
+        match self {
+            ReadAheadMode::FileSequential { .. } => "file-sequential",
+            ReadAheadMode::FolderSequential { .. } => "folder-sequential",
+            ReadAheadMode::FileOnly { .. } => "file-only",
+            ReadAheadMode::Disabled => "disabled",
+        }
+    }
+
     /// Number of chunks to prefetch ahead of the current read position.
     fn prefetch_chunks(&self) -> u32 {
         match self {
@@ -209,6 +219,7 @@ fn evict_oldest(
         Some(k) => {
             if let Some((_, (_, v))) = cache.remove(&k) {
                 cache_bytes.fetch_sub(v.len(), Ordering::Relaxed);
+                crate::metrics::fm().ra_evicted_bytes.add(v.len() as u64);
             }
             true
         }
@@ -259,6 +270,8 @@ impl ReadAheadEngine {
         max_cache_bytes: usize,
         max_inflight: usize,
     ) -> Self {
+        dtfs_common::metrics::gauge("fuse_readahead_mode", &[("mode", mode.name())]).set(1);
+        dtfs_common::metrics::gauge("fuse_readahead_window_chunks", &[]).set(mode.prefetch_chunks() as i64);
         Self {
             mode,
             client,
@@ -635,6 +648,9 @@ impl ReadAheadEngine {
             }
 
             // FUSE-2 — bound the fetch so a hung replica releases the permit.
+            let fm = crate::metrics::fm();
+            fm.ra_issued.inc();
+            let t0 = std::time::Instant::now();
             let fetch = match fetch_timeout {
                 None => client.read_chunk_as(&node_addr, &chunk_id, track, true).await,
                 Some(t) => match tokio::time::timeout(t, client.read_chunk_as(&node_addr, &chunk_id, track, true)).await {
@@ -651,6 +667,8 @@ impl ReadAheadEngine {
 
             match fetch {
                 Ok(data) => {
+                    fm.ra_get_us.observe_duration(t0.elapsed());
+                    fm.ra_bytes.add(data.len() as u64);
                     debug!(
                         chunk_id = %chunk_id,
                         node = %node_addr,
@@ -684,6 +702,7 @@ impl ReadAheadEngine {
                 Err(e) => {
                     // Prefetch failures are non-fatal — the read path will
                     // fetch on demand.
+                    fm.ra_failed.inc();
                     debug!(
                         chunk_id = %chunk_id,
                         node = %node_addr,
@@ -758,9 +777,13 @@ impl ReadAheadCacheController {
     }
 
     /// Current live byte budget.
-    #[cfg(test)]
     pub fn current_budget(&self) -> usize {
         self.max_cache_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Prefetches queued or on the wire.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 
     /// Bytes currently held in the prefetch cache.
@@ -791,6 +814,7 @@ impl ReadAheadCacheController {
             entry.value().handle.abort();
         }
         self.pending.clear();
+        crate::metrics::fm().ra_dropped_bytes.add(self.cache_bytes.load(Ordering::Relaxed) as u64);
         drain_cache(&self.cache, &self.cache_bytes);
     }
 

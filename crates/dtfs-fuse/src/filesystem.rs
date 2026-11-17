@@ -1572,6 +1572,7 @@ impl DtfsFilesystem {
         let len = bytes.len() as u64;
         let queued = self.cache_fills.enqueue(&chunk.chunk_id, len, Box::pin(async move {
             let now = || SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            crate::metrics::fm().fill_issued.inc();
             let put = match client.write_chunk_bytes(&target.addr, &chunk_id, &volume_id, &target.tier, bytes).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -1580,6 +1581,7 @@ impl DtfsFilesystem {
                     } else {
                         debug!(chunk_id = %chunk_id, node = %target.addr, error = %format!("{e:#}"), "cache fill put failed");
                     }
+                    crate::metrics::fm().fill_failed.inc();
                     return false;
                 }
             };
@@ -1601,6 +1603,7 @@ impl DtfsFilesystem {
                 }
                 Err(e) => debug!(chunk_id = %chunk_id, node = %target.addr, error = %format!("{e:#}"), "cache fill commit failed"),
             }
+            crate::metrics::fm().fill_failed.inc();
             false
         }));
         if !queued {
@@ -1783,6 +1786,9 @@ impl DtfsFilesystem {
             for cand in &candidates {
                 if let Some(cached) = self.readahead.get_cached(cand, &chunk.chunk_id) {
                     debug!(chunk_id = %chunk.chunk_id, node = %cand, "readahead cache hit");
+                    let m = crate::metrics::fm();
+                    m.cache_hit_mem.inc();
+                    m.cache_hit_mem_bytes.add(cached.len() as u64);
                     chunk_data = Some(cached);
                     // Bug AV (AV-4-1c) — notify the data-node so its
                     // per-DC counter reflects this read even though we
@@ -1810,6 +1816,9 @@ impl DtfsFilesystem {
                         lc.get_with_hint(&chunk.chunk_id, is_viewer).await
                     {
                         debug!(chunk_id = %chunk.chunk_id, "local-disk cache hit");
+                        let m = crate::metrics::fm();
+                        m.cache_hit_disk.inc();
+                        m.cache_hit_disk_bytes.add(cached.len() as u64);
                         promote_disk_hit(&self.readahead, &candidates, &chunk.chunk_id, &cached);
                         chunk_data = Some(cached);
                         // AV-4-1c — pick any candidate (the disk cache
@@ -1849,6 +1858,7 @@ impl DtfsFilesystem {
                             node = %cand,
                             "readahead prefetch join hit"
                         );
+                        crate::metrics::fm().ra_join.inc();
                         chunk_data = Some(joined);
                         if cache_hit_notify_addr.is_none() {
                             cache_hit_notify_addr = Some(cand.clone());
@@ -1911,6 +1921,8 @@ impl DtfsFilesystem {
                 // (content-addressed, so any candidate is interchangeable)
                 // fetch it exactly once, not N times over the (possibly
                 // 40 Mbps) link.
+                crate::metrics::fm().cache_miss.inc();
+                let replicas = chunk.replicas_with_tiers();
                 match claim_foreground_fetch(&self.foreground_inflight, &chunk.chunk_id) {
                     ForegroundFetchClaim::Waiter(mut rx) => {
                         let joined = if rx.changed().await.is_ok() {
@@ -1924,15 +1936,17 @@ impl DtfsFilesystem {
                                     chunk_id = %chunk.chunk_id,
                                     "foreground fetch single-flight join hit"
                                 );
+                                crate::metrics::fm().sf_fg_join.inc();
                                 d
                             }
                             None => {
+                                crate::metrics::fm().sf_fg_owner_failed.inc();
                                 // Owner's fetch failed (or its entry was
                                 // dropped before publishing a result) —
                                 // fetch it ourselves rather than failing
                                 // this read outright.
                                 let (_, d) = self
-                                    .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id, !untracked, report_scanner)
+                                    .fetch_chunk_from_candidates(&candidates, &replicas, &chunk.chunk_id, !untracked, report_scanner)
                                     .await?;
                                 d
                             }
@@ -1940,7 +1954,7 @@ impl DtfsFilesystem {
                     }
                     ForegroundFetchClaim::Owner(tx) => {
                         let fetch_result = self
-                            .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id, !untracked, report_scanner)
+                            .fetch_chunk_from_candidates(&candidates, &replicas, &chunk.chunk_id, !untracked, report_scanner)
                             .await;
                         let (node_addr, data) = match fetch_result {
                             Ok(v) => v,
@@ -2430,6 +2444,13 @@ impl DtfsFilesystem {
         Ok(())
     }
 
+    /// Count a close-triggered commit (`fuse_commits{trigger=close}`) of a writable fh.
+    fn count_close_commit(&self, fh: u64) {
+        if self.open_files.get(&fh).is_some_and(|f| f.flags.is_writable()) {
+            crate::metrics::fm().trig_close.inc();
+        }
+    }
+
     /// FUSE flush (every close(2)): always commit everything (`commit_all`),
     /// then report a pending background commit error once. close(2) returns
     /// this result; RELEASE is async and its reply is ignored, so committing
@@ -2441,6 +2462,7 @@ impl DtfsFilesystem {
         let commit = if self.defer_close_commit(fh) {
             Ok(())
         } else {
+            self.count_close_commit(fh);
             self.commit_all(fh).await
         };
         let res = commit.and_then(|()| {
@@ -2494,6 +2516,7 @@ impl DtfsFilesystem {
     ) -> (Vec<crate::writebuf::ChunkSegment>, Option<crate::writebuf::InflightGuard<'_>>) {
         let cs = self.write_buffer.chunk_size().max(1) as u64;
         let keep = (at / cs) as u32..=((at + len.max(1) as u64 - 1) / cs) as u32;
+        crate::metrics::fm().trig_dirty_cap.inc();
         self.write_buffer.cap_drain_inflight(
             path,
             len,
@@ -2541,6 +2564,9 @@ impl DtfsFilesystem {
         chunks.sort_unstable();
         let bytes = segs.iter().map(|s| s.data.len()).sum();
         self.bg_uploads.entry(path.clone()).or_default().push((inflight, chunks, bytes));
+        let m = crate::metrics::fm();
+        m.trig_full.inc();
+        m.bg_inflight.add(1);
         let this = Arc::clone(self);
         tokio::spawn(async move { this.bg_upload(fh, path, segs, inflight).await });
     }
@@ -2553,6 +2579,7 @@ impl DtfsFilesystem {
     /// restore/merge is done; its `bg_uploads` entry is cleared after that.
     async fn bg_upload(&self, fh: u64, path: String, segs: Vec<crate::writebuf::ChunkSegment>, inflight: u64) {
         let _slot = BgSlot { fs: self, path: path.clone(), id: inflight };
+        let t0 = Instant::now();
         let chunks: Vec<u32> = segs.iter().map(|s| s.chunk_index).collect();
         let _inflight = self.write_buffer.adopt_inflight(inflight);
         let res = match self.renew_if_due(fh, &path).await {
@@ -2564,6 +2591,7 @@ impl DtfsFilesystem {
             }
             Err(e) => Err(e),
         };
+        crate::metrics::fm().bg_commit_us.observe_duration(t0.elapsed());
         match res {
             Ok(committed) => {
                 self.mark_committed_and_refresh(&path, fh, committed).await;
@@ -2775,12 +2803,24 @@ impl DtfsFilesystem {
         if global() {
             debug!(path = %path, incoming, budget = ?self.write_budget, "write waits for the global write budget");
         }
+        let waited = std::sync::atomic::AtomicBool::new(false);
+        let t0 = Instant::now();
         self.wait_bg(|| {
             let inflight = self.bg_inflight_bytes(path);
-            (inflight == 0 || !dirty_cap_exceeded(self.write_buffer.dirty_bytes(path) + inflight, incoming, cap))
-                && !global()
+            let ok = (inflight == 0
+                || !dirty_cap_exceeded(self.write_buffer.dirty_bytes(path) + inflight, incoming, cap))
+                && !global();
+            if !ok {
+                waited.store(true, Ordering::Relaxed);
+            }
+            ok
         })
         .await;
+        if waited.load(Ordering::Relaxed) {
+            let m = crate::metrics::fm();
+            m.cap_waits.inc();
+            m.cap_wait_us.observe_duration(t0.elapsed());
+        }
     }
 
     /// Write-side EOF of the buffer, in-flight drains included (a background
@@ -3028,6 +3068,7 @@ impl DtfsFilesystem {
             // Re-check under the lock: release or rename may have won.
             let still_open = self.open_files.get(&fh).map(|f| f.path == path) == Some(true);
             if still_open {
+                crate::metrics::fm().trig_timer.inc();
                 let result = self.commit_all(fh).await;
                 self.record_aged_commit(&path, result);
             }
@@ -3049,6 +3090,7 @@ impl DtfsFilesystem {
             let _slot = StaleCommitSlot { fs: &this, path: path.clone() };
             let guard = this.path_guard(&path).await;
             if let Some(fh) = this.writable_fh(&path) {
+                crate::metrics::fm().trig_timer.inc();
                 let result = this.commit_all(fh).await;
                 this.record_aged_commit(&path, result);
             }
@@ -3201,6 +3243,7 @@ impl DtfsFilesystem {
         // A skipped commit (async_commit, another writer open) is Ok: no
         // buffer drop (that writer remains) and no ghost unlink.
         let commit_result = if self.open_files.contains_key(&fh) && !self.defer_close_commit(fh) {
+            self.count_close_commit(fh);
             self.commit_all(fh).await
         } else {
             Ok(())
@@ -3899,14 +3942,20 @@ impl DtfsFilesystem {
 
     /// Get cached metadata if it exists and hasn't expired.
     fn get_cached_metadata(&self, path: &str) -> Option<Arc<FileLocations>> {
-        let entry = self.metadata_cache.get(path)?;
+        let m = crate::metrics::fm();
+        let Some(entry) = self.metadata_cache.get(path) else {
+            m.meta_miss.inc();
+            return None;
+        };
         let (locations, cached_at) = entry.value();
         if cached_at.elapsed() < self.metadata_ttl {
+            m.meta_hit.inc();
             Some(locations.clone())
         } else {
             // Expired — remove from cache.
             drop(entry);
             self.metadata_cache.remove(path);
+            m.meta_miss.inc();
             None
         }
     }
@@ -3955,6 +4004,27 @@ impl DtfsFilesystem {
     /// called periodically from `main.rs` on the `metadata_ttl` cadence.
     pub fn sweep_expired_metadata_cache(&self) {
         sweep_expired_metadata_cache_entries(&self.metadata_cache, self.metadata_ttl);
+        self.sample_gauges();
+    }
+
+    /// Cache and write-buffer sizes against their bounds, at most once a
+    /// second (piggybacks on the metadata sweep tick).
+    fn sample_gauges(&self) {
+        if !crate::metrics::gauges_due() {
+            return;
+        }
+        let m = crate::metrics::fm();
+        m.meta_entries.set(self.metadata_cache.len() as i64);
+        m.dirty_bytes.set(self.write_buffer.total_bytes() as i64);
+        m.dirty_cap_bytes.set(self.write_buffer.dirty_cap() as i64);
+        let ra = self.readahead.cache_controller();
+        m.ra_cache_bytes.set(ra.cache_bytes() as i64);
+        m.ra_budget_bytes.set(ra.current_budget() as i64);
+        m.ra_pending.set(ra.pending_len() as i64);
+        if let Some(lc) = &self.local_cache {
+            m.disk_cache_bytes.set(lc.current_bytes() as i64);
+            m.disk_cache_max_bytes.set(lc.max_bytes() as i64);
+        }
     }
 
     /// Resolve the logical chunk size for a file.
@@ -4063,16 +4133,30 @@ impl DtfsFilesystem {
         Ok(())
     }
 
+    /// Per-(tier, DC) metric handles for the replica at `addr`.
+    fn src_metrics(&self, addr: &str, replicas: &[(String, String)]) -> Arc<crate::metrics::SrcMetrics> {
+        let tier = replicas.iter().find(|(a, _)| a == addr).map_or("", |(_, t)| t.as_str());
+        let dc = self.known_locations.get(addr).map(|l| l.datacenter.clone()).unwrap_or_default();
+        crate::metrics::fm().src(tier, &dc)
+    }
+
     async fn fetch_chunk_from_candidates(
         &self,
         candidates: &[String],
+        replicas: &[(String, String)],
         chunk_id: &str,
         track: bool,
         scanner: bool,
     ) -> Result<(String, bytes::Bytes)> {
         let fetch_timeout_secs = self.config.client.chunk_read_timeout_secs;
         let mut last_err: Option<anyhow::Error> = None;
-        for cand in candidates {
+        let fm = crate::metrics::fm();
+        for (i, cand) in candidates.iter().enumerate() {
+            let src = self.src_metrics(cand, replicas);
+            if i == 0 {
+                src.chosen.inc(); // the replica select_read_replica ranked first
+            }
+            let t0 = Instant::now();
             let fetch = self.client.read_chunk_as(cand, chunk_id, track, scanner);
             let result = if fetch_timeout_secs == 0 {
                 fetch.await
@@ -4095,6 +4179,8 @@ impl DtfsFilesystem {
                             "chunk fetch from {cand} timed out after {fetch_timeout_secs}s"
                         ));
                         self.failed_replicas.insert(cand.clone(), Instant::now());
+                        src.get_fail.inc();
+                        fm.failover_timeout.inc();
                         continue;
                     }
                 }
@@ -4102,9 +4188,18 @@ impl DtfsFilesystem {
             match result {
                 Ok(d) => {
                     self.failed_replicas.remove(cand);
+                    src.get_us.observe_duration(t0.elapsed());
+                    src.get_bytes.add(d.len() as u64);
                     return Ok((cand.clone(), d));
                 }
                 Err(e) => {
+                    src.get_fail.inc();
+                    if e.downcast_ref::<dtfs_client::client::IntegrityFaultError>().is_some() {
+                        fm.verify_fail.inc();
+                        fm.failover_integrity.inc();
+                    } else {
+                        fm.failover_error.inc();
+                    }
                     if fetch_error_demotes_node(&e) {
                         self.failed_replicas.insert(cand.clone(), Instant::now());
                     }
@@ -4329,10 +4424,16 @@ impl DtfsFilesystem {
                     let tier = tier.clone();
                     let expected_chunk_id = expected_chunk_id.clone();
                     let chunk_index = segment.chunk_index;
+                    let src = self.src_metrics(&addr, &[(addr.clone(), tier.clone())]);
+                    let len = data.len() as u64;
                     async move {
+                        let t0 = Instant::now();
                         let put_resp = client
                             .write_chunk_bytes(&addr, &expected_chunk_id, volume_id, &tier, data)
-                            .await?;
+                            .await
+                            .inspect_err(|_| src.put_fail.inc())?;
+                        src.put_us.observe_duration(t0.elapsed());
+                        src.put_bytes.add(len);
                         // CR-1-5 — a data node that returns a DIFFERENT
                         // chunk_id than what we declared and hashed
                         // ourselves means the bytes it stored don't match
@@ -4695,7 +4796,7 @@ impl DtfsFilesystem {
         }
         let candidates = self.read_candidates(chunk);
         let (_, existing) = self
-            .fetch_chunk_from_candidates(&candidates, &chunk.chunk_id, true, false)
+            .fetch_chunk_from_candidates(&candidates, &chunk.replicas_with_tiers(), &chunk.chunk_id, true, false)
             .await
             .with_context(|| format!("RMW seed read failed for {path} chunk {chunk_idx}"))?;
         let keep = seed_len_within_eof(existing.len(), chunk_idx * chunk_size, eof);
@@ -4898,6 +4999,7 @@ struct BgSlot<'a> {
 
 impl Drop for BgSlot<'_> {
     fn drop(&mut self) {
+        crate::metrics::fm().bg_inflight.add(-1);
         self.fs.bg_uploads.remove_if_mut(&self.path, |_, v| {
             v.retain(|b| b.0 != self.id);
             v.is_empty()
@@ -5406,6 +5508,7 @@ where
                     .flatten()
                     .filter(|d| start.elapsed() + *d < deadline);
                 if let Some(d) = retry {
+                    crate::metrics::fm().put_ladder_retries.inc();
                     debug!(node = %targets[i], attempt = n + 1, backoff_ms = d.as_millis() as u64,
                         "put target unavailable while short of quorum or anchor; retrying");
                     inflight.push(put_attempt(&put, i, targets[i].clone(), n + 1, d));
@@ -9101,6 +9204,52 @@ mod async_commit_fs_tests {
         })
     }
 
+    /// #159: a readahead-cache read counts a hit and its bytes; a read whose
+    /// only replica is dead counts a miss, a failed GetChunk and a failover.
+    /// Counters are process-global and tests run in parallel, so each is
+    /// asserted to have grown by at least this test's own increment.
+    #[tokio::test]
+    async fn read_counts_cache_hit_and_miss_with_failover() {
+        let m = crate::metrics::fm();
+        let fs = fs(false);
+        let cs = fs.write_buffer.chunk_size() as u64;
+        let hit_id = "d".repeat(64);
+        fs.readahead.insert_cached("n:1", &hit_id, Bytes::from(vec![3u8; 10]));
+        let fh = open(&fs, "/f", OpenFlags::ReadOnly);
+        let mut l = holes("/f", 10, cs);
+        l.chunks = vec![committed_chunk_info(0, &hit_id, 10, vec!["n:1".to_string()], "warm")];
+        fs.open_files.get_mut(&fh).unwrap().locations = Some(Arc::new(l));
+        let (h, hb) = (m.cache_hit_mem.get(), m.cache_hit_mem_bytes.get());
+        assert_eq!(&fs.read(fh, 0, 10).await.unwrap()[..], &[3u8; 10]);
+        assert!(m.cache_hit_mem.get() > h, "hit not counted");
+        assert!(m.cache_hit_mem_bytes.get() >= hb + 10, "hit bytes not counted");
+
+        let miss_id = "e".repeat(64);
+        let mut dead = holes("/g", 10, cs);
+        dead.chunks = vec![committed_chunk_info(0, &miss_id, 10, vec!["127.0.0.1:1".to_string()], "warm")];
+        let fh2 = open(&fs, "/g", OpenFlags::ReadOnly);
+        let dead = Arc::new(dead);
+        fs.open_files.get_mut(&fh2).unwrap().locations = Some(dead);
+        let (mi, fo) = (m.cache_miss.get(), m.failover_error.get());
+        assert!(fs.read(fh2, 0, 10).await.is_err(), "dead replica must fail the read");
+        assert!(m.cache_miss.get() > mi, "miss not counted");
+        assert!(m.failover_error.get() > fo, "failed replica attempt not counted");
+    }
+
+    /// #159: the metadata cache counts a miss for an unknown or expired
+    /// path and a hit for a fresh entry.
+    #[test]
+    fn metadata_cache_counts_hit_and_miss() {
+        let m = crate::metrics::fm();
+        let fs = fs(false);
+        let (h, mi) = (m.meta_hit.get(), m.meta_miss.get());
+        assert!(fs.get_cached_metadata("/never").is_none());
+        assert!(m.meta_miss.get() > mi, "miss not counted");
+        fs.cache_metadata("/m", Arc::new(holes("/m", 1, 4096)));
+        assert!(fs.get_cached_metadata("/m").is_some());
+        assert!(m.meta_hit.get() > h, "hit not counted");
+    }
+
     /// #133: a commit merges a rewritten chunk into the handle and drops its
     /// overlay while read() is past its snapshot clone: the read must return
     /// the committed bytes, not the old chunk version.
@@ -9177,7 +9326,7 @@ mod async_commit_fs_tests {
         let (a, b) = ("127.0.0.1:1".to_string(), "127.0.0.1:2".to_string());
         let chunk1 = committed_chunk_info(1, &"d".repeat(64), 10, vec![a.clone(), b.clone()], "warm");
         assert_eq!(fs.read_candidates(&chunk1), [a.clone(), b.clone()]);
-        assert!(fs.fetch_chunk_from_candidates(&[a.clone()], &"c".repeat(64), true, false).await.is_err());
+        assert!(fs.fetch_chunk_from_candidates(&[a.clone()], &[], &"c".repeat(64), true, false).await.is_err());
         assert_eq!(fs.read_candidates(&chunk1), [b.clone(), a.clone()], "dead replica still first");
         let now = Instant::now();
         let order = vec![a.clone(), b.clone()];
