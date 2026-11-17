@@ -1113,10 +1113,10 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_tiering_promote_copies\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"dc\" fill(null)",
+          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_tiering_promote_copies\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"target_dc\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "promote  $tag_node $tag_dc"
+          "alias": "promote  $tag_node $tag_target_dc"
         },
         {
           "datasource": {
@@ -1125,10 +1125,10 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_precache_copies\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"dc\" fill(null)",
+          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_precache_copies\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"target_dc\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "precache  $tag_node $tag_dc"
+          "alias": "precache  $tag_node $tag_target_dc"
         },
         {
           "datasource": {
@@ -1137,10 +1137,10 @@
           },
           "refId": "C",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_cache_fill_commits\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"dc\" fill(null)",
+          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_cache_fill_commits\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"reader_dc\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "fill  $tag_node $tag_dc"
+          "alias": "fill  $tag_node $tag_reader_dc"
         },
         {
           "datasource": {

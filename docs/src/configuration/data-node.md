@@ -115,3 +115,21 @@ Read by `dtfs-cli update data`; the daemon ignores it. Keys and precedence: [Man
 ## `[metrics]` (optional)
 
 InfluxDB push, identical to [Manager `[metrics]`](./manager.md#metrics-optional); role tag `data`. `mode = "proxy"` (no `[[metrics.servers]]`) sends the batches to a manager from `[cluster]` `manager_addr` / `manager_addrs` via `PushMetrics` instead, so this host needs no InfluxDB access.
+
+Proxy example (this host has no route to InfluxDB; the managers need `[[metrics.servers]]` and a larger `buffer_max_kb`, see [metrics examples](./manager.md#examples)):
+
+```toml
+[metrics]
+mode = "proxy"
+flush_interval_secs = 60
+compression = "gzip"
+```
+
+Example `[memory]` for a data node on a shared host (64 `PutChunk` slots need `hard_cap_mb >= 1280`, see `[grpc]`):
+
+```toml
+[memory]
+hard_cap_mb = 1280
+warn_threshold_pct = 80
+shed_threshold_pct = 92
+```

@@ -131,6 +131,23 @@ Seeds the auto-created `default` volume and the defaults for volumes created thr
 | `cold` | u32 | `1` | required |
 | `tape` | u32 | `0` | `1` |
 
+Example: 16 MiB chunks, every chunk anchored in `leli`, two durable replicas before an ack, a cold + warm goal:
+
+```toml
+[defaults]
+chunk_size_mb = 16               # FUSE [client] chunk_size_mb must match
+anchor_datacenter = "leli"       # case-insensitive; omit for no anchor
+
+[defaults.write_safety]          # both keys are required once the table exists
+min_replicas_before_ack = 2
+write_timeout_secs = 30
+
+[defaults.replication]           # hot, warm and cold are required once the table exists
+hot = 0
+warm = 2
+cold = 1
+```
+
 A volume that requires copies on a tier with no registered disks (or more copies than nodes carrying that tier) can never leave `undergoal`. The manager logs one warning and audits `volume.goal_unreachable` per volume and tier at startup (after 120 s), on volume create and on `set-mandatory`; `GET /api/v1/stats` returns `goal_unreachable_volumes` and a `goal_unreachable` list (`volume`, `tier`, `required`, `nodes_with_tier`), shown as a dashboard signal chip. Placement classification is unchanged.
 
 A replication count creates replicas only if something maintains them: the volume's `mandatory_replicas` (under-replication scheduler) or cache promotion (`promote_reads`). See [Replication](../storage/replication.md) and [Volume Configuration](./volume-config.md).
@@ -152,6 +169,22 @@ A replication count creates replicas only if something maintains them: the volum
 | `precache_reserve_pct` | u64 | `10` | **Validated**: 0..=50. Share of each node's cache-tier capacity pre-caching never fills; while the watermarks are set, hot and warm disks use `cache_high_watermark_pct` as the ceiling instead. | cluster |
 | `precache_max_activity_keys` | usize | `1024` | **Validated**: >= 64. (file, datacenter) read records pre-caching keeps in leader memory to detect playback; at the cap the stalest 10% are dropped. | cluster |
 | `links` | array of `{ to_dc, max_mbps }` | empty (unlimited) | **Validated**: `to_dc` non-empty and unique (case-insensitive), `max_mbps` > 0. `[[tiering.links]]` entries: every replication copy into `to_dc` from another DC shares a `max_mbps` token bucket (120 s burst), see [link budget](../storage/tiering.md#link-budget). Read at startup. | cluster |
+
+Example: cap the slow LELI uplink for copies and keep warm-tier SSDs from filling up:
+
+```toml
+[tiering]
+cache_high_watermark_pct = 85    # start evicting least recently read cache copies at 85% used
+cache_low_watermark_pct = 70     # stop at 70% (0 < low < high <= 99, or both 0 for off)
+precache_max_mbps = 10
+
+[[tiering.links]]                # one entry per destination DC, to_dc unique, max_mbps > 0
+to_dc = "leli"
+max_mbps = 30                    # below the ~40 Mbps link so reads keep headroom
+[[tiering.links]]
+to_dc = "toro"
+max_mbps = 300
+```
 
 ## `[monitoring]`
 
@@ -178,6 +211,16 @@ Cluster scrub and integrity policy. The manager sends it to every data node in e
 | `quarantine_on_fault` | bool | `true` | `true`: a single integrity fault quarantines the faulting node, both on the data node (self-quarantine) and on the manager (fault reported in a heartbeat). `false`: faults are recorded and reported, nothing is quarantined. |
 | `auto_unquarantine_secs` | u64 | `0` | Cooldown for automatic unquarantine; `0` = manual only. |
 
+Example: scrub more gently on a shared host and keep orphans for two days:
+
+```toml
+[scrub]
+quick_interval_secs = 21600      # 6 h
+deep_interval_secs = 1209600     # 14 d full BLAKE3 verify
+orphan_grace_secs = 172800       # 48 h; below 21600 (6 h) the manager refuses to start
+max_io_percent = 5
+```
+
 ## `[placement]` (optional)
 
 | Key | Type | Default | Constraint |
@@ -197,6 +240,15 @@ Per-process RAM budget and pressure ladder. `hard_cap_mb = 0` (default, or block
 | `shed_threshold_pct` | u8 | `92` | **Validated**: at most 100. |
 | `sample_interval_secs` | u64 | `5` | `0` is treated as 1. |
 
+Example: a manager that shares a 4 GB host with a data node and Plex:
+
+```toml
+[memory]
+hard_cap_mb = 512                # 0 or >= 128
+warn_threshold_pct = 80          # must stay below shed_threshold_pct
+shed_threshold_pct = 92          # at most 100
+```
+
 ## `[audit]` (optional)
 
 | Key | Type | Default | Notes |
@@ -211,6 +263,14 @@ Per-process RAM budget and pressure ladder. `hard_cap_mb = 0` (default, or block
 | `secret` | string | `""` | Per-sink shared secret. Masked in `/api/v1/config*` output. |
 | `kinds` | list of string | `[]` | Empty = all alert kinds. |
 | `dedup_secs` | u64 | `300` | Duplicate suppression window. |
+
+```toml
+[[alerts.webhooks]]
+url = "https://hooks.example.lan/dtfs"
+secret = "<webhook-secret>"
+kinds = ["node.down", "anchor.violated"]   # empty list = every kind, see Alerting
+dedup_secs = 600
+```
 
 See [Alerting](../operations/alerting.md).
 
@@ -247,3 +307,67 @@ A manager with at least one `[[metrics.servers]]` also accepts `PushMetrics` bat
 | `database` | string | | Required for v1. |
 | `username`, `password` | string | unset | v1 basic auth (when `username` is set). Redacted in Debug. |
 | `org`, `bucket`, `token` | string | | Required for v2; sent as `Authorization: Token`, never in the URL. |
+
+### Examples
+
+A manager pushing straight to InfluxDB v1 (`influxdb_v1` needs `database`; credentials are optional):
+
+```toml
+[metrics]
+push_interval_secs = 10
+compression = "gzip"                  # gzip the POST body, cheap on a WAN link
+
+[[metrics.servers]]
+name = "influx-v1"                    # shown in logs, never the URL
+kind = "influxdb_v1"
+url = "http://influx.example.lan:8086"
+database = "dtfs"
+username = "dtfs"                     # set both for basic auth, or omit both
+password = "<password>"
+```
+
+A manager pushing straight to InfluxDB v2 (`influxdb_v2` needs `org`, `bucket` and `token`; the token goes in the `Authorization` header):
+
+```toml
+[metrics]
+[[metrics.servers]]
+name = "influx-v2"
+kind = "influxdb_v2"
+url = "https://influx2.example.lan:8086"
+org = "home"
+bucket = "dtfs"
+token = "<influxdb-v2-token>"
+```
+
+A manager with both servers. Each server has its own retry buffer, so one being down does not delay the other:
+
+```toml
+[metrics]
+compression = "gzip"
+
+[[metrics.servers]]
+name = "influx-v1"
+kind = "influxdb_v1"
+url = "http://influx.example.lan:8086"
+database = "dtfs"
+
+[[metrics.servers]]
+name = "influx-v2"
+kind = "influxdb_v2"
+url = "https://influx2.example.lan:8086"
+org = "home"
+bucket = "dtfs"
+token = "<influxdb-v2-token>"
+```
+
+A data node or FUSE client in proxy mode (same block in `data.toml` and `fuse.toml`; no `[[metrics.servers]]` here, it is refused alongside `proxy`). Snapshots are taken every 10 s and sent in one gzip batch every 60 s (`flush_interval_secs` must be 0 or at least `push_interval_secs`):
+
+```toml
+[metrics]
+mode = "proxy"
+push_interval_secs = 10
+flush_interval_secs = 60
+compression = "gzip"
+```
+
+The managers that receive these batches must have `[[metrics.servers]]` configured (a manager without servers has nowhere to forward them), and a larger `buffer_max_kb` (for example `4096`) because they queue the proxied batches of every data node and client.

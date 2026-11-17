@@ -245,7 +245,8 @@ impl FuseMetrics {
         };
         map.entry(key)
             .or_insert_with(|| {
-                let l = [("tier", tier), ("dc", dc)];
+                // `src_dc`, not `dc`: `dc` is a global tag and a duplicate tag key makes InfluxDB reject the batch
+                let l = [("tier", tier), ("src_dc", dc)];
                 Arc::new(SrcMetrics {
                     get_us: histogram("fuse_get_chunk_us", &l),
                     get_bytes: counter("fuse_get_chunk_bytes", &l),

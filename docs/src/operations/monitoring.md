@@ -148,7 +148,9 @@ configured manager is a failover target for the nodes.
 ### Line protocol
 
 - Measurement `dtfs_<name>`; tags are `role`, `node`, `dc` plus the metric's own labels
-  (tags with an empty value are omitted).
+  (tags with an empty value are omitted). A label named `role`, `node` or `dc` would
+  duplicate a global tag, so the encoder emits it as `label_<name>`; the catalogue labels
+  below avoid those names (`src_dc`, `target_dc`, `reader_dc`).
 - Counters and gauges have one integer field `value`. Counters are cumulative since
   process start: rate them (InfluxQL `non_negative_derivative(..., 1s)`, Flux
   `derivative(nonNegative: true)`), so a restart does not show as a negative spike.
@@ -237,9 +239,9 @@ sampled every 5 s.
 | `scheduler_tick_us` | H | | Scheduler tick |
 | `scheduler_repair_budget_hits` | C | | Repair budget exhausted |
 | `tiering_tick_us`, `precache_tick_us`, `tiering_capacity_evict_tick_us`, `tiering_retention_tick_us` | H | | Tiering planners |
-| `tiering_promote_copies`, `precache_copies` | C | `dc` | Cache copies scheduled by planner |
+| `tiering_promote_copies`, `precache_copies` | C | `target_dc` | Cache copies scheduled by planner |
 | `precache_scheduled_bytes` | C | | Bytes scheduled by pre-cache |
-| `cache_fill_commits`, `cache_fill_bytes` | C | `dc` | Fill-on-read registrations |
+| `cache_fill_commits`, `cache_fill_bytes` | C | `reader_dc` | Fill-on-read registrations |
 | `cache_removed` | C | `reason` | Cache copies removed |
 | `orphan_reap_runs` | C | `result` | Orphan reap runs |
 | `orphan_reap_candidates`, `orphan_reap_chunks`, `orphan_reap_freed_bytes` | C | | Reaper totals |
@@ -301,10 +303,10 @@ sampled every 5 s.
 | `fuse_singleflight_owner_failed` | C | | Merged fetch whose owner failed |
 | `fuse_read_failovers` | C | `reason` (`integrity`, `timeout`, `error`) | Replica failovers |
 | `fuse_read_verify_failures` | C | | Client-side BLAKE3 mismatches |
-| `fuse_get_chunk_us`, `fuse_put_chunk_us` | H | `tier`, `dc` | Chunk transfer latency |
-| `fuse_get_chunk_bytes`, `fuse_put_chunk_bytes` | C | `tier`, `dc` | Chunk transfer bytes |
-| `fuse_get_chunk_failures`, `fuse_put_chunk_failures` | C | `tier`, `dc` | Chunk transfer failures |
-| `fuse_read_replica_chosen` | C | `tier`, `dc` | Replica selection |
+| `fuse_get_chunk_us`, `fuse_put_chunk_us` | H | `tier`, `src_dc` | Chunk transfer latency |
+| `fuse_get_chunk_bytes`, `fuse_put_chunk_bytes` | C | `tier`, `src_dc` | Chunk transfer bytes |
+| `fuse_get_chunk_failures`, `fuse_put_chunk_failures` | C | `tier`, `src_dc` | Chunk transfer failures |
+| `fuse_read_replica_chosen` | C | `tier`, `src_dc` | Replica selection |
 | `fuse_disk_cache_bytes`, `fuse_disk_cache_max_bytes` | G | | Disk cache size and bound |
 | `fuse_write_buffered_bytes`, `fuse_write_dirty_cap_bytes` | G | | Write buffer and its cap |
 | `fuse_write_cap_waits` | C | | Writers blocked at the dirty cap |

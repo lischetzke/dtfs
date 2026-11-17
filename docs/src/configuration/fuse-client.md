@@ -98,6 +98,40 @@ Defaults suit a LAN client with one or two readers. Two cases worth changing (ch
 - **Data disk with slow fsync** (NAS-backed virtual disk, about 200 ms per 4 MiB put; throughput scales with puts in flight), typically with `async_commit` for an NFS re-export: `write.flush_batch_chunks = 64` and `write.upload_concurrency = 64`, and on the data node `grpc.max_concurrent_chunk_writes = 64` (see [data node](data-node.md)). Cost: 256 MB batch and 512 MB dirty cap per open writer, plus up to 64 x replicas x 3 MiB of put buffers while it flushes; size `[memory]` for dirty cap x concurrent writers + readahead. With one batch per file the puts in flight drop to zero at every batch end (the batch ends with its slowest put); to keep about 64 puts busy for one file use `write.flush_batch_chunks = 16`, `write.upload_concurrency = 16` and `write.max_inflight_batches = 4` (64 MB batches, 320 MB dirty cap per open writer, plus 64 puts x replicas x 3 MiB of put buffers outside the dirty cap and `[memory]`: about 576 MiB with 3 targets, 192 MiB on a 1-replica volume).
 - **Clients serving about 5 parallel streams** (a Plex host): `readahead.cache_mb = 192` and `readahead.prefetch_max_inflight = 4`. With the default `prefetch_chunks = 8`, five streams want 5 x 8 x 4 MiB = 160 MiB of prefetched chunks, which the 64 MB default evicts before they are read. Cost: about 128 MB more client RAM than the default (the cache budget), plus two more 4 MiB in-flight prefetch buffers; with a `[memory]` cap the warn level still halves it. Size `hard_cap_mb` to include it.
 
+Example, a Plex host (5 streams, library scans left untracked, disk cache, bounded RAM):
+
+```toml
+[client]
+manager_addr = "10.0.0.1:9401"
+manager_addrs = ["10.0.0.2:9401", "10.0.0.3:9401"]
+untracked_read_processes = ["Plex Media Scan"]   # comm is cut to 15 characters
+
+[readahead]
+cache_mb = 192                   # >= (prefetch_chunks + prefetch_max_inflight) x chunk_size_mb
+prefetch_max_inflight = 4
+
+[cache]
+local_cache_dir = "/var/cache/dtfs"
+local_cache_max_gb = 100
+
+[memory]
+hard_cap_mb = 1024               # includes the 192 MB read-ahead budget
+```
+
+Example, an NFS re-export writer on a slow-fsync data disk (opt-in `async_commit`: acknowledged bytes can be lost if the client crashes):
+
+```toml
+[write]
+async_commit = true
+async_commit_secs = 30           # 1..=60 while async_commit is on
+flush_batch_chunks = 16
+upload_concurrency = 16          # raise the data node's grpc.max_concurrent_chunk_writes to match
+max_inflight_batches = 4         # 16 x 4 MiB batches, 320 MB dirty cap per open writer
+
+[memory]
+hard_cap_mb = 2048               # size for dirty cap x open writers + readahead.cache_mb
+```
+
 **Upgrade note (from v0.1.13 or older):** those clients clamped `upload_concurrency` to 16 and the batch to 16 chunks (64 MB with 4 MiB chunks). A config that already sets `flush_batch_chunks` in 17..=64 or `upload_concurrency` above 16 gets larger batches (up to 256 MB), a larger dirty cap (up to 512 MB per open writer) and more puts in flight (each about 3 MiB per target) after the upgrade, without any config change. Check `[memory]` against the new numbers before upgrading such a client.
 
 ## `[partition_safety]`
@@ -132,3 +166,12 @@ Read by `dtfs-cli update fuse` (alias `client`); the daemon ignores it. Keys and
 ## `[metrics]` (optional)
 
 InfluxDB push, identical to [Manager `[metrics]`](./manager.md#metrics-optional); role tag `fuse`, node tag is `[location].host`. `mode = "proxy"` (no `[[metrics.servers]]`) sends the batches via `PushMetrics` to the client's active manager, failing over through `[client]` `manager_addr` / `manager_addrs`, so this host needs no InfluxDB access.
+
+Proxy example (the managers need `[[metrics.servers]]` and a larger `buffer_max_kb`, see [metrics examples](./manager.md#examples)):
+
+```toml
+[metrics]
+mode = "proxy"
+flush_interval_secs = 60
+compression = "gzip"
+```

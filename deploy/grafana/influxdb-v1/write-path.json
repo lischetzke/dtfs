@@ -171,10 +171,10 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_fuse_put_chunk_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"tier\", \"dc\" fill(null)",
+          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_fuse_put_chunk_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"tier\", \"src_dc\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "$tag_node $tag_tier $tag_dc $col"
+          "alias": "$tag_node $tag_tier $tag_src_dc $col"
         }
       ]
     },

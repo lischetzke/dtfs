@@ -334,11 +334,12 @@ counter_vec!(COMMIT_REJECTS, "write_commit_rejects", "reason", 16);
 counter_vec!(ALLOC_REJECTS, "write_alloc_rejects", "reason", 16);
 counter_vec!(TASKS_CREATED, "scheduler_tasks_created", "kind", 16);
 counter_vec!(SCHED_OUTCOMES, "scheduler_replication_outcomes", "outcome", 16);
-counter_vec!(PROMOTE_COPIES, "tiering_promote_copies", "dc", 64);
-counter_vec!(PRECACHE_COPIES, "precache_copies", "dc", 64);
+// Label keys must not be `dc`, `node` or `role`: those are global tags and a duplicate tag key makes InfluxDB reject the batch.
+counter_vec!(PROMOTE_COPIES, "tiering_promote_copies", "target_dc", 64);
+counter_vec!(PRECACHE_COPIES, "precache_copies", "target_dc", 64);
 counter_vec!(CACHE_REMOVED, "cache_removed", "reason", 16);
-counter_vec!(CACHE_FILL_COMMITS, "cache_fill_commits", "dc", 64);
-counter_vec!(CACHE_FILL_BYTES, "cache_fill_bytes", "dc", 64);
+counter_vec!(CACHE_FILL_COMMITS, "cache_fill_commits", "reader_dc", 64);
+counter_vec!(CACHE_FILL_BYTES, "cache_fill_bytes", "reader_dc", 64);
 counter_vec!(NODE_TRANSITIONS, "monitor_node_transitions", "to", 16);
 
 // ---------------------------------------------------------------------------

@@ -245,7 +245,13 @@ impl Encoder {
     pub fn encode(&mut self, samples: &[Sample], global: &[(String, String)], ts_ns: u128) -> String {
         let mut out = String::new();
         for s in samples {
-            let mut tags = s.tags.clone();
+            // A label named like a global tag would give a duplicate tag key, which InfluxDB rejects
+            // (whole batch on v2): keep the global tag, rename the label.
+            let mut tags: Vec<(String, String)> = s
+                .tags
+                .iter()
+                .map(|(k, v)| if global.iter().any(|(g, _)| g == k) { (format!("label_{k}"), v.clone()) } else { (k.clone(), v.clone()) })
+                .collect();
             tags.extend(global.iter().cloned());
             let i = |v: u64| v.min(i64::MAX as u64) as i64;
             match &s.value {
@@ -375,7 +381,9 @@ pub fn build_request(s: &MetricsServer) -> PushRequest {
     }
 }
 
-async fn post(client: &reqwest::Client, req: &PushRequest, body: Vec<u8>, gzip: bool) -> bool {
+/// `Err` carries the HTTP status and the (trimmed) response body, or the
+/// transport error without its URL; neither holds a secret.
+async fn post(client: &reqwest::Client, req: &PushRequest, body: Vec<u8>, gzip: bool) -> Result<(), (Option<u16>, String)> {
     let mut rb = client.post(&req.url).query(&req.query).body(body);
     if gzip {
         rb = rb.header("Content-Encoding", "gzip");
@@ -385,7 +393,21 @@ async fn post(client: &reqwest::Client, req: &PushRequest, body: Vec<u8>, gzip: 
         Auth::Basic(u, p) => rb.basic_auth(u, Some(p)),
         Auth::Token(t) => rb.header("Authorization", format!("Token {t}")),
     };
-    matches!(rb.send().await, Ok(r) if r.status().is_success())
+    match rb.send().await {
+        Ok(r) if r.status().is_success() => Ok(()),
+        Ok(r) => {
+            let status = r.status();
+            let text = r.text().await.unwrap_or_default();
+            Err((Some(status.as_u16()), format!("HTTP {status}: {}", text.chars().take(200).collect::<String>())))
+        }
+        Err(e) => Err((None, e.without_url().to_string())),
+    }
+}
+
+/// A body the server refused as malformed or too large: retrying the same
+/// bytes can never succeed, so it is dropped instead of blocking the queue.
+fn rejected_for_good(status: Option<u16>) -> bool {
+    matches!(status, Some(400 | 413 | 422))
 }
 
 /// Largest uncompressed POST / PushMetrics body: queued batches are joined
@@ -591,7 +613,7 @@ pub fn spawn_pusher(cfg: MetricsConfig, proxy: Option<ProxySend>) -> Option<Arc<
                     let payload = if gz { gzip(body.as_bytes()) } else { body.as_bytes().to_vec() };
                     let res = match &dest {
                         Dest::Direct(client, reqs) => {
-                            if post(client, &reqs[i], payload, gz).await { Ok(()) } else { Err(String::new()) }
+                            post(client, &reqs[i], payload, gz).await
                         }
                         Dest::Proxy(send) => {
                             let len = payload.len() as u64;
@@ -599,16 +621,21 @@ pub fn spawn_pusher(cfg: MetricsConfig, proxy: Option<ProxySend>) -> Option<Arc<
                             if let (Ok(()), Some(c)) = (&r, &sent_bytes) {
                                 c.add(len);
                             }
-                            r
+                            r.map_err(|e| (None, e))
                         }
                     };
                     match res {
+                        Err((status, e)) if rejected_for_good(status) => {
+                            // dropped, not requeued: counted like a queue overflow
+                            ob.dropped[i].inc();
+                            tracing::warn!(server = %name, error = %e, "metrics batch rejected by the server, dropped");
+                        }
                         Ok(()) if failing[i] => {
                             failing[i] = false;
                             tracing::warn!(server = %name, "metrics push recovered");
                         }
                         Ok(()) => {}
-                        Err(e) => {
+                        Err((_, e)) => {
                             ob.requeue(i, body);
                             if !failing[i] {
                                 failing[i] = true;
@@ -711,6 +738,26 @@ mod tests {
             enc.encode(&s, &g, 9),
             "dtfs_c,role=manager value=7i 9\ndtfs_g,op=x,role=manager value=-1i 9\n"
         );
+    }
+
+    #[test]
+    fn label_named_like_a_global_tag_is_renamed_not_duplicated() {
+        let mut enc = Encoder::default();
+        let s = vec![Sample { name: "c".into(), tags: vec![("dc".into(), "toro".into())], value: Value::Counter(1) }];
+        let g = vec![("dc".to_string(), "leli".to_string())];
+        // InfluxDB: "duplicate tags" for `dc=toro,dc=leli`
+        assert_eq!(enc.encode(&s, &g, 9), "dtfs_c,dc=leli,label_dc=toro value=1i 9\n");
+    }
+
+    #[test]
+    fn only_malformed_body_statuses_are_dropped_not_retried() {
+        for s in [400, 413, 422] {
+            assert!(rejected_for_good(Some(s)), "{s}");
+        }
+        // auth, rate limit, server errors and transport errors are retried
+        for s in [Some(401), Some(403), Some(404), Some(429), Some(500), Some(503), None] {
+            assert!(!rejected_for_good(s), "{s:?}");
+        }
     }
 
     #[test]
