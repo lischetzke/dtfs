@@ -204,15 +204,18 @@ impl ReplicationManager {
         // REPLICATE_TIMEOUT_CEILING (270s). The pre-WI-04 value was a fixed
         // 120s, which the manager's fixed 60s outer deadline made dead code.
         let budget = dtfs_common::replication::replicate_transfer_timeout(total);
-        match tokio::time::timeout(budget, work).await {
+        let started = std::time::Instant::now();
+        let res = match tokio::time::timeout(budget, work).await {
             Ok(res) => res,
-            Err(_) => anyhow::bail!(
+            Err(_) => Err(anyhow::anyhow!(
                 "replication of chunk {} to {} timed out after {:?}",
                 chunk_hex,
                 target_addr,
                 budget,
-            ),
-        }
+            )),
+        };
+        crate::obs::peer(target_addr).record(started.elapsed(), total, res.is_ok());
+        res
     }
 }
 

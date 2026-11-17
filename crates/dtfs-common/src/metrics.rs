@@ -80,6 +80,9 @@ impl Histogram {
         self.sum.fetch_add(v, Relaxed);
         self.max.fetch_max(v, Relaxed);
     }
+    pub fn count(&self) -> u64 {
+        self.count.load(Relaxed)
+    }
     /// Records microseconds.
     pub fn observe_duration(&self, d: Duration) {
         self.observe(d.as_micros().min(u64::MAX as u128) as u64);

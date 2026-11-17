@@ -280,6 +280,7 @@ pub async fn run_grpc_server(
     // (default tonic cap is 4 MB).
     let max_message_bytes = dtfs_common::config::max_message_bytes(config.grpc.max_message_size_mb);
     builder
+        .layer(crate::obs::GrpcObsLayer)
         .add_service(
             DataServiceServer::new(service)
                 .max_decoding_message_size(max_message_bytes)
@@ -385,6 +386,21 @@ const GET_CHANNEL_DEPTH: usize = 2;
 
 use crate::store::hash_chunk_file_incrementally as hash_file_incrementally;
 
+/// Metric handles that travel with a GetChunk stream; dropping it (stream
+/// done or abandoned) counts the get out of the in-flight gauge.
+struct GetStats {
+    disk: Option<Arc<crate::obs::DiskObs>>,
+    started: std::time::Instant,
+    _inflight: crate::obs::Inflight,
+}
+
+#[cfg(test)]
+impl GetStats {
+    fn detached() -> Self {
+        Self { disk: None, started: std::time::Instant::now(), _inflight: crate::obs::Inflight::new(&Default::default()) }
+    }
+}
+
 /// U2 — stream an on-disk chunk file to the gRPC response channel in
 /// `GET_PIECE_SIZE` pieces, reading one piece at a time via `read_exact`.
 /// Mirrors `replication::replicate_to`'s feeder: only the channel depth
@@ -392,10 +408,12 @@ use crate::store::hash_chunk_file_incrementally as hash_file_incrementally;
 fn stream_file(
     dat_path: std::path::PathBuf,
     total_size: u64,
+    stats: GetStats,
 ) -> ReceiverStream<Result<GetChunkResponse, Status>> {
     use tokio::io::AsyncReadExt;
     let (tx, rx) = mpsc::channel(GET_CHANNEL_DEPTH);
     tokio::spawn(async move {
+        let stats = stats;
         let mut f = match tokio::fs::File::open(&dat_path).await {
             Ok(f) => f,
             Err(e) => {
@@ -414,21 +432,35 @@ fn stream_file(
             // One buffer per piece, sized to the piece and moved into the
             // response: no idle 8 MiB buffer for small chunks, no copy.
             let mut buf = vec![0u8; want];
+            let t = std::time::Instant::now();
             if let Err(e) = f.read_exact(&mut buf).await {
                 let _ = tx
                     .send(Err(Status::internal(format!("read chunk: {e}"))))
                     .await;
                 return;
             }
+            if let Some(o) = &stats.disk {
+                o.get_read_us.observe_duration(t.elapsed());
+            }
             let resp = GetChunkResponse {
                 data: buf,
                 offset,
                 total_size,
             };
+            let t = std::time::Instant::now();
             if tx.send(Ok(resp)).await.is_err() {
                 return;
             }
+            if let Some(o) = &stats.disk {
+                o.get_send_us.observe_duration(t.elapsed());
+            }
             offset += want as u64;
+        }
+        if let Some(o) = &stats.disk {
+            o.get_total_us.observe_duration(stats.started.elapsed());
+            o.get_chunk_bytes.observe(total_size);
+            o.get_bytes.add(total_size);
+            o.gets.inc();
         }
     });
     ReceiverStream::new(rx)
@@ -442,6 +474,11 @@ impl DataService for DataServiceImpl {
         &self,
         request: Request<Streaming<PutChunkRequest>>,
     ) -> Result<Response<PutChunkResponse>, Status> {
+        let node_obs = crate::obs::node();
+        let _inflight = crate::obs::Inflight::new(&node_obs.put_inflight);
+        let put_started = std::time::Instant::now();
+        // Block body keeps its original indentation to leave the diff small.
+        let put_result: Result<Response<PutChunkResponse>, Status> = async {
         // LIS-19 — authenticate before allocating a write slot / tmp.
         require_data_rpc_auth(
             &self.config.cluster.shared_secret,
@@ -478,6 +515,7 @@ impl DataService for DataServiceImpl {
                 cap_mb = self.memory.hard_cap_bytes() / 1024 / 1024,
                 "put_chunk rejected: memory budget shedding"
             );
+            node_obs.put_shed.inc();
             return Err(Status::resource_exhausted(
                 "data node over memory shed threshold (Bug G) — retry shortly",
             ));
@@ -486,12 +524,14 @@ impl DataService for DataServiceImpl {
         // streaming-to-disk (Bug I) each slot only buffers one
         // STREAM_PIECE_SIZE worth of bytes in memory (~1 MB), so 8 slots
         // = ~8 MB peak instead of the legacy ~1 GB.
+        let slot_started = std::time::Instant::now();
         let _slot = self
             .write_slots
             .clone()
             .acquire_owned()
             .await
             .map_err(|e| Status::internal(format!("put_chunk slot acquire: {e}")))?;
+        node_obs.put_slot_wait_us.observe_duration(slot_started.elapsed());
 
         // Bug I — stream the incoming gRPC pieces straight to a tmp
         // file on the target disk, hashing incrementally. We do NOT
@@ -499,6 +539,10 @@ impl DataService for DataServiceImpl {
         let mut stream = request.into_inner();
 
         // Pull the first piece to learn the requested volume_id + tier.
+        let mut recv_time = std::time::Duration::ZERO;
+        let mut tmp_write_time = std::time::Duration::ZERO;
+        let mut hash_time = std::time::Duration::ZERO;
+        let recv_started = std::time::Instant::now();
         let first = match next_put_piece(&mut stream).await? {
             Some(m) => m,
             None => {
@@ -507,6 +551,7 @@ impl DataService for DataServiceImpl {
                 ));
             }
         };
+        recv_time += recv_started.elapsed();
 
         let tier = match first.tier.as_str() {
             "hot" => DiskTier::Hot,
@@ -527,6 +572,7 @@ impl DataService for DataServiceImpl {
             .await
             .map_err(|e| Status::internal(format!("allocate tmp: {e}")))?
             .map_err(alloc_tmp_status)?;
+        let disk_obs = self.store.obs_for_mount(&disk_mount).cloned();
 
         // Bug BU-6 — guarantee the streaming tmp is removed on ANY early
         // return below (write/flush ENOSPC, stream error). A failed put
@@ -549,26 +595,39 @@ impl DataService for DataServiceImpl {
                 .map_err(|e| io_status(&format!("create tmp {}", tmp_path.display()), e))?;
             // First piece (already consumed from the stream).
             if !first.data.is_empty() {
+                let t = std::time::Instant::now();
                 hasher.update(&first.data);
+                hash_time += t.elapsed();
                 total_size += first.data.len() as u64;
+                let t = std::time::Instant::now();
                 tokio::io::AsyncWriteExt::write_all(&mut f, &first.data)
                     .await
                     .map_err(|e| io_status("write tmp", e))?;
+                tmp_write_time += t.elapsed();
             }
             // Remaining pieces.
-            while let Some(msg) = next_put_piece(&mut stream).await? {
+            loop {
+                let t = std::time::Instant::now();
+                let Some(msg) = next_put_piece(&mut stream).await? else { break };
+                recv_time += t.elapsed();
                 if msg.data.is_empty() {
                     continue;
                 }
+                let t = std::time::Instant::now();
                 hasher.update(&msg.data);
+                hash_time += t.elapsed();
                 total_size += msg.data.len() as u64;
+                let t = std::time::Instant::now();
                 tokio::io::AsyncWriteExt::write_all(&mut f, &msg.data)
                     .await
                     .map_err(|e| io_status("write tmp", e))?;
+                tmp_write_time += t.elapsed();
             }
+            let t = std::time::Instant::now();
             tokio::io::AsyncWriteExt::flush(&mut f)
                 .await
                 .map_err(|e| io_status("flush tmp", e))?;
+            tmp_write_time += t.elapsed();
             // fsync is done implicitly by commit_chunk_from_tmp before
             // the rename to the final path; we can save the duplicate
             // sync_all on the tmp.
@@ -618,6 +677,13 @@ impl DataService for DataServiceImpl {
         // and the dashboard "↑ Write" showed 0 B/s under any load.
         self.metrics.record_write(total_size);
 
+        if let Some(o) = &disk_obs {
+            o.put_recv_us.observe_duration(recv_time);
+            o.put_tmp_write_us.observe_duration(tmp_write_time);
+            o.put_hash_us.observe_duration(hash_time);
+            o.put_total_us.observe_duration(put_started.elapsed());
+        }
+
         Ok(Response::new(PutChunkResponse {
             chunk_id: computed_hex,
             size: meta.size,
@@ -625,6 +691,12 @@ impl DataService for DataServiceImpl {
             success: true,
             disk_id,
         }))
+        }
+        .await;
+        if let Err(s) = &put_result {
+            node_obs.put_rejects.inc(s.code());
+        }
+        put_result
     }
 
     /// Bug BC-6 — enumerate the chunk_ids this data node holds, one page
@@ -732,6 +804,9 @@ impl DataService for DataServiceImpl {
             &md,
         )?;
 
+        let get_started = std::time::Instant::now();
+        let get_inflight = crate::obs::Inflight::new(&crate::obs::node().get_inflight);
+
         // CR-4-7 (DATA-10) — ChunkId::from_hex byte-slices by hex-digit
         // PAIR, not by raw string index, so a non-ASCII chunk_id (e.g. one
         // containing a multi-byte UTF-8 char) is rejected as invalid_argument
@@ -763,6 +838,7 @@ impl DataService for DataServiceImpl {
         // digest mismatch) and the next disk's copy tried.
         let mut err = Status::not_found(format!("chunk not found: {}", req.chunk_id));
         for (disk_mount, dat_path, total_size) in self.store.chunk_copies(&chunk_id).await {
+            let dobs = self.store.obs_for_mount(&disk_mount).cloned();
             // Bug BC-8 — verify_on_read. When the cluster integrity knob is
             // enabled (default true), BLAKE3-hash the on-disk chunk against
             // the stored ChunkMeta.checksum BEFORE any bytes leave this
@@ -789,7 +865,8 @@ impl DataService for DataServiceImpl {
                         tracing::warn!(chunk_id = %req.chunk_id, "verify_on_read: .meta missing or unreadable; .dat matches its id, .meta rebuilt");
                         self.metrics.record_read(total_size);
                         self.store.note_read_on_mount(&disk_mount, &chunk_id, now_ms, req.scanner, total_size);
-                        return Ok(Response::new(stream_file(dat_path, total_size)));
+                        let stats = GetStats { disk: dobs, started: get_started, _inflight: get_inflight };
+                        return Ok(Response::new(stream_file(dat_path, total_size, stats)));
                     }
                     // Item 10: try the remaining copies before giving up. Only a
                     // confirmed digest mismatch quarantines (disk-keyed report);
@@ -799,6 +876,9 @@ impl DataService for DataServiceImpl {
                         if self.store.confirm_and_quarantine(&disk_mount, &chunk_id.as_hex(), false).await {
                             tracing::error!(chunk_id = %req.chunk_id, disk = %disk_mount.display(), "verify_on_read: .meta absent and .dat does not hash to its id; copy quarantined");
                             err = Status::data_loss(format!("verify_on_read mismatch on chunk {}", req.chunk_id));
+                            if let Some(o) = &dobs {
+                                o.get_data_loss.inc();
+                            }
                         } else if tokio::fs::try_exists(&dat_path).await.unwrap_or(true) {
                             tracing::error!(chunk_id = %req.chunk_id, disk = %disk_mount.display(), "verify_on_read: .meta absent and copy unreadable; trying next disk");
                             err = Status::internal(format!("verify_on_read: copy of chunk {} unreadable", req.chunk_id));
@@ -806,7 +886,12 @@ impl DataService for DataServiceImpl {
                         continue;
                     }
                 };
-                let actual = match hash_file_incrementally(&dat_path, total_size).await {
+                let verify_started = std::time::Instant::now();
+                let hashed = hash_file_incrementally(&dat_path, total_size).await;
+                if let Some(o) = &dobs {
+                    o.get_verify_us.observe_duration(verify_started.elapsed());
+                }
+                let actual = match hashed {
                     Ok(a) => a,
                     Err(e) => {
                         // A read error is not corruption: no quarantine (scrub decides).
@@ -832,6 +917,9 @@ impl DataService for DataServiceImpl {
                     err = Status::data_loss(format!(
                         "verify_on_read mismatch on chunk {}", req.chunk_id
                     ));
+                    if let Some(o) = &dobs {
+                        o.get_data_loss.inc();
+                    }
                     continue;
                 }
             }
@@ -841,7 +929,11 @@ impl DataService for DataServiceImpl {
             self.metrics.record_read(total_size);
             self.store.note_read_on_mount(&disk_mount, &chunk_id, now_ms, req.scanner, total_size);
 
-            return Ok(Response::new(stream_file(dat_path, total_size)));
+            let stats = GetStats { disk: dobs, started: get_started, _inflight: get_inflight };
+            return Ok(Response::new(stream_file(dat_path, total_size, stats)));
+        }
+        if err.code() == tonic::Code::NotFound {
+            crate::obs::node().get_not_found.inc();
         }
         Err(err)
     }
@@ -1361,11 +1453,11 @@ max_io_percent = 10
         let tmp = tempfile::TempDir::new().unwrap();
         let p = tmp.path().join("x.dat");
         std::fs::write(&p, vec![5u8; GET_PIECE_SIZE + 3]).unwrap();
-        let pieces: Vec<_> = stream_file(p.clone(), GET_PIECE_SIZE as u64).collect().await;
+        let pieces: Vec<_> = stream_file(p.clone(), GET_PIECE_SIZE as u64, GetStats::detached()).collect().await;
         assert_eq!(pieces.len(), 1);
         let one = pieces[0].as_ref().unwrap();
         assert_eq!((one.data.len(), one.data.capacity()), (GET_PIECE_SIZE, GET_PIECE_SIZE));
-        let small: Vec<_> = stream_file(p, 3).collect().await;
+        let small: Vec<_> = stream_file(p, 3, GetStats::detached()).collect().await;
         let s = small[0].as_ref().unwrap();
         assert_eq!((s.data.len(), s.data.capacity(), small.len()), (3, 3, 1));
     }
@@ -1377,7 +1469,7 @@ max_io_percent = 10
         let tmp = tempfile::TempDir::new().unwrap();
         let p = tmp.path().join("x.dat");
         std::fs::write(&p, b"short").unwrap();
-        let items: Vec<_> = stream_file(p, 6).collect().await;
+        let items: Vec<_> = stream_file(p, 6, GetStats::detached()).collect().await;
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].as_ref().unwrap_err().code(), tonic::Code::Internal);
     }
@@ -2158,6 +2250,7 @@ max_io_percent = 10
         let addr = listener.local_addr().unwrap();
         tokio::spawn(
             tonic::transport::Server::builder()
+                .layer(crate::obs::GrpcObsLayer)
                 .add_service(DataServiceServer::new(svc))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
@@ -2206,6 +2299,33 @@ max_io_percent = 10
             store.get_chunk_meta(&ChunkId::from_hex(&wrong_id).unwrap()).await.is_err(),
             "no chunk committed under the (wrong) declared id either"
         );
+    }
+
+    /// #159 -- a rejected put bumps the reject counter and the gRPC layer's
+    /// error counter with the exact code; an accepted put records the
+    /// per-disk stage histograms and request counters.
+    #[tokio::test]
+    async fn put_metrics_count_reject_code_and_accepted_stages() {
+        use tonic::Code;
+        let node = crate::obs::node();
+        let grpc = crate::obs::method("PutChunk");
+        let (rej0, layer0, other0) = (node.put_rejects.get(Code::DataLoss), grpc.errors.get(Code::DataLoss), grpc.requests.get());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (result, _store) = run_put_chunk(tmp.path(), &"ab".repeat(32), b"metrics-bad-declared-id").await;
+        assert_eq!(result.expect_err("mismatch rejected").code(), Code::DataLoss);
+        assert!(node.put_rejects.get(Code::DataLoss) > rej0, "handler reject counter");
+        assert!(grpc.errors.get(Code::DataLoss) > layer0, "layer error counter");
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (result, store) = run_put_chunk(tmp.path(), "", b"metrics-good-put").await;
+        result.expect("accepted");
+        let o = store.disk_obs(0).unwrap();
+        for h in [&o.put_total_us, &o.put_recv_us, &o.put_tmp_write_us, &o.put_hash_us, &o.put_fsync_dat_us, &o.put_rename_us, &o.put_meta_us, &o.put_commit_us, &o.put_chunk_bytes] {
+            assert!(h.count() >= 1);
+        }
+        assert!(o.put_bytes.get() >= b"metrics-good-put".len() as u64);
+        assert!(grpc.requests.get() >= other0 + 2, "layer counted both requests");
     }
 
     /// An empty declared `chunk_id` is the documented back-compat case

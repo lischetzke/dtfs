@@ -9,6 +9,7 @@ mod integrity;
 mod last_read;
 mod memory;
 mod metrics;
+mod obs;
 mod replication;
 mod scrub;
 mod server;
@@ -278,6 +279,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         mon.run_monitor().await;
     });
+    tokio::spawn(obs::run_gauge_sampler(chunk_store.clone(), memory.clone()));
 
     // Bug U — graceful shutdown wiring.
     //
@@ -793,13 +795,11 @@ async fn manager_lifecycle(
             &node_id,
             heartbeat,
         );
-        match client
-            .heartbeat(heartbeat_req)
-            .await
-        {
+        match obs::timed_heartbeat(client.heartbeat(heartbeat_req)).await {
             Ok(resp) => {
                 let resp = resp.into_inner();
                 if !resp.accepted {
+                    obs::node().heartbeat_rejected.inc();
                     tracing::warn!("Manager rejected heartbeat");
                     // Bug BF-5: rejection ≠ delivery confirmation;
                     // re-enqueue so the next tick retries the faults

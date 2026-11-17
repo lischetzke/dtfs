@@ -145,6 +145,8 @@ pub struct ChunkStore {
     /// Last-read index per disk (position = disk_id); `None` for a cold disk.
     // shortcut: cold and tape disks are not tracked (shipped configs keep cache tiers off them), track them if a volume ever caches there.
     last_read: Vec<Option<Arc<LastReadIndex>>>,
+    /// Metric handles per disk (position = disk_id), registered once here.
+    obs: Vec<Arc<crate::obs::DiskObs>>,
 }
 
 /// Bug BY — a completed scrub result queued for the next heartbeat. The
@@ -169,8 +171,14 @@ impl ChunkStore {
             .iter()
             .map(|d| (!matches!(d.tier, DiskTier::Cold | DiskTier::Tape)).then(|| Arc::new(LastReadIndex::new(&d.mount_path))))
             .collect();
+        let obs = disk_manager
+            .all_disks()
+            .iter()
+            .map(|d| Arc::new(crate::obs::DiskObs::new(d.disk_id, &d.tier.to_string())))
+            .collect();
         Self {
             last_read,
+            obs,
             disk_manager: Arc::new(disk_manager),
             chunk_count: Arc::new(AtomicU64::new(0)),
             bytes_stored: Arc::new(AtomicU64::new(0)),
@@ -178,6 +186,14 @@ impl ChunkStore {
             pending_scrub_results: Arc::new(parking_lot::Mutex::new(Vec::new())),
             chunk_locks: Arc::new((0..256).map(|_| tokio::sync::Mutex::new(())).collect()),
         }
+    }
+
+    pub fn disk_obs(&self, disk_id: u32) -> Option<&Arc<crate::obs::DiskObs>> {
+        self.obs.get(disk_id as usize)
+    }
+
+    pub fn obs_for_mount(&self, mount: &Path) -> Option<&Arc<crate::obs::DiskObs>> {
+        self.disk_obs(self.disk_id_for_path(mount)?)
     }
 
     fn last_read_for_mount(&self, mount: &Path) -> Option<&Arc<LastReadIndex>> {
@@ -554,6 +570,8 @@ impl ChunkStore {
             .clone();
         let disk_id = disk.disk_id;
         let _ = tier; // tier is informational here — disk is already chosen
+        let obs = self.disk_obs(disk_id);
+        let commit_started = std::time::Instant::now();
 
         let chunk_dir = chunk_data_dir(&disk.mount_path, chunk_id);
         let wal_dir_path = wal_dir(&disk.mount_path);
@@ -566,10 +584,14 @@ impl ChunkStore {
         // on a power loss after a successful gRPC response the chunk
         // metadata could be durable while the bytes were lost. Open
         // O_RDONLY here just to sync the data pages without re-buffering.
+        let fsync_started = std::time::Instant::now();
         {
             let f = fs::File::open(tmp_path).await.map_err(DtfsError::Io)?;
             note_sync();
             f.sync_all().await.map_err(DtfsError::Io)?;
+        }
+        if let Some(o) = obs {
+            o.put_fsync_dat_us.observe_duration(fsync_started.elapsed());
         }
 
         let final_dat_path = chunk_dir.join(format!("{}.dat", chunk_id.as_hex()));
@@ -607,9 +629,13 @@ impl ChunkStore {
         write_wal_entry(&wal_path, &wal_entry).await?;
 
         // 2. Atomic rename tmp → final.
+        let rename_started = std::time::Instant::now();
         fs::rename(tmp_path, &final_dat_path)
             .await
             .map_err(DtfsError::Io)?;
+        if let Some(o) = obs {
+            o.put_rename_us.observe_duration(rename_started.elapsed());
+        }
 
         // Stamp mtime = commit time (rename keeps the tmp's last-write
         // mtime) so the manager's `if_mtime_le_ms` delete guard always sees
@@ -655,10 +681,14 @@ impl ChunkStore {
         // before it leaves any subset of the two renames: put-WAL replay
         // repairs/rolls back a .dat without .meta and drops a .meta
         // without .dat.
+        let meta_started = std::time::Instant::now();
         let meta_written = match write_meta_atomic_no_dir_sync(&disk.mount_path, &final_meta_path, &meta_json).await {
             Ok(()) => fsync_dir(&chunk_dir).await,
             Err(e) => Err(e),
         };
+        if let Some(o) = obs {
+            o.put_meta_us.observe_duration(meta_started.elapsed());
+        }
         if let Err(e) = meta_written {
             // CR-4-3 (DATA-4) — the `.dat` is already committed (renamed)
             // at this point; a failure writing its `.meta` companion must
@@ -683,6 +713,13 @@ impl ChunkStore {
         if !already_present {
             self.chunk_count.fetch_add(1, Ordering::Relaxed);
             self.bytes_stored.fetch_add(size, Ordering::Relaxed);
+        }
+
+        if let Some(o) = obs {
+            o.put_commit_us.observe_duration(commit_started.elapsed());
+            o.put_chunk_bytes.observe(size);
+            o.put_bytes.add(size);
+            o.puts.inc();
         }
 
         tracing::debug!(
@@ -1057,8 +1094,13 @@ impl ChunkStore {
         tracing::warn!(chunk = %chunk_hex, disk = %disk_path.display(), "scrub quarantining corrupt chunk (inline, under chunk lock)");
         if let Err(e) = quarantine_chunk_on_disk(disk_path, chunk_hex).await {
             tracing::warn!(chunk = %chunk_hex, error = %e, "quarantine failed (non-fatal; entry still reported)");
-        } else if let Some(ix) = self.last_read_for_mount(disk_path) {
-            ix.remove(&id.0);
+        } else {
+            if let Some(o) = self.obs_for_mount(disk_path) {
+                o.quarantines.inc();
+            }
+            if let Some(ix) = self.last_read_for_mount(disk_path) {
+                ix.remove(&id.0);
+            }
         }
         self.enqueue_pending_corruption([(chunk_hex.to_string(), self.disk_id_for_path(disk_path))]);
         true
@@ -1430,6 +1472,8 @@ impl ChunkStore {
             chunks_meta_repaired: 0,
         };
         let mut skipped_in_flight: u64 = 0;
+        let sobs = self.obs_for_mount(disk_path);
+        let mut scanned_bytes: u64 = 0;
 
         let start = std::time::Instant::now();
 
@@ -1481,6 +1525,9 @@ impl ChunkStore {
                     if let Some(t) = chunk_started.take() {
                         let d = crate::scrub::throttle_delay(t.elapsed(), max_io_percent);
                         if !d.is_zero() {
+                            if let Some(o) = sobs {
+                                o.scrub_throttle_us.add(d.as_micros().min(u64::MAX as u128) as u64);
+                            }
                             tokio::time::sleep(d).await;
                         }
                     }
@@ -1533,6 +1580,7 @@ impl ChunkStore {
                     };
 
                     result.chunks_checked += 1;
+                    scanned_bytes += file_meta.len();
 
                     let meta_path = path.with_extension("meta");
                     let chunk_meta_json = match fs::read_to_string(&meta_path).await {
@@ -1724,6 +1772,16 @@ impl ChunkStore {
                 "REV-4-4 scrub hit per-chunk/per-bucket failures; \
                  the disk pass completed"
             );
+        }
+
+        if let Some(o) = sobs {
+            o.scrub_chunks.add(result.chunks_checked);
+            o.scrub_bytes.add(scanned_bytes);
+            o.scrub_corrupt.add(result.chunks_corrupt);
+            o.scrub_missing.add(result.chunks_missing);
+            o.scrub_size_mismatch.add(result.chunks_size_mismatch);
+            o.scrub_meta_repaired.add(result.chunks_meta_repaired);
+            o.scrub_io_errors.add(io_errors);
         }
 
         result.duration_secs = start.elapsed().as_secs_f64();
@@ -2658,6 +2716,45 @@ mod tests {
         let fixed: ChunkMeta = serde_json::from_str(&std::fs::read_to_string(&mp).unwrap()).unwrap();
         assert_eq!(fixed.volume_id, VolumeId::new("default".to_string()));
         assert_eq!(fixed.replication_factor, 1);
+    }
+
+    /// #159 -- a store put records the commit stage histograms and bytes; a
+    /// deep scrub of a corrupted chunk counts scanned/corrupt/quarantined
+    /// (counters are process-global per disk label, so only deltas are checked).
+    #[tokio::test]
+    async fn put_and_scrub_feed_per_disk_metrics() {
+        let (store, _tmp) = make_test_store().await;
+        let disk = store.disk_paths()[0].clone();
+        let o = store.disk_obs(0).unwrap().clone();
+        let vol = VolumeId::new("default".to_string());
+        let data = b"metrics-put-and-scrub";
+        let id = ChunkId::from_bytes(checksum::compute(data));
+        let (fsync0, ren0, meta0, commit0) = (o.put_fsync_dat_us.count(), o.put_rename_us.count(), o.put_meta_us.count(), o.put_commit_us.count());
+        let (bytes0, puts0) = (o.put_bytes.get(), o.puts.get());
+        store.put_chunk(&id, data, &vol, DiskTier::Hot).await.unwrap();
+        assert!(o.put_fsync_dat_us.count() > fsync0 && o.put_rename_us.count() > ren0);
+        assert!(o.put_meta_us.count() > meta0 && o.put_commit_us.count() > commit0);
+        assert!(o.put_bytes.get() >= bytes0 + data.len() as u64 && o.puts.get() > puts0);
+
+        let (chk0, sb0, bad0, q0) = (o.scrub_chunks.get(), o.scrub_bytes.get(), o.scrub_corrupt.get(), o.quarantines.get());
+        std::fs::write(chunk_data_path(&disk, &id), b"metrics-put-and-scrXb").unwrap();
+        store.scrub_disk(&disk, ScrubLevel::Deep).await.unwrap();
+        assert!(o.scrub_chunks.get() > chk0 && o.scrub_bytes.get() > sb0);
+        assert!(o.scrub_corrupt.get() > bad0 && o.quarantines.get() > q0);
+    }
+
+    /// #159 -- the gauge sampler publishes this disk's capacity, with
+    /// free = total - used.
+    #[tokio::test]
+    async fn sample_gauges_publishes_disk_capacity() {
+        let (store, _tmp) = make_test_store().await;
+        let memory = crate::memory::MemoryBudget::from_config(&Default::default());
+        crate::obs::sample_gauges(&store, &memory);
+        let o = store.disk_obs(0).unwrap();
+        assert!(o.disk_total_bytes.get() > 0);
+        assert!(o.disk_free_bytes.get() <= o.disk_total_bytes.get());
+        assert_eq!(o.disk_failed.get(), 0);
+        assert!(store.disk_obs(99).is_none(), "unknown disk has no handles");
     }
 
     /// Bytes that do not hash to the chunk id are corrupt even when the
