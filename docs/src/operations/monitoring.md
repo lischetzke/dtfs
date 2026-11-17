@@ -93,6 +93,189 @@ absolute values. A node in `Maintenance` is counted in none of the node gauges.
 Anything else (Raft lag, per-disk usage, scrub results) comes from the REST
 endpoints above or `GET /api/v1/stats`.
 
+## InfluxDB push and dashboards
+
+The Prometheus section above is unchanged. Separately, every role (manager, data node,
+FUSE client) can push its own internal metrics to InfluxDB v1 or v2 as line protocol,
+which is what the dashboards in `deploy/grafana/` read.
+
+### Enable
+
+Add a `[metrics]` block with one or more `[[metrics.servers]]` to `manager.toml`,
+`data.toml` and `fuse.toml`. Without a server nothing is pushed. Keys and defaults:
+[Manager `[metrics]`](../configuration/manager.md#metrics-optional) (the data node and
+FUSE pages point there). The push carries the global tags `role` (`manager`, `data`,
+`fuse`), `node` (`[node].hostname`, for FUSE `[location].host`) and `dc`.
+
+### Line protocol
+
+- Measurement `dtfs_<name>`; tags are `role`, `node`, `dc` plus the metric's own labels
+  (tags with an empty value are omitted).
+- Counters and gauges have one integer field `value`. Counters are cumulative since
+  process start: rate them (InfluxQL `non_negative_derivative(..., 1s)`, Flux
+  `derivative(nonNegative: true)`), so a restart does not show as a negative spike.
+- Histograms have the cumulative fields `count` and `sum` (microseconds for `*_us`) and
+  the per-push-interval fields `p50`, `p90`, `p99`, `max`. The quantiles are power-of-two
+  bucket upper bounds clamped to the interval maximum (a few tens of percent coarse), and
+  are absent for an interval with no observation.
+
+### Import the dashboards
+
+Two sets with the same five dashboards, panels and variables (`dc`, `node`, `disk`):
+
+| Folder | Query language | Grafana datasource |
+|---|---|---|
+| `deploy/grafana/influxdb-v1/` | InfluxQL | InfluxDB, query language InfluxQL (InfluxDB v1) |
+| `deploy/grafana/influxdb-v2/` | Flux | InfluxDB, query language Flux (InfluxDB v2); pick the bucket in the `bucket` variable |
+
+In Grafana: Dashboards, New, Import, upload the JSON files of one folder, and choose the
+datasource in the `DS` variable at the top of each dashboard. Dashboards: `write-path`
+(FUSE write, PutChunk, client allocate/commit, data-node put stages, Raft log fsync, to
+answer whether the Raft fsync is the write bottleneck), `read-path`, `raft-manager`,
+`data-node` (per disk) and `memory-health`. The files use dashboard schema version 41
+(the `DASHBOARD_SCHEMA_VERSION` of Grafana 11.6). `tests/grafana_dashboards.rs` in
+`dtfs-common` fails when a dashboard queries a measurement that no crate registers, or
+when the two sets drift apart.
+
+### Overhead model
+
+The hot path only does relaxed atomic adds (counter, gauge, one histogram bucket); no
+locks, allocation or I/O. Handles are registered once and cached. Label values are
+bounded: fixed enums (FUSE ops, errnos, gRPC and REST route names from allowlists,
+anything else is `other`) or capped sets (FUSE tier/DC pairs, replication peers, forward
+ops) that fold into `other` past the cap. Encoding and the HTTP push run on a background
+task every `push_interval_secs`. A failing server gets a per-server FIFO capped at
+`buffer_max_kb`; the oldest batches are dropped first and counted in
+`dtfs_metrics_dropped_batches{server}`. Nothing ever blocks a request.
+
+### Metric catalogue
+
+Measurement = `dtfs_` + name. C = counter, G = gauge, H = histogram. Every series also
+carries `role`, `node`, `dc`. The manager's Raft, state-machine and memory gauges are
+sampled every 5 s.
+
+**All roles**
+
+| Name | Type | Labels | Meaning |
+|---|---|---|---|
+| `metrics_dropped_batches` | C | `server` | Batches dropped from a full retry queue |
+
+**Manager**
+
+| Name | Type | Labels | Meaning |
+|---|---|---|---|
+| `raft_log_write_us` | H | | Raft log append plus fsync |
+| `raft_append_entries` | H | | Entries per log append |
+| `raft_append_bytes` | H | | Bytes per log append |
+| `raft_vote_write_us` | H | | Vote persistence |
+| `raft_apply_us` | H | | State-machine apply of one log entry (the leader's response wait excluded) |
+| `raft_client_write_us` | H | | `client_write` on the local Raft: proposal to applied (leader wait excluded) |
+| `raft_write_or_forward_us` | H | | Write served locally or forwarded to the leader |
+| `raft_forward_us` | H | | Forward round trip (follower side) |
+| `raft_forward_failed` | C | | Failed forwards |
+| `raft_forward_received` | C | | Forwarded writes received (leader side) |
+| `raft_forwarded` | C | `op` | Forwards by ClientRequest variant |
+| `raft_current_term`, `raft_last_log_index`, `raft_last_applied`, `raft_snapshot_index` | G | | Raft positions |
+| `raft_apply_lag` | G | | `last_log_index - last_applied` of this manager |
+| `raft_is_leader`, `raft_has_leader` | G | | 1/0 |
+| `raft_leader_changes` | C | | Leader changes seen by this manager |
+| `grpc_server_requests`, `grpc_server_errors` | C | `method` (+`code` on errors) | ManagerService / Raft transport calls |
+| `grpc_server_us` | H | `method` | gRPC handler latency |
+| `grpc_server_inflight` | G | `method` | In-flight calls |
+| `rest_requests` | C | `route`, `status` (`2xx`..) | REST requests |
+| `rest_us` | H | `route` | REST latency |
+| `write_alloc_chunks`, `write_commit_chunks` | H | | Chunks per allocate / commit call |
+| `write_alloc_rejects`, `write_commit_rejects` | C | `reason` | Rejected allocations / commits |
+| `write_lease_granted`, `write_lease_denied` | C | | Write leases |
+| `scheduler_tasks_created` | C | `kind` | Repair/replication/anchor-lag tasks created |
+| `scheduler_tasks_finished` | C | `status` (`done`, `failed`) | Finished tasks |
+| `scheduler_replication_outcomes` | C | `outcome` | Replication scheduling outcomes |
+| `scheduler_tick_us` | H | | Scheduler tick |
+| `scheduler_repair_budget_hits` | C | | Repair budget exhausted |
+| `tiering_tick_us`, `precache_tick_us`, `tiering_capacity_evict_tick_us`, `tiering_retention_tick_us` | H | | Tiering planners |
+| `tiering_promote_copies`, `precache_copies` | C | `dc` | Cache copies scheduled by planner |
+| `precache_scheduled_bytes` | C | | Bytes scheduled by pre-cache |
+| `cache_fill_commits`, `cache_fill_bytes` | C | `dc` | Fill-on-read registrations |
+| `cache_removed` | C | `reason` | Cache copies removed |
+| `orphan_reap_runs` | C | `result` | Orphan reap runs |
+| `orphan_reap_candidates`, `orphan_reap_chunks`, `orphan_reap_freed_bytes` | C | | Reaper totals |
+| `orphan_reap_us` | H | | Reap run duration |
+| `monitor_node_transitions` | C | `to` | Node health transitions |
+| `sm_files`, `sm_nodes` | G | | State-machine sizes |
+| `sm_nodes_by_health` | G | `health` | Nodes per health state |
+| `memory_rss_bytes`, `memory_hard_cap_bytes`, `memory_warn_bytes`, `memory_shed_bytes` | G | | RSS and ladder thresholds |
+| `memory_pressure_level` | G | | 0 normal, 1 warn, 2 shed |
+
+**Data node**
+
+| Name | Type | Labels | Meaning |
+|---|---|---|---|
+| `data_put_total_us` | H | `disk`, `tier` | PutChunk, whole call |
+| `data_put_recv_us`, `data_put_tmp_write_us`, `data_put_hash_us`, `data_put_fsync_dat_us`, `data_put_rename_us`, `data_put_meta_us`, `data_put_commit_us` | H | `disk`, `tier` | Put stages |
+| `data_put_chunk_bytes`, `data_get_chunk_bytes` | H | `disk`, `tier` | Chunk sizes |
+| `data_put_bytes_total`, `data_puts_total` | C | `disk`, `tier` | Bytes and count stored |
+| `data_get_read_us`, `data_get_send_us`, `data_get_verify_us`, `data_get_total_us` | H | `disk`, `tier` | Get stages and total |
+| `data_get_bytes_total`, `data_gets_total` | C | `disk`, `tier` | Bytes and count served |
+| `data_get_data_loss_total` | C | `disk`, `tier` | Reads that failed verification |
+| `data_scrub_chunks_total`, `data_scrub_bytes_total`, `data_scrub_throttle_us_total` | C | `disk`, `tier` | Scrub progress, time spent throttled |
+| `data_scrub_corrupt_total`, `data_scrub_missing_total`, `data_scrub_size_mismatch_total`, `data_scrub_meta_repaired_total`, `data_scrub_io_errors_total` | C | `disk`, `tier` | Scrub findings |
+| `data_quarantines_total` | C | `disk`, `tier` | Chunks quarantined |
+| `data_disk_total_bytes`, `data_disk_used_bytes`, `data_disk_free_bytes`, `data_disk_failed` | G | `disk`, `tier` | Disk capacity, failed flag |
+| `data_put_inflight`, `data_get_inflight` | G | | In-flight RPCs |
+| `data_put_slot_wait_us` | H | | Wait for a put slot |
+| `data_put_shed_total` | C | | Puts shed under memory pressure |
+| `data_put_rejects_total` | C | `method`, `code` | Rejected puts by gRPC code |
+| `data_get_not_found_total` | C | | Gets for an unknown chunk |
+| `data_heartbeat_us` | H | | Heartbeat to the manager |
+| `data_heartbeat_failures_total`, `data_heartbeat_rejected_total` | C | | Heartbeat failures / refusals |
+| `data_mem_rss_bytes`, `data_mem_cap_bytes`, `data_mem_pressure_level` | G | | RSS, cap, 0/1/2 pressure |
+| `data_store_chunks`, `data_store_bytes` | G | | Store totals |
+| `data_replicate_out_bytes_total`, `data_replicate_out_total`, `data_replicate_out_failures_total` | C | `peer` | Outgoing replication |
+| `data_replicate_out_us` | H | `peer` | Outgoing replication latency |
+| `data_grpc_requests_total` | C | `method` | gRPC requests |
+| `data_grpc_latency_us` | H | `method` | gRPC latency |
+| `data_grpc_inflight` | G | `method` | In-flight gRPC calls |
+
+**FUSE client** (`role=fuse`; the client library metrics are pushed by the same process)
+
+| Name | Type | Labels | Meaning |
+|---|---|---|---|
+| `fuse_op_us` | H | `op` | Latency per FUSE op |
+| `fuse_op_errors` | C | `op`, `errno` | Failed ops (`other` for unlisted errnos) |
+| `fuse_meta_cache_hits`, `fuse_meta_cache_misses` | C | | Metadata cache |
+| `fuse_meta_cache_entries` | G | | Metadata cache size |
+| `fuse_chunk_cache_hits`, `fuse_chunk_cache_hit_bytes` | C | `layer` (`readahead`, `disk`) | Chunk cache hits |
+| `fuse_chunk_cache_misses` | C | | Chunk cache misses |
+| `fuse_readahead_issued`, `fuse_readahead_failed`, `fuse_readahead_bytes` | C | | Readahead activity |
+| `fuse_readahead_get_us` | H | | Readahead GetChunk latency |
+| `fuse_readahead_evicted_bytes` | C | `reason` (`budget`, `drop`) | Readahead bytes discarded |
+| `fuse_readahead_cache_bytes`, `fuse_readahead_budget_bytes`, `fuse_readahead_pending` | G | | Readahead cache state |
+| `fuse_readahead_mode` | G | `mode` | Current readahead mode (1) |
+| `fuse_readahead_window_chunks` | G | | Prefetch window |
+| `fuse_singleflight_merges` | C | `kind` | Reads merged onto an in-flight fetch |
+| `fuse_singleflight_owner_failed` | C | | Merged fetch whose owner failed |
+| `fuse_read_failovers` | C | `reason` (`integrity`, `timeout`, `error`) | Replica failovers |
+| `fuse_read_verify_failures` | C | | Client-side BLAKE3 mismatches |
+| `fuse_get_chunk_us`, `fuse_put_chunk_us` | H | `tier`, `dc` | Chunk transfer latency |
+| `fuse_get_chunk_bytes`, `fuse_put_chunk_bytes` | C | `tier`, `dc` | Chunk transfer bytes |
+| `fuse_get_chunk_failures`, `fuse_put_chunk_failures` | C | `tier`, `dc` | Chunk transfer failures |
+| `fuse_read_replica_chosen` | C | `tier`, `dc` | Replica selection |
+| `fuse_disk_cache_bytes`, `fuse_disk_cache_max_bytes` | G | | Disk cache size and bound |
+| `fuse_write_buffered_bytes`, `fuse_write_dirty_cap_bytes` | G | | Write buffer and its cap |
+| `fuse_write_cap_waits` | C | | Writers blocked at the dirty cap |
+| `fuse_write_cap_wait_us` | H | | Time blocked at the dirty cap |
+| `fuse_async_inflight_batches` | G | | Background upload batches |
+| `fuse_async_batch_commit_us` | H | | Background batch commit |
+| `fuse_commits` | C | `trigger` (`batch_full`, `timer`, `dirty_cap`, `close`) | Commits by trigger |
+| `fuse_cache_fill_issued`, `fuse_cache_fill_failed` | C | | Fill-on-read |
+| `fuse_put_ladder_retries` | C | | PutChunk target ladder retries |
+| `client_allocate_chunks_us`, `client_commit_chunk_locations_us` | H | | Manager calls from the client |
+| `client_allocate_chunks_failures`, `client_commit_chunk_locations_failures` | C | | Their failures |
+| `client_put_chunk_retries` | C | | PutChunk retries |
+
+The FUSE client exports no RSS or memory-pressure gauge; the `memory-health` dashboard
+shows its cache sizes against their bounds instead.
+
 ## Node Health Monitoring
 
 The manager tracks data node health through periodic heartbeats:
