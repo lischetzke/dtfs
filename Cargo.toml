@@ -77,6 +77,8 @@ sha2 = "0.10"
 tokio-stream = "0.1"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Issue #159 — gzip of metrics bodies (pure-Rust miniz_oxide backend).
+flate2 = "1.1.11"
 
 # Internal crates
 dtfs-common = { path = "crates/dtfs-common" }

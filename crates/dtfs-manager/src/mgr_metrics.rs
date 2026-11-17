@@ -45,12 +45,12 @@ impl<T> Cached<T> {
 /// `ManagerService` methods of proto/manager.proto. The label is always one
 /// of these (or `RaftRpc` / `other`), never text from the request: the layer
 /// runs before auth, so a caller must not be able to mint label values.
-const KNOWN_METHODS: [&str; 21] = [
+const KNOWN_METHODS: [&str; 22] = [
     "CreateFile", "GetFileLocations", "DeleteFile", "ListDirectory", "AllocateChunks",
     "CommitChunkLocations", "RenameFile", "SetFileSize", "CreateSymlink", "ReadSymlink",
     "CreateLink", "ClusterCapacity", "AcquireWriteLease", "RenewWriteLease",
     "ReleaseWriteLease", "ReleaseLeasesByHost", "RegisterNode", "Heartbeat",
-    "ReportChunkStatus", "ForwardClientWrite", "CommitCacheFill",
+    "ReportChunkStatus", "ForwardClientWrite", "CommitCacheFill", "PushMetrics",
 ];
 
 /// `"/dtfs.manager.ManagerService/CreateFile"` -> `"CreateFile"`; the Raft

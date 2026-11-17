@@ -2402,3 +2402,104 @@ mod issue_144_read_report_buffer_tests {
         assert_eq!(engine.precache_activity_len_for_test(), 1, "released by the poll and fed to the engine");
     }
 }
+
+/// Issue #159 — PushMetrics handler on a manager that is not leader (the
+/// harness Raft is uninitialised): no Raft write is involved.
+#[cfg(test)]
+mod push_metrics_tests {
+    use super::*;
+    use dtfs_common::metrics::{counter, gzip, proxy_binding, Outbox};
+    use tonic::Code;
+
+    const SECRET: &str = "s3cret";
+
+    async fn service(secret: &str, outbox: Option<Arc<Outbox>>) -> (crate::api::test_support::Harness, MetadataService) {
+        let h = crate::api::test_support::harness().await;
+        let mut config = h.state.config.clone();
+        config.cluster.shared_secret = secret.to_string();
+        let svc = MetadataService::new(
+            config,
+            h.state.raft.clone(),
+            h.state.sm_data.clone(),
+            Arc::new(crate::placement::PlacementEngine::default()),
+            dtfs_common::tls::TlsContext::plaintext(),
+        )
+        .with_metrics_outbox(outbox);
+        (h, svc)
+    }
+
+    fn req(payload: &[u8], encoding: &str, mac_binding: Option<&str>) -> Request<PushMetricsRequest> {
+        let mut r = Request::new(PushMetricsRequest { payload: payload.to_vec(), encoding: encoding.into() });
+        if let Some(b) = mac_binding {
+            let (ts, mac) = dtfs_common::crypto::stamp_mgr_rpc_auth(SECRET, "PushMetrics", b).unwrap();
+            r.metadata_mut().insert(dtfs_common::crypto::DATA_RPC_AUTH_TS, ts.parse().unwrap());
+            r.metadata_mut().insert(dtfs_common::crypto::DATA_RPC_AUTH_MAC, mac.parse().unwrap());
+        }
+        r
+    }
+
+    fn rejected(reason: &str) -> u64 {
+        counter("metrics_proxy_rejected", &[("reason", reason)]).get()
+    }
+
+    #[tokio::test]
+    async fn good_gzip_batch_is_queued_and_counted() {
+        let ob = Arc::new(Outbox::new(&["t_pm_a", "t_pm_b"], 1 << 20));
+        let (_h, svc) = service(SECRET, Some(ob.clone())).await;
+        let body = "dtfs_x,role=data value=1i 1\ndtfs_y value=2i 1\n";
+        let z = gzip(body.as_bytes());
+        let before = counter("metrics_proxy_received_batches", &[]).get();
+        let bytes_before = counter("metrics_proxy_received_bytes", &[]).get();
+        svc.push_metrics(req(&z, "gzip", Some(&proxy_binding(&z)))).await.unwrap();
+        assert_eq!(counter("metrics_proxy_received_batches", &[]).get(), before + 1);
+        assert_eq!(counter("metrics_proxy_received_bytes", &[]).get(), bytes_before + z.len() as u64);
+        for i in 0..2 {
+            assert_eq!(ob.take_body(i).unwrap(), body, "queued for every server");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_wrong_mac_refused() {
+        let ob = Arc::new(Outbox::new(&["t_pm_auth"], 1 << 20));
+        let (_h, svc) = service(SECRET, Some(ob.clone())).await;
+        let p = b"dtfs_x value=1i 1\n";
+        let before = rejected("auth");
+        let e = svc.push_metrics(req(p, "", None)).await.unwrap_err();
+        assert_eq!(e.code(), Code::PermissionDenied, "missing MAC");
+        let mut r = req(p, "", Some(&proxy_binding(p)));
+        r.metadata_mut().insert(dtfs_common::crypto::DATA_RPC_AUTH_MAC, "00".repeat(32).parse().unwrap());
+        assert_eq!(svc.push_metrics(r).await.unwrap_err().code(), Code::PermissionDenied, "wrong MAC");
+        let other = proxy_binding(b"dtfs_x value=2i 1\n");
+        let e = svc.push_metrics(req(p, "", Some(&other))).await.unwrap_err();
+        assert_eq!(e.code(), Code::PermissionDenied, "MAC bound to another payload");
+        assert!(rejected("auth") >= before + 3);
+        assert!(ob.take_body(0).is_none(), "nothing queued");
+    }
+
+    #[tokio::test]
+    async fn no_servers_is_failed_precondition() {
+        let (_h, svc) = service("", None).await;
+        let before = rejected("no_servers");
+        let e = svc.push_metrics(req(b"dtfs_x value=1i 1\n", "", None)).await.unwrap_err();
+        assert_eq!(e.code(), Code::FailedPrecondition);
+        assert!(rejected("no_servers") > before);
+    }
+
+    #[tokio::test]
+    async fn bad_payloads_are_invalid_argument() {
+        let ob = Arc::new(Outbox::new(&["t_pm_bad"], 1 << 20));
+        let (_h, svc) = service("", Some(ob.clone())).await;
+        let big = gzip(&vec![b'a'; dtfs_common::metrics::MAX_PROXY_DECODED_BYTES + 1]);
+        for (p, enc, reason) in [
+            (b"dtfs_x value=1i 1\n".to_vec(), "br", "bad_encoding"),
+            (big, "gzip", "too_large"),
+            (b"dtfs_x value=1i 1\ncpu value=1i 1\n".to_vec(), "", "bad_line"),
+        ] {
+            let before = rejected(reason);
+            let e = svc.push_metrics(req(&p, enc, None)).await.unwrap_err();
+            assert_eq!(e.code(), Code::InvalidArgument, "{reason}");
+            assert!(rejected(reason) > before, "{reason}");
+        }
+        assert!(ob.take_body(0).is_none(), "a rejected batch queues nothing");
+    }
+}

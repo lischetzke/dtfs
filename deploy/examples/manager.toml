@@ -218,7 +218,13 @@ listen_addr = "0.0.0.0:9401"        # metadata gRPC for data nodes + clients
 #[metrics]
 #push_interval_secs = 10
 #timeout_secs = 5
-#buffer_max_kb = 1024               # per server, batches kept while it is down
+#buffer_max_kb = 1024               # per server, batches kept while it is down;
+#                                   # raise it when nodes proxy through this manager
+#mode = "direct"                    # a manager always pushes directly ("proxy" is refused)
+#flush_interval_secs = 0            # send every N s (>= push_interval_secs); 0 = every snapshot
+#compression = "none"               # "gzip": gzip the InfluxDB POST body
+# With at least one server, this manager also accepts PushMetrics batches
+# from data nodes / FUSE clients in mode = "proxy" and forwards them.
 #[[metrics.servers]]
 #name = "influx-v2"
 #kind = "influxdb_v2"

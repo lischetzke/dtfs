@@ -93,7 +93,23 @@ service ManagerService {
   // copy in the reader's DC. Mutating: dtfs-mgr-rpc HMAC, binding
   // path\nchunk_index\nchunk_id\nnode_id\ndisk_id.
   rpc CommitCacheFill(CommitCacheFillRequest) returns (CommitCacheFillResponse);
+
+  // Issue #159 — metrics proxy: a data node or FUSE client in
+  // `[metrics] mode = "proxy"` hands its InfluxDB line-protocol batch to any
+  // manager, which queues it for its own `[[metrics.servers]]`. Nothing
+  // replicated changes (no Raft write). Mutating: dtfs-mgr-rpc HMAC, binding
+  // hex BLAKE3 of `payload` as sent.
+  rpc PushMetrics(PushMetricsRequest) returns (PushMetricsResponse);
 }
+
+message PushMetricsRequest {
+  // Line protocol; gzip-compressed when `encoding` is "gzip".
+  bytes payload = 1;
+  // "" (plain) or "gzip".
+  string encoding = 2;
+}
+
+message PushMetricsResponse {}
 
 message CommitCacheFillRequest {
   string path = 1;

@@ -28,6 +28,7 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 # Issue #159 — InfluxDB push.
 reqwest = { workspace = true }
+flate2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

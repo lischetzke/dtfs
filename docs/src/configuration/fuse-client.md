@@ -131,4 +131,4 @@ Read by `dtfs-cli update fuse` (alias `client`); the daemon ignores it. Keys and
 
 ## `[metrics]` (optional)
 
-InfluxDB push, identical to [Manager `[metrics]`](./manager.md#metrics-optional); role tag `fuse`, node tag is `[location].host`.
+InfluxDB push, identical to [Manager `[metrics]`](./manager.md#metrics-optional); role tag `fuse`, node tag is `[location].host`. `mode = "proxy"` (no `[[metrics.servers]]`) sends the batches via `PushMetrics` to the client's active manager, failing over through `[client]` `manager_addr` / `manager_addrs`, so this host needs no InfluxDB access.

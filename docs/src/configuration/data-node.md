@@ -114,4 +114,4 @@ Read by `dtfs-cli update data`; the daemon ignores it. Keys and precedence: [Man
 
 ## `[metrics]` (optional)
 
-InfluxDB push, identical to [Manager `[metrics]`](./manager.md#metrics-optional); role tag `data`.
+InfluxDB push, identical to [Manager `[metrics]`](./manager.md#metrics-optional); role tag `data`. `mode = "proxy"` (no `[[metrics.servers]]`) sends the batches to a manager from `[cluster]` `manager_addr` / `manager_addrs` via `PushMetrics` instead, so this host needs no InfluxDB access.

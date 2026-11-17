@@ -94,7 +94,6 @@ async fn main() -> Result<()> {
         .validate_intervals()
         .map_err(|e| anyhow::anyhow!(e))?;
     dtfs_common::metrics::set_global_tags("fuse", &fuse_config.location.host, &fuse_config.location.datacenter);
-    let _metrics_pusher = dtfs_common::metrics::spawn_pusher(fuse_config.metrics.clone());
 
     let mountpoint = args
         .mountpoint
@@ -160,6 +159,16 @@ async fn main() -> Result<()> {
     }
 
     info!(count = endpoints.len(), "connected to manager pool");
+
+    // #159 — proxy mode sends through the client's manager pool.
+    let metrics_proxy = (fuse_config.metrics.mode == config::MetricsMode::Proxy).then(|| {
+        let (c, timeout) = (client.clone(), std::time::Duration::from_secs(fuse_config.metrics.timeout_secs));
+        dtfs_common::metrics::proxy_send(move |payload, encoding| {
+            let c = c.clone();
+            async move { c.push_metrics(payload, encoding, timeout).await }
+        })
+    });
+    let _metrics_outbox = dtfs_common::metrics::spawn_pusher(fuse_config.metrics.clone(), metrics_proxy);
 
     // Save fields needed after fuse_config is moved into DtfsFilesystem.
     let manager_addr_display = fuse_config.client.manager_addr.clone();

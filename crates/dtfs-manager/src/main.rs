@@ -55,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
     // config API (issue #129).
     config.validate_all().map_err(|e| anyhow::anyhow!(e))?;
     dtfs_common::metrics::set_global_tags("manager", &config.node.hostname, &config.location.datacenter);
-    let _metrics_pusher = dtfs_common::metrics::spawn_pusher(config.metrics.clone());
+    let metrics_outbox = dtfs_common::metrics::spawn_pusher(config.metrics.clone(), None);
 
     tracing::info!(
         "Manager {} at {} ({})",
@@ -451,7 +451,8 @@ async fn main() -> anyhow::Result<()> {
         tls_ctx.clone(),
     )
     .with_tiering(tiering_engine.clone()) // P0-9: receive per-chunk-per-DC reads
-    .with_audit(audit_log.clone()); // Bug BX-10: placement.spill audit rows
+    .with_audit(audit_log.clone()) // Bug BX-10: placement.spill audit rows
+    .with_metrics_outbox(metrics_outbox); // #159: PushMetrics proxy queue
     metadata_service.spawn_read_report_flusher();
 
     // --- Start servers ---

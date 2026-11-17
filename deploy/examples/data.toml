@@ -127,7 +127,10 @@ tier = "cold"
 #push_interval_secs = 10
 #timeout_secs = 5
 #buffer_max_kb = 1024
-#[[metrics.servers]]
+#mode = "direct"                    # "proxy": send to a manager (PushMetrics), no servers here
+#flush_interval_secs = 0            # send every N s (>= push_interval_secs); 0 = every snapshot
+#compression = "none"               # "gzip": gzip the POST body (direct) or the payload (proxy)
+#[[metrics.servers]]                # direct mode only
 #name = "influx-v2"
 #kind = "influxdb_v2"
 #url = "http://influx.example:8086"

@@ -138,6 +138,8 @@ text there.
   PutChunk/ListChunks empty). Empty secret = legacy skip.
 - Manager plane: mutating ManagerService RPCs incl. `Heartbeat` and
   `ReportChunkStatus` need the same shape over `dtfs-mgr-rpc`.
+  `PushMetrics` binding = hex BLAKE3 of the payload as sent
+  (`metrics::proxy_binding`, compressed bytes when gzip).
 - Follower forwards: `forward_secret_ok` checks who, `forwardable()`
   allow-lists what; `write_via_leader` must read
   `ForwardWriteResponse.success`.

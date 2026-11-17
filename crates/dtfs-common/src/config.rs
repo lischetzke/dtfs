@@ -90,8 +90,34 @@ pub struct MetricsConfig {
     /// the oldest are dropped past it.
     #[serde(default = "default_metrics_buffer_max_kb")]
     pub buffer_max_kb: u64,
+    /// `direct`: push to `servers`. `proxy` (data and FUSE only): hand the
+    /// batches to a manager via `PushMetrics`, which forwards them.
+    #[serde(default)]
+    pub mode: MetricsMode,
+    /// Send every this many seconds (snapshots still every
+    /// `push_interval_secs`, accumulated); 0 = `push_interval_secs`.
+    #[serde(default)]
+    pub flush_interval_secs: u64,
+    #[serde(default)]
+    pub compression: MetricsCompression,
     #[serde(default)]
     pub servers: Vec<MetricsServer>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricsMode {
+    #[default]
+    Direct,
+    Proxy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MetricsCompression {
+    #[default]
+    None,
+    Gzip,
 }
 
 fn default_metrics_push_interval_secs() -> u64 {
@@ -110,6 +136,9 @@ impl Default for MetricsConfig {
             push_interval_secs: default_metrics_push_interval_secs(),
             timeout_secs: default_metrics_timeout_secs(),
             buffer_max_kb: default_metrics_buffer_max_kb(),
+            mode: MetricsMode::Direct,
+            flush_interval_secs: 0,
+            compression: MetricsCompression::None,
             servers: Vec::new(),
         }
     }
@@ -167,7 +196,13 @@ impl MetricsConfig {
         nonzero("[metrics] push_interval_secs", self.push_interval_secs)?;
         nonzero("[metrics] timeout_secs", self.timeout_secs)?;
         nonzero("[metrics] buffer_max_kb", self.buffer_max_kb)?;
-        let set = |o: &Option<String>| o.as_deref().is_some_and(|s| !s.is_empty());
+        if self.flush_interval_secs != 0 && self.flush_interval_secs < self.push_interval_secs {
+            return Err("[metrics] flush_interval_secs must be 0 or >= push_interval_secs".into());
+        }
+        if self.mode == MetricsMode::Proxy && !self.servers.is_empty() {
+            return Err("[metrics] mode = \"proxy\" must not list [[metrics.servers]]".into());
+        }
+        let set =|o: &Option<String>| o.as_deref().is_some_and(|s| !s.is_empty());
         for s in &self.servers {
             let n = &s.name;
             if n.is_empty() {
@@ -185,6 +220,15 @@ impl MetricsConfig {
                 }
                 _ => {}
             }
+        }
+        Ok(())
+    }
+
+    /// `validate` plus the manager-only rule: a manager pushes directly.
+    pub fn validate_manager(&self) -> Result<(), String> {
+        self.validate()?;
+        if self.mode == MetricsMode::Proxy {
+            return Err("[metrics] mode = \"proxy\" is only valid on data nodes and FUSE clients".into());
         }
         Ok(())
     }
@@ -1031,7 +1075,7 @@ impl ManagerConfig {
         self.memory.validate()?;
         self.placement.validate()?;
         self.grpc.validate()?;
-        self.metrics.validate()?;
+        self.metrics.validate_manager()?;
         self.validate_intervals()
     }
 }
@@ -2737,10 +2781,47 @@ mod metrics_config_tests {
     fn defaults_when_absent_and_old_configs_load() {
         let d = MetricsConfig::default();
         assert_eq!((d.push_interval_secs, d.timeout_secs, d.buffer_max_kb), (10, 5, 1024));
+        assert_eq!((d.mode, d.flush_interval_secs, d.compression), (MetricsMode::Direct, 0, MetricsCompression::None));
         assert!(d.servers.is_empty());
         assert!(d.validate().is_ok());
         let p = parse("");
         assert_eq!(p.push_interval_secs, 10);
+        // A pre-proxy config (no mode / flush / compression) keeps direct push.
+        let old = parse("push_interval_secs = 15\nbuffer_max_kb = 64\n");
+        assert_eq!(old.mode, MetricsMode::Direct);
+        assert_eq!(old.flush_interval_secs, 0);
+        assert_eq!(old.compression, MetricsCompression::None);
+        assert!(old.validate_manager().is_ok());
+    }
+
+    #[test]
+    fn proxy_flush_and_compression_parse() {
+        let c = parse("mode = \"proxy\"\nflush_interval_secs = 30\ncompression = \"gzip\"\n");
+        assert_eq!((c.mode, c.flush_interval_secs, c.compression), (MetricsMode::Proxy, 30, MetricsCompression::Gzip));
+        assert!(c.validate().is_ok());
+        for bad in ["mode = \"relay\"", "compression = \"zstd\""] {
+            assert!(toml::from_str::<MetricsConfig>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn proxy_and_flush_validation_exact_errors() {
+        let flush = |f| MetricsConfig { flush_interval_secs: f, ..Default::default() };
+        assert!(flush(10).validate().is_ok(), "flush == push");
+        assert!(flush(0).validate().is_ok());
+        assert_eq!(flush(9).validate().unwrap_err(), "[metrics] flush_interval_secs must be 0 or >= push_interval_secs");
+
+        let mut c = with(v1());
+        c.mode = MetricsMode::Proxy;
+        assert_eq!(c.validate().unwrap_err(), "[metrics] mode = \"proxy\" must not list [[metrics.servers]]");
+
+        let p = MetricsConfig { mode: MetricsMode::Proxy, ..Default::default() };
+        assert!(p.validate().is_ok(), "data/FUSE accept proxy");
+        assert_eq!(
+            p.validate_manager().unwrap_err(),
+            "[metrics] mode = \"proxy\" is only valid on data nodes and FUSE clients"
+        );
+        assert!(with(v1()).validate_manager().is_ok());
     }
 
     #[test]

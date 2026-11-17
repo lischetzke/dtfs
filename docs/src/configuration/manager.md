@@ -231,11 +231,16 @@ Keep the file mode 0640: `token` and `cluster.shared_secret` share it.
 
 Pushes the process's internal counters, gauges and histograms (`dtfs_*` measurements, tags `role`, `node`, `dc`) to InfluxDB as line protocol. Same block in `data.toml` and `fuse.toml`. No `[[metrics.servers]]` = no pusher. Histograms report cumulative `count`/`sum` and per-interval `p50`/`p90`/`p99`/`max` (microseconds for `*_us`). Failed batches are kept per server up to `buffer_max_kb`, then the oldest are dropped and counted in `dtfs_metrics_dropped_batches`. Push failures are logged once per state change with the server `name` only.
 
+A manager with at least one `[[metrics.servers]]` also accepts `PushMetrics` batches from data nodes and FUSE clients in `mode = "proxy"` and queues them in the same per-server buffers, so raise `buffer_max_kb` there (see [Monitoring](../operations/monitoring.md)). There is no separate switch.
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `push_interval_secs` | u64 | `10` | **Validated**: > 0. |
-| `timeout_secs` | u64 | `5` | HTTP timeout per push. **Validated**: > 0. |
-| `buffer_max_kb` | u64 | `1024` | Retry buffer per server. **Validated**: > 0. |
+| `push_interval_secs` | u64 | `10` | Snapshot interval. **Validated**: > 0. |
+| `timeout_secs` | u64 | `5` | HTTP (or `PushMetrics`) timeout per send. **Validated**: > 0. |
+| `buffer_max_kb` | u64 | `1024` | Retry buffer per server (one `proxy` buffer in proxy mode). **Validated**: > 0. |
+| `mode` | string | `direct` | `direct`: push to `[[metrics.servers]]`. `proxy` (data and FUSE only): send to a manager, which forwards. **Validated**: a manager refuses `proxy`; `proxy` with `[[metrics.servers]]` is refused; any other value is refused. |
+| `flush_interval_secs` | u64 | `0` | Send every this many seconds; snapshots still accumulate every `push_interval_secs` (rounded up to whole snapshots). `0` = `push_interval_secs`. **Validated**: `0` or >= `push_interval_secs`. |
+| `compression` | string | `none` | `gzip`: gzip the InfluxDB POST body (`Content-Encoding: gzip`), or the `PushMetrics` payload in proxy mode. |
 | `[[metrics.servers]] name` | string | required | Non-empty; used in logs. |
 | `kind` | string | required | `influxdb_v1` or `influxdb_v2`; anything else is refused. |
 | `url` | string | required | Must start with `http://` or `https://`. |

@@ -543,6 +543,44 @@ impl DtfsClient {
         Ok(())
     }
 
+    /// Issue #159 — hand a metrics batch to a manager (`[metrics] mode =
+    /// "proxy"`). Starts at the active manager and walks the others on a
+    /// connect error or a `proxy_try_next` code; never moves the active
+    /// manager. One pass, no backoff: the pusher keeps the batch for its
+    /// next flush. The error never carries the payload.
+    pub async fn push_metrics(
+        &self,
+        payload: Vec<u8>,
+        encoding: &'static str,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<(), String> {
+        let addrs = self.inner.manager_addrs.read().clone();
+        let start = *self.inner.active_idx.read();
+        let binding = dtfs_common::metrics::proxy_binding(&payload);
+        let body = dtfs_proto::dtfs::manager::PushMetricsRequest { payload, encoding: encoding.into() };
+        let mut last = "no managers configured".to_string();
+        for k in 0..addrs.len() {
+            let addr = &addrs[(start + k) % addrs.len()];
+            let channel = match self.get_or_create_channel(&self.inner.manager_channels, addr).await {
+                Ok(c) => c,
+                Err(e) => {
+                    last = format!("{addr}: {e}");
+                    continue;
+                }
+            };
+            let mut r = self.stamp_mgr_mutation("PushMetrics", &binding, body.clone());
+            r.set_timeout(timeout);
+            match ManagerServiceClient::new(channel).push_metrics(r).await {
+                Ok(_) => return Ok(()),
+                Err(s) if dtfs_common::metrics::proxy_try_next(s.code()) => {
+                    last = format!("{addr}: {:?}: {}", s.code(), s.message());
+                }
+                Err(s) => return Err(format!("{addr}: {:?}: {}", s.code(), s.message())),
+            }
+        }
+        Err(last)
+    }
+
     /// Delete a file from the DTFS namespace.
     #[instrument(skip(self))]
     pub async fn delete_file(&self, path: &str) -> Result<DeleteFileResponse> {

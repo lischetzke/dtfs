@@ -108,12 +108,42 @@ FUSE pages point there). The push carries the global tags `role` (`manager`, `da
 `fuse`), `node` (`[node].hostname`, for FUSE `[location].host`) and `dc`.
 
 `[metrics]` is per process, read at startup only, and not distributed through the
-cluster: a process without its own `[[metrics.servers]]` pushes nothing, and there is
-no proxying through the managers. Every host whose metrics you want needs the block and
-a direct network path to the InfluxDB server. Configure all managers, not one: the
-leader-only series (`raft_follower_lag`, `raft_millis_since_quorum_ack`, scheduler
-gauges) come from whichever manager is leader and go blank when leadership moves to an
-unconfigured one.
+cluster. Two modes (`mode`):
+
+- `direct` (default): the process pushes to its own `[[metrics.servers]]`; without one
+  it pushes nothing. The host needs the block and a network path to InfluxDB.
+- `proxy` (data nodes and FUSE clients only, no `[[metrics.servers]]`): the process
+  sends its line-protocol batches to a manager with the `PushMetrics` gRPC call, and the
+  manager forwards them with its own. Only the managers need InfluxDB settings and
+  access. Data nodes start at the manager that last accepted (first the first one of
+  `[cluster]`), FUSE clients at their active manager; on a connect error, `Unavailable`, `Unimplemented`,
+  `FailedPrecondition`, `DeadlineExceeded`, `Cancelled` or `Unknown` the node tries the next
+  configured manager. When every manager fails, the batches stay in the node's bounded
+  queue (`buffer_max_kb`, drops counted in `dtfs_metrics_dropped_batches{server="proxy"}`)
+  for the next flush. With `cluster.shared_secret` set the call carries the
+  `dtfs-mgr-rpc` HMAC (binding: BLAKE3 of the payload). Mixed versions: a manager
+  older than this feature answers `Unimplemented` and the node moves on; at least one
+  manager must be upgraded and have servers.
+
+A manager accepts proxied batches only when it has at least one `[[metrics.servers]]`
+(else `FailedPrecondition`). It refuses an unknown encoding, a payload that decompresses
+past 16 MiB, non-UTF-8 text and any non-empty line not starting with `dtfs_`, and appends
+an accepted batch to every server's queue. Those queues are the same `buffer_max_kb`
+buffers, so raise it on proxy managers to roughly nodes x snapshot size x
+`flush_interval_secs` / `push_interval_secs` (more if InfluxDB outages should be
+bridged).
+
+`flush_interval_secs` (default `0` = every snapshot) takes snapshots every
+`push_interval_secs` but sends only every flush interval (rounded up to whole
+snapshots), joining the queued batches into bodies of at most 4 MiB (one POST or
+`PushMetrics` call per destination per flush unless that is exceeded).
+`compression = "gzip"` gzips the InfluxDB POST body (`Content-Encoding: gzip`) or the
+`PushMetrics` payload.
+
+Configure all managers, not one: the leader-only series (`raft_follower_lag`,
+`raft_millis_since_quorum_ack`, scheduler gauges) come from whichever manager is leader
+and go blank when leadership moves to an unconfigured one, and in proxy mode every
+configured manager is a failover target for the nodes.
 
 ### Line protocol
 
@@ -151,9 +181,9 @@ The hot path only does relaxed atomic adds (counter, gauge, one histogram bucket
 locks, allocation or I/O. Handles are registered once and cached. Label values are
 bounded: fixed enums (FUSE ops, errnos, gRPC and REST route names from allowlists,
 anything else is `other`) or capped sets (FUSE tier/DC pairs, replication peers, forward
-ops) that fold into `other` past the cap. Encoding and the HTTP push run on a background
-task every `push_interval_secs`. A failing server gets a per-server FIFO capped at
-`buffer_max_kb`; the oldest batches are dropped first and counted in
+ops) that fold into `other` past the cap. Encoding runs on a background task every
+`push_interval_secs`, the send every flush interval. Batches wait in a per-server (or
+`proxy`) FIFO capped at `buffer_max_kb`; the oldest batches are dropped first and counted in
 `dtfs_metrics_dropped_batches{server}`. Nothing ever blocks a request.
 
 ### Metric catalogue
@@ -166,7 +196,11 @@ sampled every 5 s.
 
 | Name | Type | Labels | Meaning |
 |---|---|---|---|
-| `metrics_dropped_batches` | C | `server` | Batches dropped from a full retry queue |
+| `metrics_dropped_batches` | C | `server` | Batches dropped from a full retry queue (`server="proxy"` in proxy mode) |
+| `metrics_proxy_sent_bytes` | C | | Data/FUSE in proxy mode: payload bytes (as sent, compressed with gzip) a manager accepted |
+| `metrics_proxy_received_batches` | C | | Manager: `PushMetrics` batches accepted |
+| `metrics_proxy_received_bytes` | C | | Manager: payload bytes (as received) of accepted batches |
+| `metrics_proxy_rejected` | C | `reason` | Manager: refused `PushMetrics` batches; `auth`, `no_servers`, `bad_encoding`, `too_large`, `bad_line` |
 
 **Manager**
 

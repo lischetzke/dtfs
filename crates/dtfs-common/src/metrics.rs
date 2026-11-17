@@ -1,8 +1,10 @@
 //! Issue #159 — in-process metrics (atomic counters/gauges/log2 histograms)
-//! pushed to InfluxDB v1/v2 as line protocol. The hot path is Relaxed atomics
-//! only; registration and the push loop are cold. Credentials are never logged.
+//! pushed to InfluxDB v1/v2 as line protocol, directly or (data/FUSE
+//! `mode = "proxy"`) through a manager's `PushMetrics`. The hot path is
+//! Relaxed atomics only; registration and the push loop are cold.
+//! Credentials and payloads are never logged.
 
-use crate::config::{MetricsConfig, MetricsKind, MetricsServer};
+use crate::config::{MetricsCompression, MetricsConfig, MetricsKind, MetricsMode, MetricsServer};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -290,6 +292,28 @@ impl BatchQueue {
     pub fn push(&mut self, b: String) -> u64 {
         self.bytes += b.len();
         self.q.push_back(b);
+        self.trim()
+    }
+    /// Puts an unsent body back in front; returns batches dropped (oldest
+    /// first) to stay under the cap.
+    pub fn requeue_front(&mut self, b: String) -> u64 {
+        self.bytes += b.len();
+        self.q.push_front(b);
+        self.trim()
+    }
+    /// Pops the oldest batches joined into one body of at most `max` bytes,
+    /// split between batches; a single batch above `max` goes alone.
+    pub fn take_body(&mut self, max: usize) -> Option<String> {
+        let mut body = self.q.pop_front()?;
+        self.bytes -= body.len();
+        while self.q.front().is_some_and(|n| body.len() + n.len() <= max) {
+            let n = self.q.pop_front().unwrap_or_default();
+            self.bytes -= n.len();
+            body.push_str(&n);
+        }
+        Some(body)
+    }
+    fn trim(&mut self) -> u64 {
         let mut dropped = 0;
         while self.bytes > self.cap {
             match self.q.pop_front() {
@@ -351,8 +375,11 @@ pub fn build_request(s: &MetricsServer) -> PushRequest {
     }
 }
 
-async fn post(client: &reqwest::Client, req: &PushRequest, body: String) -> bool {
+async fn post(client: &reqwest::Client, req: &PushRequest, body: Vec<u8>, gzip: bool) -> bool {
     let mut rb = client.post(&req.url).query(&req.query).body(body);
+    if gzip {
+        rb = rb.header("Content-Encoding", "gzip");
+    }
     rb = match &req.auth {
         Auth::None => rb,
         Auth::Basic(u, p) => rb.basic_auth(u, Some(p)),
@@ -361,59 +388,240 @@ async fn post(client: &reqwest::Client, req: &PushRequest, body: String) -> bool
     matches!(rb.send().await, Ok(r) if r.status().is_success())
 }
 
-/// Starts the push loop; `None` when no servers are configured. Needs a
-/// tokio runtime. Call after `cfg.validate()`.
-pub fn spawn_pusher(cfg: MetricsConfig) -> Option<tokio::task::JoinHandle<()>> {
-    if cfg.servers.is_empty() {
-        return None;
+/// Largest uncompressed POST / PushMetrics body: queued batches are joined
+/// up to this, split between batches.
+pub const MAX_BODY_BYTES: usize = 4 << 20;
+/// Hard cap on a decompressed `PushMetrics` payload (gzip bomb guard).
+pub const MAX_PROXY_DECODED_BYTES: usize = 16 << 20;
+/// `metrics_dropped_batches` server label in proxy mode.
+pub const PROXY_DEST: &str = "proxy";
+
+pub fn gzip(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    // Writes into a Vec cannot fail.
+    let _ = e.write_all(data);
+    e.finish().unwrap_or_default()
+}
+
+/// Decompresses at most `cap` bytes: `BadEncoding` on corrupt input,
+/// `TooLarge` past the cap. Never allocates past the cap.
+pub fn gunzip_capped(data: &[u8], cap: usize) -> Result<Vec<u8>, ProxyReject> {
+    use std::io::Read;
+    let mut d = flate2::read::GzDecoder::new(data);
+    let mut out = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = d.read(&mut buf).map_err(|_| ProxyReject::BadEncoding)?;
+        if n == 0 {
+            return Ok(out);
+        }
+        if out.len() + n > cap {
+            return Err(ProxyReject::TooLarge);
+        }
+        if out.capacity() < out.len() + n {
+            let want = (out.capacity() * 2).max(out.len() + n).min(cap);
+            out.reserve_exact(want - out.len());
+        }
+        out.extend_from_slice(&buf[..n]);
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(cfg.timeout_secs))
-        .build()
-        .ok()?;
-    Some(tokio::spawn(async move {
-        let dropped_ctr: Vec<_> = cfg
-            .servers
-            .iter()
-            .map(|s| counter("metrics_dropped_batches", &[("server", &s.name)]))
-            .collect();
-        let reqs: Vec<_> = cfg.servers.iter().map(build_request).collect();
-        let mut queues: Vec<_> = cfg.servers.iter().map(|_| BatchQueue::new(cfg.buffer_max_kb as usize * 1024)).collect();
-        let mut failing = vec![false; cfg.servers.len()];
+}
+
+/// Why a manager refused a `PushMetrics` batch (`metrics_proxy_rejected{reason}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyReject {
+    Auth,
+    NoServers,
+    BadEncoding,
+    TooLarge,
+    BadLine,
+}
+
+impl ProxyReject {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::NoServers => "no_servers",
+            Self::BadEncoding => "bad_encoding",
+            Self::TooLarge => "too_large",
+            Self::BadLine => "bad_line",
+        }
+    }
+}
+
+/// MAC binding of a `PushMetrics` request: hex BLAKE3 of the payload as sent.
+pub fn proxy_binding(payload: &[u8]) -> String {
+    blake3::hash(payload).to_hex().to_string()
+}
+
+/// Manager side of `PushMetrics`: decode (`""` or `"gzip"`, capped at
+/// [`MAX_PROXY_DECODED_BYTES`]) and check that it is UTF-8 and that every
+/// non-empty line is a `dtfs_` point. The result ends with a newline.
+pub fn decode_proxied(payload: &[u8], encoding: &str) -> Result<String, ProxyReject> {
+    let raw = match encoding {
+        "" if payload.len() > MAX_PROXY_DECODED_BYTES => return Err(ProxyReject::TooLarge),
+        "" => payload.to_vec(),
+        "gzip" => gunzip_capped(payload, MAX_PROXY_DECODED_BYTES)?,
+        _ => return Err(ProxyReject::BadEncoding),
+    };
+    let mut s = String::from_utf8(raw).map_err(|_| ProxyReject::BadLine)?;
+    if !s.lines().all(|l| l.is_empty() || l.starts_with("dtfs_")) {
+        return Err(ProxyReject::BadLine);
+    }
+    if !s.is_empty() && !s.ends_with('\n') {
+        s.push('\n'); // else the next batch's first line would join this one's last
+    }
+    Ok(s)
+}
+
+/// Proxy sender: a status code after which the node tries the next manager
+/// (down, old manager without the RPC, manager without servers, timeout).
+/// Auth and payload refusals would repeat on every manager.
+pub fn proxy_try_next(code: tonic::Code) -> bool {
+    use tonic::Code::*;
+    matches!(code, Unavailable | Unimplemented | FailedPrecondition | DeadlineExceeded | Cancelled | Unknown)
+}
+
+/// Snapshots per send: `ceil(flush / push)`, 1 when `flush` is 0.
+pub fn flush_every(push_interval_secs: u64, flush_interval_secs: u64) -> u64 {
+    if flush_interval_secs == 0 { 1 } else { flush_interval_secs.div_ceil(push_interval_secs.max(1)) }
+}
+
+/// Pending batches per destination (one per `[[metrics.servers]]`, or one
+/// `proxy`), shared by the push loop and a manager's `PushMetrics` handler.
+pub struct Outbox {
+    queues: Mutex<Vec<BatchQueue>>,
+    dropped: Vec<Arc<Counter>>,
+}
+
+impl Outbox {
+    pub fn new(dests: &[&str], cap_bytes: usize) -> Self {
+        Self {
+            queues: Mutex::new(dests.iter().map(|_| BatchQueue::new(cap_bytes)).collect()),
+            dropped: dests.iter().map(|d| counter("metrics_dropped_batches", &[("server", d)])).collect(),
+        }
+    }
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<BatchQueue>> {
+        self.queues.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Queues `batch` for every destination, counting drop-oldest evictions.
+    pub fn push(&self, batch: &str) {
+        if batch.is_empty() {
+            return;
+        }
+        let mut q = self.lock();
+        for (i, q) in q.iter_mut().enumerate() {
+            self.dropped[i].add(q.push(batch.to_string()));
+        }
+    }
+    /// Next body of at most [`MAX_BODY_BYTES`] for destination `i`.
+    pub fn take_body(&self, i: usize) -> Option<String> {
+        self.lock().get_mut(i)?.take_body(MAX_BODY_BYTES)
+    }
+    fn requeue(&self, i: usize, body: String) {
+        if let Some(q) = self.lock().get_mut(i) {
+            self.dropped[i].add(q.requeue_front(body));
+        }
+    }
+}
+
+/// Proxy transport (data node, FUSE): sends `(payload, encoding)` to a
+/// manager via `PushMetrics`, failing over through the managers.
+pub type ProxySend = Arc<
+    dyn Fn(Vec<u8>, &'static str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+pub fn proxy_send<F, Fut>(f: F) -> ProxySend
+where
+    F: Fn(Vec<u8>, &'static str) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    Arc::new(move |p, e| {
+        Box::pin(f(p, e)) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+    })
+}
+
+enum Dest {
+    Direct(reqwest::Client, Vec<PushRequest>),
+    Proxy(ProxySend),
+}
+
+/// Starts the push loop and returns its outbox; `None` when nothing is
+/// pushed (direct with no servers, or proxy without a sender). Needs a
+/// tokio runtime. Call after `cfg.validate()`.
+pub fn spawn_pusher(cfg: MetricsConfig, proxy: Option<ProxySend>) -> Option<Arc<Outbox>> {
+    let (dest, names): (Dest, Vec<&str>) = match (cfg.mode, proxy) {
+        (MetricsMode::Proxy, Some(p)) => (Dest::Proxy(p), vec![PROXY_DEST]),
+        (MetricsMode::Proxy, None) => return None,
+        (MetricsMode::Direct, _) if cfg.servers.is_empty() => return None,
+        (MetricsMode::Direct, _) => {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(cfg.timeout_secs))
+                .build()
+                .ok()?;
+            (Dest::Direct(client, cfg.servers.iter().map(build_request).collect()), cfg.servers.iter().map(|s| s.name.as_str()).collect())
+        }
+    };
+    let outbox = Arc::new(Outbox::new(&names, cfg.buffer_max_kb as usize * 1024));
+    let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    let ob = outbox.clone();
+    tokio::spawn(async move {
+        let gz = cfg.compression == MetricsCompression::Gzip;
+        let sent_bytes = matches!(dest, Dest::Proxy(_)).then(|| counter("metrics_proxy_sent_bytes", &[]));
+        let every = flush_every(cfg.push_interval_secs, cfg.flush_interval_secs);
+        let mut failing = vec![false; names.len()];
         let mut enc = Encoder::default();
         let global = GLOBAL_TAGS.get().cloned().unwrap_or_default();
         let mut tick = tokio::time::interval(Duration::from_secs(cfg.push_interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
+        for n in 1u64.. {
             tick.tick().await;
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
-            let batch = enc.encode(&snapshot_registry(), &global, ts);
-            for (i, srv) in cfg.servers.iter().enumerate() {
-                if !batch.is_empty() {
-                    let d = queues[i].push(batch.clone());
-                    dropped_ctr[i].add(d);
-                }
-                while let Some(b) = queues[i].front() {
-                    if post(&client, &reqs[i], b.clone()).await {
-                        queues[i].pop();
-                        if failing[i] {
+            ob.push(&enc.encode(&snapshot_registry(), &global, ts));
+            if n % every != 0 {
+                continue;
+            }
+            for (i, name) in names.iter().enumerate() {
+                while let Some(body) = ob.take_body(i) {
+                    let payload = if gz { gzip(body.as_bytes()) } else { body.as_bytes().to_vec() };
+                    let res = match &dest {
+                        Dest::Direct(client, reqs) => {
+                            if post(client, &reqs[i], payload, gz).await { Ok(()) } else { Err(String::new()) }
+                        }
+                        Dest::Proxy(send) => {
+                            let len = payload.len() as u64;
+                            let r = send(payload, if gz { "gzip" } else { "" }).await;
+                            if let (Ok(()), Some(c)) = (&r, &sent_bytes) {
+                                c.add(len);
+                            }
+                            r
+                        }
+                    };
+                    match res {
+                        Ok(()) if failing[i] => {
                             failing[i] = false;
-                            tracing::warn!(server = %srv.name, "metrics push recovered");
+                            tracing::warn!(server = %name, "metrics push recovered");
                         }
-                    } else {
-                        if !failing[i] {
-                            failing[i] = true;
-                            tracing::warn!(server = %srv.name, "metrics push failing; batches are buffered and retried");
+                        Ok(()) => {}
+                        Err(e) => {
+                            ob.requeue(i, body);
+                            if !failing[i] {
+                                failing[i] = true;
+                                tracing::warn!(server = %name, error = %e, "metrics push failing; batches are buffered and retried");
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
             }
         }
-    }))
+    });
+    Some(outbox)
 }
 
 #[cfg(test)]
@@ -518,6 +726,137 @@ mod tests {
         q.push("dd".into());
         q.pop();
         assert!(q.is_empty());
+    }
+
+    #[test]
+    fn take_body_splits_at_4_mib_between_batches() {
+        let half = MAX_BODY_BYTES / 2;
+        let mut q = BatchQueue::new(64 << 20);
+        q.push("a".repeat(half));
+        q.push("b".repeat(half));
+        q.push("c".into());
+        let b = q.take_body(MAX_BODY_BYTES).unwrap();
+        assert_eq!(b.len(), MAX_BODY_BYTES, "two halves fill exactly 4 MiB");
+        assert_eq!(q.take_body(MAX_BODY_BYTES).unwrap(), "c");
+        assert!(q.take_body(MAX_BODY_BYTES).is_none());
+        // One byte over: split between the batches, never inside one.
+        q.push("a".repeat(half));
+        q.push("b".repeat(half + 1));
+        assert_eq!(q.take_body(MAX_BODY_BYTES).unwrap().len(), half);
+        assert_eq!(q.take_body(MAX_BODY_BYTES).unwrap().len(), half + 1);
+        // A single batch above the limit goes alone.
+        q.push("x".repeat(MAX_BODY_BYTES + 1));
+        q.push("y".into());
+        assert_eq!(q.take_body(MAX_BODY_BYTES).unwrap().len(), MAX_BODY_BYTES + 1);
+        assert_eq!(q.take_body(MAX_BODY_BYTES).unwrap(), "y");
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn requeue_front_keeps_order_and_cap() {
+        let mut q = BatchQueue::new(10);
+        q.push("bbbb".into());
+        assert_eq!(q.requeue_front("aaaa".into()), 0);
+        assert_eq!(q.take_body(100).unwrap(), "aaaabbbb");
+        q.push("cccccc".into());
+        assert_eq!(q.requeue_front("aaaaa".into()), 1, "11 > 10: the requeued (oldest) body is dropped");
+        assert_eq!(q.front().unwrap(), "cccccc");
+    }
+
+    #[test]
+    fn flush_accumulates_snapshots_into_one_body() {
+        assert_eq!(flush_every(10, 0), 1);
+        assert_eq!(flush_every(10, 10), 1);
+        assert_eq!(flush_every(10, 30), 3);
+        assert_eq!(flush_every(10, 25), 3, "rounded up to whole snapshots");
+        let ob = Outbox::new(&["t_flush_a", "t_flush_b"], 1 << 20);
+        for s in ["dtfs_a v=1i 1\n", "dtfs_a v=2i 2\n", "dtfs_a v=3i 3\n"] {
+            ob.push(s);
+        }
+        ob.push("");
+        for i in 0..2 {
+            assert_eq!(ob.take_body(i).unwrap(), "dtfs_a v=1i 1\ndtfs_a v=2i 2\ndtfs_a v=3i 3\n");
+            assert!(ob.take_body(i).is_none());
+        }
+        assert!(ob.take_body(2).is_none(), "unknown destination");
+    }
+
+    #[test]
+    fn outbox_counts_drops_per_destination() {
+        let ob = Outbox::new(&["t_drop_dest"], 8);
+        ob.push("aaaa");
+        ob.push("bbbb");
+        ob.push("cccc");
+        assert_eq!(counter("metrics_dropped_batches", &[("server", "t_drop_dest")]).get(), 1);
+        ob.requeue(0, "dddddddd".into()); // 16 > 8: the requeued (oldest) body goes
+        assert_eq!(counter("metrics_dropped_batches", &[("server", "t_drop_dest")]).get(), 2);
+        assert_eq!(ob.take_body(0).unwrap(), "bbbbcccc");
+    }
+
+    #[test]
+    fn gzip_round_trip() {
+        let s = "dtfs_x,role=data value=1i 1\n".repeat(1000);
+        let z = gzip(s.as_bytes());
+        assert!(z.len() < s.len() / 10);
+        assert_eq!(gunzip_capped(&z, MAX_PROXY_DECODED_BYTES).unwrap(), s.as_bytes());
+        assert_eq!(decode_proxied(&z, "gzip").unwrap(), s);
+    }
+
+    #[test]
+    fn gunzip_cap_boundary() {
+        let at = gzip(&vec![b'a'; MAX_PROXY_DECODED_BYTES]);
+        assert_eq!(gunzip_capped(&at, MAX_PROXY_DECODED_BYTES).unwrap().len(), MAX_PROXY_DECODED_BYTES);
+        let over = gzip(&vec![b'a'; MAX_PROXY_DECODED_BYTES + 1]);
+        assert_eq!(gunzip_capped(&over, MAX_PROXY_DECODED_BYTES), Err(ProxyReject::TooLarge));
+        assert_eq!(decode_proxied(&over, "gzip"), Err(ProxyReject::TooLarge));
+        assert_eq!(decode_proxied(&vec![b'a'; MAX_PROXY_DECODED_BYTES + 1], ""), Err(ProxyReject::TooLarge));
+        assert_eq!(gunzip_capped(b"not gzip", 100), Err(ProxyReject::BadEncoding));
+    }
+
+    #[test]
+    fn decode_proxied_line_checks() {
+        assert_eq!(decode_proxied(b"dtfs_a v=1i 1\n\ndtfs_b v=2i 2", "").unwrap(), "dtfs_a v=1i 1\n\ndtfs_b v=2i 2\n");
+        assert_eq!(decode_proxied(b"", "").unwrap(), "");
+        assert_eq!(decode_proxied(b"dtfs_a v=1i 1\ncpu v=1i 1\n", ""), Err(ProxyReject::BadLine));
+        assert_eq!(decode_proxied(b" dtfs_a v=1i 1\n", ""), Err(ProxyReject::BadLine));
+        assert_eq!(decode_proxied(b"dtfs_a v=\xff 1\n", ""), Err(ProxyReject::BadLine), "not UTF-8");
+        assert_eq!(decode_proxied(b"dtfs_a v=1i 1\n", "zstd"), Err(ProxyReject::BadEncoding));
+        assert_eq!(decode_proxied(b"dtfs_a v=1i 1\n", "gzip"), Err(ProxyReject::BadEncoding), "plain bytes labelled gzip");
+        let reasons: Vec<_> = [ProxyReject::Auth, ProxyReject::NoServers, ProxyReject::BadEncoding, ProxyReject::TooLarge, ProxyReject::BadLine]
+            .iter()
+            .map(|r| r.reason())
+            .collect();
+        assert_eq!(reasons, ["auth", "no_servers", "bad_encoding", "too_large", "bad_line"]);
+    }
+
+    #[test]
+    fn proxy_failover_decision_per_code() {
+        use tonic::Code::*;
+        for c in [Unavailable, Unimplemented, FailedPrecondition, DeadlineExceeded, Cancelled, Unknown] {
+            assert!(proxy_try_next(c), "{c:?}");
+        }
+        for c in [
+            Ok,
+            InvalidArgument,
+            NotFound,
+            AlreadyExists,
+            PermissionDenied,
+            ResourceExhausted,
+            Aborted,
+            OutOfRange,
+            Internal,
+            DataLoss,
+            Unauthenticated,
+        ] {
+            assert!(!proxy_try_next(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn proxy_binding_is_blake3_hex_of_payload() {
+        assert_eq!(proxy_binding(b"abc"), blake3::hash(b"abc").to_hex().to_string());
+        assert_eq!(proxy_binding(b"abc").len(), 64);
+        assert_ne!(proxy_binding(b"abc"), proxy_binding(b"abd"));
     }
 
     fn server(kind: MetricsKind) -> MetricsServer {

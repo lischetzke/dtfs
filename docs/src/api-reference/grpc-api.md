@@ -41,6 +41,7 @@ There are two planes so a stamp for one cannot be replayed on the other: `dtfs-d
 | ManagerService | `CommitCacheFill` | `path\nchunk_index\nchunk_id\nnode_id\ndisk_id` |
 | ManagerService | `Heartbeat`, `ReportChunkStatus` | `node_id` |
 | ManagerService | `ReleaseLeasesByHost` | `hostname` |
+| ManagerService | `PushMetrics` | hex `blake3(payload)` of the payload as sent (gzip bytes when `encoding = "gzip"`) |
 | ManagerService | `ForwardClientWrite` | hex `blake3(client_request_json)`; while `cluster.accept_legacy_forward_secret = true` (default) the follower also fills the legacy raw `shared_secret` field (for pre-HMAC leaders) and the leader accepts an unstamped forward on it; with `false` the field is sent empty and an unstamped forward is refused |
 | ManagerService | `RegisterNode` | no stamp; the request carries `shared_secret` instead |
 | ManagerService | `GetFileLocations`, `ListDirectory`, `ReadSymlink`, `ClusterCapacity` | not authenticated (read-only) |
@@ -108,6 +109,7 @@ Order used by the FUSE client: `AcquireWriteLease`, `AllocateChunks`, stream `Pu
 | `Heartbeat` | `node_id`, `uptime_secs`, `total_chunks`, `total_bytes_used`, `config_version`, `chunk_reads` (per-chunk read counters by datacenter), `total_bytes_read`, `total_bytes_written`, `disk_usage` (`disk_id`, `total_bytes`, `used_bytes`), `integrity_faults`, `scrub_results` | `accepted`, `config_version`, `config_update`, `self_quarantine_cleared`, `scrub_request` |
 | `ReportChunkStatus` | `node_id`, `chunks` (`chunk_id`, `size`, `status`: `healthy`, `corrupt`, `missing`) | `accepted` |
 | `ForwardClientWrite` | `client_request_json`, `shared_secret` | `success`, `response_json`, `error`. Peer-manager use only: a follower forwards a Raft command to the leader. Only an allow-listed set of commands is accepted. |
+| `PushMetrics` | `payload` (InfluxDB line protocol), `encoding` (`""` or `"gzip"`) | empty. Metrics proxy (`[metrics] mode = "proxy"`): any manager, no Raft write; the batch joins the manager's `[[metrics.servers]]` queues. Refusals in order: `PERMISSION_DENIED` (stamp), `FAILED_PRECONDITION` (manager has no servers), `INVALID_ARGUMENT` (unknown encoding, corrupt gzip, more than 16 MiB decompressed, not UTF-8, a non-empty line not starting with `dtfs_`). An older manager answers `UNIMPLEMENTED`. |
 
 A heartbeat whose liveness write cannot commit fails the RPC; `NOT_FOUND` tells the data node to re-register. `HeartbeatResponse.config_update.scrub_override` (`ScrubConfigOverride`) carries the cluster scrub policy from the manager's `[scrub]` block on every heartbeat: `quick_interval_hours`, `deep_interval_hours`, `quick_interval_secs`, `deep_interval_secs` (exact seconds, `0` from an older manager), `orphan_interval_secs`, `orphan_grace_secs`, `max_io_percent`, `verify_on_read`, `quarantine_on_fault`, `auto_unquarantine_secs`. `scrub_request` relays a manual scrub trigger (`id`, `level`, `requested_at_ms`); data nodes deduplicate by `id`. `config_update.config_json` is empty in current builds.
 

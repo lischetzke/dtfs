@@ -71,6 +71,9 @@ pub struct MetadataService {
     /// Issue #144 — heartbeat read reports, resolved in one row pass per
     /// [`READ_REPORT_FLUSH`] instead of one per heartbeat.
     read_reports: Arc<parking_lot::Mutex<ReadReportBuffer>>,
+    /// Issue #159 — this manager's InfluxDB queues, filled by `PushMetrics`;
+    /// `None` without `[[metrics.servers]]`.
+    metrics_outbox: Option<Arc<dtfs_common::metrics::Outbox>>,
 }
 
 /// Issue #144 — how long read reports are merged before one resolve pass.
@@ -214,7 +217,14 @@ impl MetadataService {
             audit: None,
             tls,
             read_reports: Default::default(),
+            metrics_outbox: None,
         }
+    }
+
+    /// Issue #159 — queues proxied `PushMetrics` batches are appended to.
+    pub fn with_metrics_outbox(mut self, outbox: Option<Arc<dtfs_common::metrics::Outbox>>) -> Self {
+        self.metrics_outbox = outbox;
+        self
     }
 
     /// Heartbeats only add reports; with no further read report a buffered
@@ -3711,6 +3721,39 @@ impl ManagerService for MetadataService {
         Ok(Response::new(ReleaseLeasesByHostResponse {
             released_count: count,
         }))
+    }
+
+    /// Issue #159 — queue a proxied line-protocol batch for this manager's
+    /// `[[metrics.servers]]`. Any manager serves it; nothing replicated
+    /// changes. Order: auth, servers, encoding, size cap, lines.
+    async fn push_metrics(
+        &self,
+        request: Request<PushMetricsRequest>,
+    ) -> Result<Response<PushMetricsResponse>, Status> {
+        use dtfs_common::metrics::{counter, decode_proxied, proxy_binding, ProxyReject};
+        let reject = |r: ProxyReject| counter("metrics_proxy_rejected", &[("reason", r.reason())]).inc();
+        let binding = proxy_binding(&request.get_ref().payload);
+        if let Err(e) =
+            require_mgr_rpc_auth(&self.config.cluster.shared_secret, "PushMetrics", &binding, request.metadata())
+        {
+            reject(ProxyReject::Auth);
+            return Err(e);
+        }
+        let Some(outbox) = &self.metrics_outbox else {
+            reject(ProxyReject::NoServers);
+            tracing::warn!("PushMetrics rejected: no [[metrics.servers]] on this manager");
+            return Err(Status::failed_precondition("no [[metrics.servers]] configured on this manager"));
+        };
+        let req = request.into_inner();
+        let text = decode_proxied(&req.payload, &req.encoding).map_err(|r| {
+            reject(r);
+            tracing::warn!(reason = r.reason(), bytes = req.payload.len(), "PushMetrics rejected");
+            Status::invalid_argument(format!("metrics batch rejected: {}", r.reason()))
+        })?;
+        outbox.push(&text);
+        counter("metrics_proxy_received_batches", &[]).inc();
+        counter("metrics_proxy_received_bytes", &[]).add(req.payload.len() as u64);
+        Ok(Response::new(PushMetricsResponse {}))
     }
 }
 

@@ -66,6 +66,61 @@ fn stamp_mgr_rpc_request<T>(secret: &str, method: &str, binding: &str, body: T) 
     req
 }
 
+/// Issue #159 — `[metrics] mode = "proxy"` transport: `PushMetrics` to the
+/// managers in `all_manager_addrs` order, starting at the last one that
+/// accepted and walking on a connect error or a `proxy_try_next` code. Keeps
+/// its own cached connection (the heartbeat loop owns its client). The
+/// error never carries the payload.
+fn metrics_proxy_sender(
+    config: &DataNodeConfig,
+    tls: dtfs_common::tls::TlsContext,
+) -> dtfs_common::metrics::ProxySend {
+    type Conn = (usize, Option<ManagerServiceClient<tonic::transport::Channel>>);
+    let addrs: Arc<Vec<String>> =
+        Arc::new(config.cluster.all_manager_addrs().iter().map(|a| tls.endpoint_url(a)).collect());
+    let secret = Arc::new(config.cluster.shared_secret.clone());
+    let timeout = Duration::from_secs(config.metrics.timeout_secs);
+    let conn: Arc<tokio::sync::Mutex<Conn>> = Arc::default();
+    dtfs_common::metrics::proxy_send(move |payload, encoding| {
+        let (addrs, secret, tls, conn) = (addrs.clone(), secret.clone(), tls.clone(), conn.clone());
+        async move {
+            let binding = dtfs_common::metrics::proxy_binding(&payload);
+            let body = dtfs_proto::dtfs::manager::PushMetricsRequest { payload, encoding: encoding.into() };
+            let mut st = conn.lock().await;
+            let mut last = "no managers configured".to_string();
+            for k in 0..addrs.len() {
+                let idx = (st.0 + k) % addrs.len();
+                let mut client = match st.1.take() {
+                    Some(c) if k == 0 => c,
+                    _ => match tls.connect(&addrs[idx]).await {
+                        Ok(ch) => ManagerServiceClient::new(ch),
+                        Err(e) => {
+                            last = format!("{}: {e}", addrs[idx]);
+                            continue;
+                        }
+                    },
+                };
+                let mut r = stamp_mgr_rpc_request(&secret, "PushMetrics", &binding, body.clone());
+                r.set_timeout(timeout);
+                match client.push_metrics(r).await {
+                    Ok(_) => {
+                        *st = (idx, Some(client));
+                        return Ok(());
+                    }
+                    Err(s) if dtfs_common::metrics::proxy_try_next(s.code()) => {
+                        last = format!("{}: {:?}: {}", addrs[idx], s.code(), s.message());
+                    }
+                    Err(s) => {
+                        *st = (idx, Some(client));
+                        return Err(format!("{}: {:?}: {}", addrs[idx], s.code(), s.message()));
+                    }
+                }
+            }
+            Err(last)
+        }
+    })
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "dtfs-data", about = "DTFS Data Node", version = dtfs_common::version::VERSION_STRING)]
 struct Args {
@@ -101,7 +156,6 @@ async fn main() -> anyhow::Result<()> {
     config.placement.validate().map_err(|e| anyhow::anyhow!(e))?;
     config.metrics.validate().map_err(|e| anyhow::anyhow!(e))?;
     dtfs_common::metrics::set_global_tags("data", &config.node.hostname, &config.location.datacenter);
-    let _metrics_pusher = dtfs_common::metrics::spawn_pusher(config.metrics.clone());
 
     tracing::info!(
         "Data node {} at {} ({})",
@@ -114,6 +168,9 @@ async fn main() -> anyhow::Result<()> {
     // heartbeat lifecycle, and outbound chunk replication.
     let tls_ctx = dtfs_common::tls::TlsContext::from_config(&config.tls)?;
     tls_ctx.log_startup("dtfs-data", &config.tls.mode);
+    let metrics_proxy = (config.metrics.mode == dtfs_common::config::MetricsMode::Proxy)
+        .then(|| metrics_proxy_sender(&config, tls_ctx.clone()));
+    let _metrics_outbox = dtfs_common::metrics::spawn_pusher(config.metrics.clone(), metrics_proxy);
 
     // Initialize disk managers for each configured disk
     disk::check_fresh_disks_are_mounted(&config.disks)?;
