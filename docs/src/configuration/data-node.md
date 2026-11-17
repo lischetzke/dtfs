@@ -111,3 +111,7 @@ Parsed (`ltfs_path`, `device`, `library_device`, `label`, `capacity_gb`, `max_wr
 ## `[updater]` (optional, CLI only)
 
 Read by `dtfs-cli update data`; the daemon ignores it. Keys and precedence: [Manager `[updater]`](./manager.md#updater-optional-cli-only).
+
+## `[metrics]` (optional)
+
+InfluxDB push, identical to [Manager `[metrics]`](./manager.md#metrics-optional); role tag `data`.

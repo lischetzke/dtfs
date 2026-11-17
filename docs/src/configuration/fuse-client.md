@@ -128,3 +128,7 @@ Same keys and semantics as the manager (`mode`, `cert_file`, `key_file`, `ca_fil
 ## `[updater]` (optional, CLI only)
 
 Read by `dtfs-cli update fuse` (alias `client`); the daemon ignores it. Keys and precedence: [Manager `[updater]`](./manager.md#updater-optional-cli-only).
+
+## `[metrics]` (optional)
+
+InfluxDB push, identical to [Manager `[metrics]`](./manager.md#metrics-optional); role tag `fuse`, node tag is `[location].host`.

@@ -702,6 +702,7 @@ dependencies = [
  "chrono",
  "hmac",
  "rcgen",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",

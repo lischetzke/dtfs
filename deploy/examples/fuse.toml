@@ -183,3 +183,16 @@ mountpoint = "/mnt/dtfs"
 # unverified, warning printed). Env DTFS_MINISIGN_PUBKEY overrides.
 #minisign_public_key = ""
 #install_dir = "/usr/local/bin"
+
+# Issue #159: InfluxDB metrics push; keys and servers as in manager.toml.
+#[metrics]
+#push_interval_secs = 10
+#timeout_secs = 5
+#buffer_max_kb = 1024
+#[[metrics.servers]]
+#name = "influx-v2"
+#kind = "influxdb_v2"
+#url = "http://influx.example:8086"
+#org = "home"
+#bucket = "dtfs"
+#token = "CHANGE-ME"

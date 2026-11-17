@@ -92,6 +92,8 @@ async fn main() -> Result<()> {
     fuse_config
         .validate_intervals()
         .map_err(|e| anyhow::anyhow!(e))?;
+    dtfs_common::metrics::set_global_tags("fuse", &fuse_config.location.host, &fuse_config.location.datacenter);
+    let _metrics_pusher = dtfs_common::metrics::spawn_pusher(fuse_config.metrics.clone());
 
     let mountpoint = args
         .mountpoint

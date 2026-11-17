@@ -271,7 +271,15 @@ impl MetadataService {
             }
         }
 
-        match self.raft.client_write(req).await {
+        // Issue #159 — propose-to-applied latency (leader wait excluded).
+        static WRITE_US: std::sync::OnceLock<std::sync::Arc<dtfs_common::metrics::Histogram>> =
+            std::sync::OnceLock::new();
+        let t0 = std::time::Instant::now();
+        let res = self.raft.client_write(req).await;
+        WRITE_US
+            .get_or_init(|| dtfs_common::metrics::histogram("raft_client_write_us", &[]))
+            .observe_duration(t0.elapsed());
+        match res {
             Ok(resp) => Ok(resp.data),
             Err(e) => {
                 // Bug AC — distinguish "should retry on another manager"

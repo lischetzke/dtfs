@@ -226,3 +226,19 @@ Read by [`dtfs-cli update`](../api-reference/cli-reference.md#update); the daemo
 | `install_dir` | string | `/usr/local/bin` | Overridden by `--install-dir`. |
 
 Keep the file mode 0640: `token` and `cluster.shared_secret` share it.
+
+## `[metrics]` (optional)
+
+Pushes the process's internal counters, gauges and histograms (`dtfs_*` measurements, tags `role`, `node`, `dc`) to InfluxDB as line protocol. Same block in `data.toml` and `fuse.toml`. No `[[metrics.servers]]` = no pusher. Histograms report cumulative `count`/`sum` and per-interval `p50`/`p90`/`p99`/`max` (microseconds for `*_us`). Failed batches are kept per server up to `buffer_max_kb`, then the oldest are dropped and counted in `dtfs_metrics_dropped_batches`. Push failures are logged once per state change with the server `name` only.
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `push_interval_secs` | u64 | `10` | **Validated**: > 0. |
+| `timeout_secs` | u64 | `5` | HTTP timeout per push. **Validated**: > 0. |
+| `buffer_max_kb` | u64 | `1024` | Retry buffer per server. **Validated**: > 0. |
+| `[[metrics.servers]] name` | string | required | Non-empty; used in logs. |
+| `kind` | string | required | `influxdb_v1` or `influxdb_v2`; anything else is refused. |
+| `url` | string | required | Must start with `http://` or `https://`. |
+| `database` | string | | Required for v1. |
+| `username`, `password` | string | unset | v1 basic auth (when `username` is set). Redacted in Debug. |
+| `org`, `bucket`, `token` | string | | Required for v2; sent as `Authorization: Token`, never in the URL. |

@@ -324,6 +324,27 @@ pub fn stale_sm_startup_allowed(
     }
 }
 
+/// Issue #159 — handles cached once so the append path takes no registry lock.
+struct LogMetrics {
+    write_us: Arc<dtfs_common::metrics::Histogram>,
+    append_entries: Arc<dtfs_common::metrics::Histogram>,
+    append_bytes: Arc<dtfs_common::metrics::Histogram>,
+    vote_write_us: Arc<dtfs_common::metrics::Histogram>,
+}
+
+fn log_metrics() -> &'static LogMetrics {
+    static M: std::sync::OnceLock<LogMetrics> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        use dtfs_common::metrics::histogram;
+        LogMetrics {
+            write_us: histogram("raft_log_write_us", &[]),
+            append_entries: histogram("raft_append_entries", &[]),
+            append_bytes: histogram("raft_append_bytes", &[]),
+            vote_write_us: histogram("raft_vote_write_us", &[]),
+        }
+    })
+}
+
 /// RAFT-5 / CR2-7-5 — `WriteOptions` with `set_sync(true)`. Every durable
 /// Raft log/meta write (append, save_vote, truncate, purge) must fsync
 /// before returning; a per-write `flush_cf` only flushes RocksDB's
@@ -490,9 +511,13 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         // a plain `put_cf` + `flush_cf` only pushes the memtable to an
         // SST/WAL buffer (no fsync) and additionally forces a flush (one
         // L0 SST) on every single vote write.
-        self.db
+        let t0 = std::time::Instant::now();
+        let r = self
+            .db
             .put_cf_opt(&cf, META_KEY_VOTE, bytes, &synced_write_opts())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+        log_metrics().vote_write_us.observe_duration(t0.elapsed());
+        r?;
         Ok(())
     }
 
@@ -518,17 +543,25 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         // returns, which is the actual durability guarantee openraft
         // needs before invoking `callback.io_completed`.
         let mut batch = WriteBatch::default();
+        let (mut n_entries, mut n_bytes) = (0u64, 0u64);
         for entry in entries {
             let key = index_to_key(entry.log_id.index);
             let value = encode_value(&entry)?;
+            n_entries += 1;
+            n_bytes += value.len() as u64;
             batch.put_cf(&cf, key, value);
             debug!("append log: {}", entry.log_id);
         }
 
+        let t0 = std::time::Instant::now();
         let write_result = self
             .db
             .write_opt(batch, &synced_write_opts())
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+        let m = log_metrics();
+        m.write_us.observe_duration(t0.elapsed());
+        m.append_entries.observe(n_entries);
+        m.append_bytes.observe(n_bytes);
 
         callback.io_completed(write_result);
 

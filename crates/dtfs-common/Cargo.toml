@@ -26,6 +26,8 @@ rustls = { workspace = true }
 tokio = { workspace = true }
 # CF-6 — TlsContext builds tonic Server/ClientTlsConfig + endpoints.
 tonic = { workspace = true }
+# Issue #159 — InfluxDB push.
+reqwest = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

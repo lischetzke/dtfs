@@ -53,6 +53,8 @@ async fn main() -> anyhow::Result<()> {
     // CR2-8-1 message-size cap, zero intervals: one set, shared with the
     // config API (issue #129).
     config.validate_all().map_err(|e| anyhow::anyhow!(e))?;
+    dtfs_common::metrics::set_global_tags("manager", &config.node.hostname, &config.location.datacenter);
+    let _metrics_pusher = dtfs_common::metrics::spawn_pusher(config.metrics.clone());
 
     tracing::info!(
         "Manager {} at {} ({})",

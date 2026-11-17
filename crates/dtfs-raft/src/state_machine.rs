@@ -886,6 +886,7 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
             let log_id = entry.log_id.clone();
             debug!("apply: log_id={}", log_id);
 
+            let apply_t0 = std::time::Instant::now();
             let response = {
                 let mut sm = self.data.write().await;
                 sm.last_applied_log = Some(log_id.clone());
@@ -901,6 +902,11 @@ impl RaftStateMachine<TypeConfig> for StateMachineStore {
                 }
             };
             // sm lock is dropped here
+            static APPLY_US: std::sync::OnceLock<std::sync::Arc<dtfs_common::metrics::Histogram>> =
+                std::sync::OnceLock::new();
+            APPLY_US
+                .get_or_init(|| dtfs_common::metrics::histogram("raft_apply_us", &[]))
+                .observe_duration(apply_t0.elapsed());
 
             // If there is a client waiting (leader), send the response.
             if let Some(resp) = responder {

@@ -97,6 +97,7 @@ Load-bearing ownership only; history per row in `docs/src/internals/invariants.m
 | `dtfs-manager/src/monitor.rs` | Heartbeat health detection only, leader-only, staleness counted from max(last_seen, leader tenure start); MUST NOT schedule repair |
 | `dtfs-manager/src/metadata.rs` | ManagerService gRPC over `raft_write`; follower writes forward via `forwardable()` allow-list (incl. lease-less UpdateChunkLocations of `CommitCacheFill`, validated in `metadata/cache_fill.rs`) |
 | `dtfs-manager/src/api.rs` + `api/*.rs` | REST router; handlers per resource; decommission refuses while replicas remain; volume delete refuses `default`, entries without `delete_files` and leased files, re-checks for entries before `DeleteVolume` |
+| `dtfs-common/src/metrics.rs` | Atomic counters/gauges/log2 histograms (hot path Relaxed atomics), InfluxDB v1/v2 line-protocol push (`[metrics]`), bounded drop-on-failure queue, never logs credentials |
 | `dtfs-data/src/server.rs::put_chunk` | Streaming put; HMAC gates all data-plane RPCs |
 | `dtfs-data/src/store.rs::commit_chunk_from_tmp` | Atomic commit (§ A.6) |
 | `dtfs-data/src/last_read.rs` | Per-disk coarse last-read index (`.dtfs/last_read.tsv`), served by `ListOldestChunks`; client non-scanner reads only |

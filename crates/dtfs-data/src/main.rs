@@ -98,6 +98,9 @@ async fn main() -> anyhow::Result<()> {
     // CR2-8-1 (CMN-3) — reject an unusable message-size cap at startup.
     config.grpc.validate().map_err(|e| anyhow::anyhow!(e))?;
     config.placement.validate().map_err(|e| anyhow::anyhow!(e))?;
+    config.metrics.validate().map_err(|e| anyhow::anyhow!(e))?;
+    dtfs_common::metrics::set_global_tags("data", &config.node.hostname, &config.location.datacenter);
+    let _metrics_pusher = dtfs_common::metrics::spawn_pusher(config.metrics.clone());
 
     tracing::info!(
         "Data node {} at {} ({})",

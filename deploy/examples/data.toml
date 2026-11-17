@@ -121,3 +121,16 @@ tier = "cold"
 #label = "lto9-library-a"
 #capacity_gb = 18000                # informational hint (LTO-9 native ~18 TB)
 #max_write_mbps = 0                 # 0 = unlimited tiering write bandwidth
+
+# Issue #159: InfluxDB metrics push; keys and servers as in manager.toml.
+#[metrics]
+#push_interval_secs = 10
+#timeout_secs = 5
+#buffer_max_kb = 1024
+#[[metrics.servers]]
+#name = "influx-v2"
+#kind = "influxdb_v2"
+#url = "http://influx.example:8086"
+#org = "home"
+#bucket = "dtfs"
+#token = "CHANGE-ME"

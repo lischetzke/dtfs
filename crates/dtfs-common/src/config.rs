@@ -72,6 +72,122 @@ pub struct ManagerConfig {
     /// working (cap 0 = unbounded, no ladder).
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// Issue #159 — InfluxDB metrics push. No servers = no pusher.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+}
+
+/// Issue #159 — `[metrics]`: periodic push of the in-process registry
+/// (`crate::metrics`) to InfluxDB v1/v2 servers. No `[[metrics.servers]]`
+/// means the pusher is not started (metrics are still recorded, cheaply).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    #[serde(default = "default_metrics_push_interval_secs")]
+    pub push_interval_secs: u64,
+    #[serde(default = "default_metrics_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Per-server cap on batches kept for retry while a server is down;
+    /// the oldest are dropped past it.
+    #[serde(default = "default_metrics_buffer_max_kb")]
+    pub buffer_max_kb: u64,
+    #[serde(default)]
+    pub servers: Vec<MetricsServer>,
+}
+
+fn default_metrics_push_interval_secs() -> u64 {
+    10
+}
+fn default_metrics_timeout_secs() -> u64 {
+    5
+}
+fn default_metrics_buffer_max_kb() -> u64 {
+    1024
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            push_interval_secs: default_metrics_push_interval_secs(),
+            timeout_secs: default_metrics_timeout_secs(),
+            buffer_max_kb: default_metrics_buffer_max_kb(),
+            servers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetricsKind {
+    #[serde(rename = "influxdb_v1")]
+    InfluxdbV1,
+    #[serde(rename = "influxdb_v2")]
+    InfluxdbV2,
+}
+
+/// One `[[metrics.servers]]` entry. `Debug` redacts `password` and `token`.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MetricsServer {
+    pub name: String,
+    pub kind: MetricsKind,
+    pub url: String,
+    /// v1 only.
+    #[serde(default)]
+    pub database: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// v2 only.
+    #[serde(default)]
+    pub org: Option<String>,
+    #[serde(default)]
+    pub bucket: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for MetricsServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |o: &Option<String>| o.as_ref().map(|_| "<redacted>");
+        f.debug_struct("MetricsServer")
+            .field("name", &self.name)
+            .field("kind", &self.kind)
+            .field("url", &self.url)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field("password", &redact(&self.password))
+            .field("org", &self.org)
+            .field("bucket", &self.bucket)
+            .field("token", &redact(&self.token))
+            .finish()
+    }
+}
+
+impl MetricsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        nonzero("[metrics] push_interval_secs", self.push_interval_secs)?;
+        nonzero("[metrics] timeout_secs", self.timeout_secs)?;
+        nonzero("[metrics] buffer_max_kb", self.buffer_max_kb)?;
+        let set = |o: &Option<String>| o.as_deref().is_some_and(|s| !s.is_empty());
+        for s in &self.servers {
+            let n = &s.name;
+            if n.is_empty() {
+                return Err("[[metrics.servers]] name must not be empty".into());
+            }
+            if !(s.url.starts_with("http://") || s.url.starts_with("https://")) {
+                return Err(format!("[[metrics.servers]] '{n}': url must start with http:// or https://"));
+            }
+            match s.kind {
+                MetricsKind::InfluxdbV1 if !set(&s.database) => {
+                    return Err(format!("[[metrics.servers]] '{n}': influxdb_v1 requires database"));
+                }
+                MetricsKind::InfluxdbV2 if !(set(&s.org) && set(&s.bucket) && set(&s.token)) => {
+                    return Err(format!("[[metrics.servers]] '{n}': influxdb_v2 requires org, bucket and token"));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Bug BU — capacity-aware placement headroom.
@@ -233,6 +349,9 @@ pub struct DataNodeConfig {
     /// client can reroute, rather than streaming until the kernel ENOSPCs.
     #[serde(default)]
     pub placement: PlacementConfig,
+    /// Issue #159 — InfluxDB metrics push.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 /// Hard memory budget for the data node process.
@@ -408,6 +527,9 @@ pub struct FuseConfig {
     /// legacy `fuse.toml` working unchanged.
     #[serde(default)]
     pub tls: TlsConfig,
+    /// Issue #159 — InfluxDB metrics push.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
 }
 
 // --- Sub-configs ---
@@ -909,6 +1031,7 @@ impl ManagerConfig {
         self.memory.validate()?;
         self.placement.validate()?;
         self.grpc.validate()?;
+        self.metrics.validate()?;
         self.validate_intervals()
     }
 }
@@ -921,6 +1044,7 @@ impl FuseConfig {
             "[partition_safety] quorum_loss_timeout_secs",
             self.partition_safety.quorum_loss_timeout_secs,
         )?;
+        self.metrics.validate()?;
         self.write.validate()
     }
 }
@@ -2598,5 +2722,120 @@ max_message_size_mb = 0
         assert!(parse("").untracked_read_processes.is_empty());
         let cfg = parse("untracked_read_processes = [\"Plex Media Scan\"]");
         assert_eq!(cfg.untracked_read_processes, vec!["Plex Media Scan".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod metrics_config_tests {
+    use super::*;
+
+    fn parse(toml_s: &str) -> MetricsConfig {
+        toml::from_str(toml_s).unwrap()
+    }
+
+    #[test]
+    fn defaults_when_absent_and_old_configs_load() {
+        let d = MetricsConfig::default();
+        assert_eq!((d.push_interval_secs, d.timeout_secs, d.buffer_max_kb), (10, 5, 1024));
+        assert!(d.servers.is_empty());
+        assert!(d.validate().is_ok());
+        let p = parse("");
+        assert_eq!(p.push_interval_secs, 10);
+    }
+
+    #[test]
+    fn valid_v1_and_v2_parse() {
+        let c = parse(
+            r#"
+[[servers]]
+name = "a"
+kind = "influxdb_v1"
+url = "http://h:8086"
+database = "d"
+[[servers]]
+name = "b"
+kind = "influxdb_v2"
+url = "https://h"
+org = "o"
+bucket = "b"
+token = "t"
+"#,
+        );
+        assert!(c.validate().is_ok());
+        assert_eq!(c.servers[1].kind, MetricsKind::InfluxdbV2);
+    }
+
+    #[test]
+    fn unknown_kind_refused() {
+        let r: Result<MetricsConfig, _> =
+            toml::from_str("[[servers]]\nname=\"a\"\nkind=\"graphite\"\nurl=\"http://h\"\n");
+        assert!(r.is_err());
+    }
+
+    fn v1() -> MetricsServer {
+        MetricsServer {
+            name: "a".into(),
+            kind: MetricsKind::InfluxdbV1,
+            url: "http://h".into(),
+            database: Some("d".into()),
+            username: None,
+            password: Some("pw-secret".into()),
+            org: None,
+            bucket: None,
+            token: Some("tok-secret".into()),
+        }
+    }
+
+    fn with(s: MetricsServer) -> MetricsConfig {
+        MetricsConfig { servers: vec![s], ..Default::default() }
+    }
+
+    #[test]
+    fn validation_negatives_exact_errors() {
+        let mut c = MetricsConfig::default();
+        c.push_interval_secs = 0;
+        assert_eq!(c.validate().unwrap_err(), "[metrics] push_interval_secs must be > 0");
+        let mut c = MetricsConfig::default();
+        c.timeout_secs = 0;
+        assert_eq!(c.validate().unwrap_err(), "[metrics] timeout_secs must be > 0");
+        let mut c = MetricsConfig::default();
+        c.buffer_max_kb = 0;
+        assert_eq!(c.validate().unwrap_err(), "[metrics] buffer_max_kb must be > 0");
+
+        let mut s = v1();
+        s.database = None;
+        assert_eq!(with(s).validate().unwrap_err(), "[[metrics.servers]] 'a': influxdb_v1 requires database");
+        let mut s = v1();
+        s.url = "ftp://h".into();
+        assert_eq!(
+            with(s).validate().unwrap_err(),
+            "[[metrics.servers]] 'a': url must start with http:// or https://"
+        );
+        let mut s = v1();
+        s.name = String::new();
+        assert_eq!(with(s).validate().unwrap_err(), "[[metrics.servers]] name must not be empty");
+        for missing in 0..3 {
+            let mut s = v1();
+            s.kind = MetricsKind::InfluxdbV2;
+            s.org = Some("o".into());
+            s.bucket = Some("b".into());
+            s.token = Some("t".into());
+            match missing {
+                0 => s.org = None,
+                1 => s.bucket = Some(String::new()),
+                _ => s.token = None,
+            }
+            assert_eq!(
+                with(s).validate().unwrap_err(),
+                "[[metrics.servers]] 'a': influxdb_v2 requires org, bucket and token"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let d = format!("{:?}", v1());
+        assert!(!d.contains("pw-secret") && !d.contains("tok-secret"));
+        assert!(d.contains("<redacted>"));
     }
 }
