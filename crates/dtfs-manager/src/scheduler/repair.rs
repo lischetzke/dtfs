@@ -39,6 +39,7 @@ impl TaskScheduler {
                     "replication scheduling deferred: migration state busy (scheduler tick in progress)"
                 );
             }
+            crate::mgr_metrics::SCHED_OUTCOMES.with("deferred").add(reqs.len() as u64);
             return vec![ScheduleOutcome::Deferred; reqs.len()];
         };
         let costs = self.link_costs(reqs).await;
@@ -53,8 +54,10 @@ impl TaskScheduler {
         };
         let mut created = 0usize;
         for (r, o) in reqs.iter().zip(&outcomes) {
+            crate::mgr_metrics::SCHED_OUTCOMES.with(o.label()).inc();
             match o {
                 ScheduleOutcome::New => {
+                    crate::mgr_metrics::TASKS_CREATED.with("schedule").inc();
                     created += 1;
                     info!(chunk_id = %r.0, source = r.1, target = r.2, "Scheduled replication task");
                     self.audit.log(
@@ -150,6 +153,8 @@ impl TaskScheduler {
         // candidate, i.e. quadratic in exactly the situation that produced the
         // backlog. `created` tracks what this pass adds.
         let mut created: usize = 0;
+        // Issue #159 — (chunk, tier) deficits seen by a complete scan.
+        let mut deficits: i64 = 0;
         // CR-3-5/MGR-5 — `task_blocks_requeue` (not a bespoke `!= Done &&
         // != Failed`) so a Failed task's retention window also blocks an
         // immediate re-queue here: pre-fix, a deterministically-failing
@@ -249,6 +254,7 @@ impl TaskScheduler {
 
                 // Schedule a copy for every mandated tier that is short.
                 for (tier, _deficit) in under_replicated_tiers(count_on, &mandatory) {
+                    deficits += 1;
                     // Bug BH — exclude a node that already holds this chunk ON
                     // THE TARGET TIER, but a node holding it on a DIFFERENT
                     // tier is still a valid target (single-node multi-tier
@@ -285,6 +291,7 @@ impl TaskScheduler {
                             "REV-3-4: re-replication task budget reached for this tick; \
                              remaining deficits resume next tick"
                         );
+                        crate::mgr_metrics::m().sched_budget_hits.inc();
                         return;
                     }
                     // Repair is never refused by the link budget; it borrows.
@@ -315,12 +322,15 @@ impl TaskScheduler {
                         "Bug BX-4 auto-scheduled re-replication for a short mandated tier"
                     );
                     migration_state.tasks.insert(task_id, task);
+                    crate::mgr_metrics::TASKS_CREATED.with("repair").inc();
                     live_index.insert((chunk_hash.clone(), target, tier));
                     created += 1;
                     live_tasks += 1;
                 }
             }
         }
+        // Complete scan only; a budget `return` above leaves the last value.
+        crate::mgr_metrics::leader_gauge("scheduler_under_replicated", &[]).set(deficits);
     }
 
     /// Bug AV (AV-3-3) — Auto-anchor-migration check.
@@ -738,6 +748,7 @@ impl TaskScheduler {
                         ),
                         "scheduled",
                     );
+                    crate::mgr_metrics::TASKS_CREATED.with("anchor_lag").inc();
                     migration_state.tasks.insert(task_id, task);
                     // CR-3-5/MGR-6 — update the dedup set + budget
                     // counters WITHIN this pass, so two files sharing a
@@ -841,6 +852,19 @@ pub(crate) enum ScheduleOutcome {
     /// Not scheduled: the target DC's `[[tiering.links]]` budget is spent.
     /// Nothing recorded; the caller re-plans next tick.
     Throttled,
+}
+
+impl ScheduleOutcome {
+    /// Metric label.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::New => "new",
+            Self::AlreadyScheduled => "already",
+            Self::Refused => "refused",
+            Self::Deferred => "deferred",
+            Self::Throttled => "throttled",
+        }
+    }
 }
 
 /// Pure batch planner behind `schedule_replications`: dedups per

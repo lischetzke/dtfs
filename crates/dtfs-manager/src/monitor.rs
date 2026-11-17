@@ -367,12 +367,14 @@ impl HealthMonitor {
                             "Node {} is SUSPECT -- heartbeat overdue",
                             node_id
                         );
+                        crate::mgr_metrics::NODE_TRANSITIONS.with("suspect").inc();
                         // Commit the suspect status to the cluster state machine so
                         // placement can avoid new writes to this node.
                         self.update_node_status_in_raft(*node_id, "suspect", &membership_nodes).await;
                     }
                     NodeStatus::Down => {
                         warn!(node_id = %node_id, "Node is DOWN");
+                        crate::mgr_metrics::NODE_TRANSITIONS.with("down").inc();
                         // Mark in Raft so placement and tiering stop using
                         // this node — and so the leader's scheduler tick
                         // stops counting its replicas (Bug CH:

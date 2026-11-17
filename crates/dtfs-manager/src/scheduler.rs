@@ -431,9 +431,11 @@ impl TaskScheduler {
                 consecutive_pressure_skips = 0;
             }
 
+            let t0 = std::time::Instant::now();
             if let Err(e) = self.tick().await {
                 warn!(error = %e, "Scheduler tick failed");
             }
+            crate::mgr_metrics::m().sched_tick_us.observe_duration(t0.elapsed());
         }
     }
 
@@ -501,6 +503,7 @@ impl TaskScheduler {
         if !self.is_leader() {
             tracing::trace!("Scheduler tick skipped: not leader");
             self.link_budget.lock().reset();
+            crate::mgr_metrics::clear_leader_gauges();
             return Ok(());
         }
 
@@ -558,8 +561,86 @@ impl TaskScheduler {
 
         // 3. Persist the updated migration state back to Raft.
         self.save_migration_state(&migration_state).await;
+        publish_tick_metrics(&migration_state, &self.link_budget_status());
 
         Ok(())
+    }
+}
+
+/// Metric labels for `status_counts`, same order.
+pub(crate) const STATUS_LABELS: [&str; 6] =
+    ["pending", "copying", "verifying", "completing", "done", "failed"];
+
+/// Tasks per status, in `STATUS_LABELS` order.
+pub(crate) fn status_counts(state: &MigrationState) -> [u64; 6] {
+    let mut out = [0u64; 6];
+    for t in state.tasks.values() {
+        out[match t.status {
+            MigrationStatus::Pending => 0,
+            MigrationStatus::Copying => 1,
+            MigrationStatus::Verifying => 2,
+            MigrationStatus::Completing => 3,
+            MigrationStatus::Done => 4,
+            MigrationStatus::Failed => 5,
+        }] += 1;
+    }
+    out
+}
+
+/// Issue #159 — queue depth per status and the link-budget state, leader only.
+fn publish_tick_metrics(state: &MigrationState, links: &[link_budget::LinkBacklog]) {
+    use crate::mgr_metrics::leader_gauge;
+    for (l, c) in STATUS_LABELS.iter().zip(status_counts(state)) {
+        leader_gauge("scheduler_tasks", &[("status", l)]).set(c as i64);
+    }
+    for lk in links {
+        let dc = lk.to_dc.as_str();
+        leader_gauge("scheduler_link_max_mbps", &[("to_dc", dc)]).set(lk.max_mbps as i64);
+        leader_gauge("scheduler_link_tokens_bytes", &[("to_dc", dc)]).set(lk.tokens_bytes);
+        leader_gauge("scheduler_link_skipped_requests", &[("to_dc", dc)]).set(lk.skipped_requests as i64);
+        leader_gauge("scheduler_link_skipped_bytes", &[("to_dc", dc)]).set(lk.skipped_bytes as i64);
+        leader_gauge("scheduler_link_admitted_bytes", &[("to_dc", dc), ("kind", "cache")])
+            .set(lk.admitted_cache_bytes as i64);
+        leader_gauge("scheduler_link_admitted_bytes", &[("to_dc", dc), ("kind", "repair")])
+            .set(lk.admitted_repair_bytes as i64);
+    }
+}
+
+#[cfg(test)]
+mod status_counts_tests {
+    use super::*;
+
+    fn task(id: &str, status: MigrationStatus) -> ReplicationTask {
+        ReplicationTask {
+            task_id: id.into(),
+            chunk_id: "c".into(),
+            source_node: 1,
+            target_node: 2,
+            tier: DiskTier::Hot,
+            status,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            attempts: 0,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn counts_each_status_in_label_order() {
+        let mut s = MigrationState::default();
+        for (i, st) in [MigrationStatus::Pending, MigrationStatus::Pending, MigrationStatus::Done, MigrationStatus::Failed]
+            .into_iter()
+            .enumerate()
+        {
+            s.tasks.insert(format!("t{i}"), task(&format!("t{i}"), st));
+        }
+        assert_eq!(status_counts(&s), [2, 0, 0, 0, 1, 1]);
+        assert_eq!(STATUS_LABELS[4], "done");
+    }
+
+    #[test]
+    fn empty_state_counts_zero() {
+        assert_eq!(status_counts(&MigrationState::default()), [0; 6]);
     }
 }
 

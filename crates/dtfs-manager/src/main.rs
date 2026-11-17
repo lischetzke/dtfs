@@ -12,6 +12,7 @@ mod cache_stats;
 mod goal_check;
 mod membership;
 mod metadata;
+mod mgr_metrics;
 mod monitor;
 mod placement;
 mod placement_state;
@@ -322,6 +323,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         mem_mon.run_monitor().await;
     });
+    // Issue #159 — raft/state/memory gauges, one 5 s task.
+    let _metrics_sampler = mgr_metrics::spawn_sampler(raft.clone(), sm_data.clone(), memory_budget.clone());
 
     // --- Task scheduler background task ---
 

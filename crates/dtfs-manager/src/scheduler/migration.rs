@@ -21,7 +21,14 @@ impl TaskScheduler {
         // by the fixed `MIGRATION_RPC_TIMEOUT` (Bug CN) — so a stalled data
         // node can't hang a round (and the loop). The terminal-task prune
         // runs at the START of `tick` (Bug CN), not here.
+        // Issue #159 — advance never removes tasks, so the terminal-status
+        // delta is what finished during this call.
+        let before = status_counts(state);
         advance_migration_tasks(self, state, now_ms).await;
+        let after = status_counts(state);
+        let mm = crate::mgr_metrics::m();
+        mm.tasks_finished_done.add(after[4].saturating_sub(before[4]));
+        mm.tasks_finished_failed.add(after[5].saturating_sub(before[5]));
     }
 
 

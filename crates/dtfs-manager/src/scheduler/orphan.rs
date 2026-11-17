@@ -196,6 +196,14 @@ impl TaskScheduler {
         }
         rec.finished_ms = Some(now_millis());
         *self.orphan_last_run.lock() = Some(rec.clone());
+        if !dry_run {
+            let mm = crate::mgr_metrics::m();
+            mm.orphan_run_us.observe(rec.finished_ms.unwrap_or(0).saturating_sub(rec.started_ms).saturating_mul(1000));
+            if rec.error.is_some() { mm.orphan_runs_failed.inc() } else { mm.orphan_runs_ok.inc() }
+            mm.orphan_candidates.add(rec.candidates as u64);
+            mm.orphan_reaped.add(rec.reaped as u64);
+            mm.orphan_freed_bytes.add(rec.bytes_freed.unwrap_or(0));
+        }
         if let Some(e) = &rec.error {
             warn!(trigger, grace_secs, dry_run, reaped = rec.reaped, error = %e, "orphan reap did not complete");
         } else if rec.candidates > 0 || trigger == "manual" {

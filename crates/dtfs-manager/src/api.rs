@@ -245,6 +245,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             state.clone(),
             crate::rest_auth::require_mutation_auth,
         ))
+        // Issue #159 — per-route counters and latency; outermost, so auth
+        // rejections are counted too.
+        .route_layer(middleware::from_fn(crate::mgr_metrics::rest_metrics))
         .with_state(state);
 
     // Merge API routes (higher priority) with WebUI (fallback).

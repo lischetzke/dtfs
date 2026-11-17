@@ -583,6 +583,7 @@ pub async fn run_grpc_server(
     // In-flight requests continue until they complete; main is responsible
     // for any post-server cleanup (Raft snapshot, audit flush).
     builder
+        .layer(crate::mgr_metrics::GrpcMetricsLayer)
         .add_service(
             ManagerServiceServer::new(metadata_service)
                 .max_decoding_message_size(max_message_bytes)

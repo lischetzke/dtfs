@@ -182,9 +182,16 @@ impl TieringEngine {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            let mm = crate::mgr_metrics::m();
+            let t0 = std::time::Instant::now();
             self.precache_tick().await;
+            mm.precache_tick_us.observe_duration(t0.elapsed());
+            let t0 = std::time::Instant::now();
             self.capacity_evict_tick().await;
+            mm.evict_tick_us.observe_duration(t0.elapsed());
+            let t0 = std::time::Instant::now();
             self.retention_demote_tick().await;
+            mm.retention_tick_us.observe_duration(t0.elapsed());
             self.refresh_cache_view().await;
         }
     }
@@ -298,6 +305,7 @@ impl TieringEngine {
             if batch.deferred > 0 {
                 debug!(deferred = batch.deferred, "precache: scheduling deferred, re-planned next tick");
             }
+            crate::mgr_metrics::m().precache_bytes.add(batch.bytes);
             if batch.new > 0 {
                 let (cursors, series) = (plan.status.cursors.len(), plan.status.series.len());
                 info!(new = batch.new, deferred = batch.deferred, bytes = batch.bytes, cursors, series, "precache: copies scheduled");
@@ -696,9 +704,11 @@ impl TieringEngine {
         // temperature-based path. Volumes without a `cache_replicas`
         // policy produce no plan (the planner skips them); volumes
         // WITH a policy drive the new opportunistic cache lifecycle.
+        let t0 = std::time::Instant::now();
         if let Err(e) = self.tick_av_cache().await {
             warn!(error = %e, "Bug AV tick_av_cache failed");
         }
+        crate::mgr_metrics::m().tiering_tick_us.observe_duration(t0.elapsed());
 
         Ok(())
     }

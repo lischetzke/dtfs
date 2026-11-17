@@ -131,9 +131,13 @@ impl CacheStats {
 
     pub(crate) fn note_removed(&self, r: Removed) {
         self.counters.lock().removed[r as usize] += 1;
+        crate::mgr_metrics::CACHE_REMOVED.with(REMOVED_LABELS[r as usize]).inc();
     }
 
     pub(crate) fn note_fill(&self, dc: &str, bytes: u64) {
+        let dc_l = dc.to_ascii_lowercase();
+        crate::mgr_metrics::CACHE_FILL_COMMITS.with(&dc_l).inc();
+        crate::mgr_metrics::CACHE_FILL_BYTES.with(&dc_l).add(bytes);
         let mut c = self.counters.lock();
         let e = c.fill.entry(dc.to_ascii_lowercase()).or_default();
         e.0 += 1;
@@ -141,6 +145,11 @@ impl CacheStats {
     }
 
     pub(crate) fn note_scheduled(&self, kind: Scheduled, dc: &str) {
+        let dc_l = dc.to_ascii_lowercase();
+        match kind {
+            Scheduled::Promote => crate::mgr_metrics::PROMOTE_COPIES.with(&dc_l).inc(),
+            Scheduled::Precache => crate::mgr_metrics::PRECACHE_COPIES.with(&dc_l).inc(),
+        }
         let mut c = self.counters.lock();
         let m = match kind {
             Scheduled::Promote => &mut c.promote,

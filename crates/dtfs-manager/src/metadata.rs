@@ -317,7 +317,8 @@ impl MetadataService {
     /// non-leader. This wrapper proxies the request to the leader via the
     /// `ForwardClientWrite` RPC instead of dropping it.
     async fn raft_write_or_forward(&self, req: ClientRequest) -> Result<ClientResponse, Status> {
-        match self.raft.client_write(req.clone()).await {
+        let t0 = std::time::Instant::now();
+        let res = match self.raft.client_write(req.clone()).await {
             Ok(resp) => Ok(resp.data),
             Err(e) => {
                 let msg = format!("{e}");
@@ -328,12 +329,28 @@ impl MetadataService {
                     Err(Status::internal(format!("Raft write failed: {e}")))
                 }
             }
+        };
+        crate::mgr_metrics::m().raft_write_or_forward_us.observe_duration(t0.elapsed());
+        res
+    }
+
+    /// Issue #159 — counts and times the forward, then runs
+    /// `proxy_to_leader_inner`.
+    async fn proxy_to_leader(&self, req: ClientRequest) -> Result<ClientResponse, Status> {
+        let mm = crate::mgr_metrics::m();
+        crate::mgr_metrics::FORWARDED.with(client_request_variant_name(&req)).inc();
+        let t0 = std::time::Instant::now();
+        let res = self.proxy_to_leader_inner(req).await;
+        mm.raft_forward_us.observe_duration(t0.elapsed());
+        if res.is_err() {
+            mm.raft_forward_failed.inc();
         }
+        res
     }
 
     /// Bug BL — forward a `ClientRequest` to the current Raft leader and
     /// return the leader's `ClientResponse`.
-    async fn proxy_to_leader(&self, req: ClientRequest) -> Result<ClientResponse, Status> {
+    async fn proxy_to_leader_inner(&self, req: ClientRequest) -> Result<ClientResponse, Status> {
         use openraft::async_runtime::watch::WatchReceiver;
         let leader_id = self
             .raft
@@ -957,6 +974,7 @@ pub(crate) async fn write_via_leader(
             if !is_forward_to_leader_err(&msg) {
                 return Err(msg);
             }
+            crate::mgr_metrics::FORWARDED.with(client_request_variant_name(&req)).inc();
             let leader_id = raft
                 .metrics()
                 .borrow_watched()
@@ -2549,6 +2567,7 @@ impl ManagerService for MetadataService {
             request.metadata(),
         )?;
         let body = request.into_inner();
+        crate::mgr_metrics::m().forward_received.inc();
         let req: ClientRequest = serde_json::from_slice(&body.client_request_json)
             .map_err(|e| Status::invalid_argument(format!("bad ClientRequest json: {e}")))?;
         // MGR-11 — CO-2-2 only authenticates WHO is forwarding, not WHAT is
@@ -2735,12 +2754,14 @@ impl ManagerService for MetadataService {
         // huge loop while every writer waits behind it.
         validate_num_chunks(req.num_chunks, MAX_CHUNKS_PER_ALLOCATION)
             .map_err(Status::invalid_argument)?;
+        crate::mgr_metrics::m().alloc_chunks.observe(req.num_chunks as u64);
 
         self.placement.rebuild_ring(&self.sm_data).await;
 
         let data = self.sm_data.read().await;
 
         if data.nodes.is_empty() {
+            crate::mgr_metrics::ALLOC_REJECTS.with("no_nodes").inc();
             return Err(Status::unavailable("No data nodes available"));
         }
 
@@ -3031,6 +3052,7 @@ impl ManagerService for MetadataService {
                     .allow
                     .unwrap_or(pcfg.allow_capacity_spill);
                 if !spill_allowed {
+                    crate::mgr_metrics::ALLOC_REJECTS.with("spill_disabled").inc();
                     return Err(Status::unavailable(format!(
                         "No healthy data node has free space on tier {effective_tier:?} (all candidate disks below placement headroom or excluded); capacity spill disabled for this volume"
                     )));
@@ -3061,6 +3083,7 @@ impl ManagerService for MetadataService {
                     .unwrap_or_else(|| dtfs_common::topology::Location::new("", "", "", ""));
                 let ranked = crate::placement::rank_candidates(&candidates, &requester);
                 let Some(best) = ranked.first() else {
+                    crate::mgr_metrics::ALLOC_REJECTS.with("no_space").inc();
                     return Err(Status::unavailable(
                         "No data node has free space on any maintained tier (cluster full, or only cache-only tiers left); cannot spill",
                     ));
@@ -3210,8 +3233,10 @@ impl ManagerService for MetadataService {
             (chunks, ack_floor, min_committed)
         }; // sm_data lock released here
 
+        crate::mgr_metrics::m().commit_chunks.observe(chunks.len() as u64);
         let unresolved = unresolved_commit_nodes(&chunks);
         if !unresolved.is_empty() {
+            crate::mgr_metrics::COMMIT_REJECTS.with("unresolved_node").inc();
             tracing::warn!(
                 path = %req.path,
                 addresses = ?unresolved,
@@ -3236,6 +3261,7 @@ impl ManagerService for MetadataService {
         // gate lives at the manager boundary (defence-in-depth), NOT inside
         // the raft state machine, so there is no snapshot-compat impact.
         if (min_committed as u64) < ack_floor as u64 {
+            crate::mgr_metrics::COMMIT_REJECTS.with("replica_floor").inc();
             tracing::warn!(
                 path = %req.path,
                 volume = %req.volume_id,
@@ -3275,6 +3301,7 @@ impl ManagerService for MetadataService {
             // Bug P — lease_id didn't match the currently-held lease.
             // FUSE client must surface this so the writer aborts.
             ClientResponse::WriteLeaseConflict { owner_id, .. } => {
+                crate::mgr_metrics::COMMIT_REJECTS.with("lease_conflict").inc();
                 Ok(Response::new(CommitChunkLocationsResponse {
                     success: false,
                     lease_conflict: true,
@@ -3561,23 +3588,29 @@ impl ManagerService for MetadataService {
             ClientResponse::WriteLeaseGranted {
                 lease_id,
                 expires_at_ms,
-            } => Ok(Response::new(AcquireWriteLeaseResponse {
+            } => {
+                crate::mgr_metrics::m().lease_granted.inc();
+                Ok(Response::new(AcquireWriteLeaseResponse {
                 granted: true,
                 lease_id,
                 expires_at_ms,
                 conflict_owner: String::new(),
                 conflict_expires_at_ms: 0,
-            })),
+            }))
+            }
             ClientResponse::WriteLeaseConflict {
                 owner_id,
                 expires_at_ms,
-            } => Ok(Response::new(AcquireWriteLeaseResponse {
+            } => {
+                crate::mgr_metrics::m().lease_denied.inc();
+                Ok(Response::new(AcquireWriteLeaseResponse {
                 granted: false,
                 lease_id: String::new(),
                 expires_at_ms: 0,
                 conflict_owner: owner_id,
                 conflict_expires_at_ms: expires_at_ms,
-            })),
+            }))
+            }
             ClientResponse::Error { message } => Err(Status::internal(message)),
             _ => Err(Status::internal("unexpected AcquireWriteLease response")),
         }
