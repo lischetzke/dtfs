@@ -53,6 +53,7 @@ jobs:
       - name: Script guards
         run: |
           bash scripts/tests/test-ci-version.sh
+          bash scripts/tests/test-release-notes.sh
           bash scripts/tests/test-dtfs-install.sh
           bash scripts/tests/check-webui-js.sh
           bash scripts/dtfs-cluster-healthcheck.sh --help >/dev/null

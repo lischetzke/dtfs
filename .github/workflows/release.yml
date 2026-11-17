@@ -136,6 +136,18 @@ jobs:
           args: --tag ${{ needs.prepare.outputs.version }} --unreleased --strip header
         env:
           OUTPUT: notes.md
+      - name: Compose the release notes (commit body + changelog)
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          msg=()
+          # A manual run has no release commit: changelog only.
+          if [ "$EVENT" != "workflow_dispatch" ]; then
+            git log -1 --format=%B "$GITHUB_SHA" > commit-message.txt
+            msg=(commit-message.txt)
+          fi
+          bash scripts/ci/release-notes.sh "$VERSION" notes.md "${msg[@]}" > release-notes.md
       - name: Create the tag and GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -144,4 +156,4 @@ jobs:
           [ ! -f dist/SHA256SUMS.minisig ] || assets+=(dist/SHA256SUMS.minisig)
           # Same shape as `scripts/dtfs-release.sh <version> --publish`.
           gh release create "$VERSION" "${assets[@]}" \
-            --title "$VERSION" --target "$GITHUB_SHA" --notes-file notes.md
+            --title "$VERSION" --target "$GITHUB_SHA" --notes-file release-notes.md

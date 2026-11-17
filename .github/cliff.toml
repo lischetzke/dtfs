@@ -9,8 +9,10 @@
 #     commit body routes it into that section regardless of prefix.
 #   - a `Known-issue:` trailer routes it into Known Issues.
 # .github/workflows/release.yml (orhun/git-cliff-action) and, when
-# git-cliff is installed, scripts/dtfs-release.sh produce `notes.md` for
-# `gh release create --notes-file`.
+# git-cliff is installed, scripts/dtfs-release.sh produce `notes.md`;
+# scripts/ci/release-notes.sh puts the release commit body (highlights,
+# .github/release-notes-template.md) in front of it for
+# `gh release create --notes-file`. `release vX.Y.Z` commits are skipped.
 
 [changelog]
 header = ""
@@ -34,6 +36,8 @@ filter_commits = false
 tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
 commit_preprocessors = []
 commit_parsers = [
+  # First: a release commit's body may carry trailers that would route it.
+  { message = "^release v", skip = true },
   { message = "Breaking:", group = "Breaking Changes" },
   { message = "Update-required:", group = "Special Requirements for Updates" },
   { message = "Known-issue:", group = "Known Issues" },

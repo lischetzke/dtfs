@@ -63,15 +63,36 @@ never ships. A release can also be started without a commit: Actions >
    `SHA256SUMS`. The stamp is verified before the files are uploaded as the
    `dist` artifact.
 3. `publish` refuses an existing tag or release, signs `SHA256SUMS` when
-   signing is configured (below), generates the notes with `git-cliff` from
-   `.github/cliff.toml` (commit subjects and `Breaking:` / `Update-required:` /
-   `Known-issue:` trailers) and runs `gh release create vX.Y.Z` with the tarball,
+   signing is configured (below), composes the notes (next section) and runs
+   `gh release create vX.Y.Z` with the tarball,
    `SHA256SUMS` and, when signed, `SHA256SUMS.minisig`. The release creates the tag
    at the built commit. The same command is what
    `scripts/dtfs-release.sh vX.Y.Z --publish` runs by hand.
 
 Naming, URLs and how to verify a download are in
 [Release Artifacts](../deployment/artifacts.md).
+
+## Release notes
+
+`scripts/ci/release-notes.sh <version> <cliff-notes> [<commit-message>]`
+composes the notes in this order: `Welcome to DTFS vX.Y.Z!`, the body of the
+release commit, an Upgrading block with the version filled in, `---`, and
+`## What's Changed` with the `git-cliff` changelog (`.github/cliff.toml`:
+commit subjects and `Breaking:` / `Update-required:` / `Known-issue:`
+trailers; `release vX.Y.Z` commits are skipped). The commit body is the
+hand-written part (summary, optional update warning and known issues,
+highlights with one subsection each): there is no changelog file in the
+repository. The script removes the commit subject and the trailing trailer
+paragraph (`Co-Authored-By`, `Claude-Session`, ...) from the body. A
+`workflow_dispatch` run has no release commit, so it gets the welcome line,
+Upgrading and the changelog only; so does a release commit without a body.
+
+To write the release commit, copy `.github/release-notes-template.md`, fill in
+the sections you need, and commit the file with `git commit -F <file>`
+(`-F` keeps the markdown `#` lines; add `--cleanup=verbatim` when you use an
+editor). Style rules are in the template. `scripts/dtfs-release.sh --publish`
+uses the same script, taking the body from the current commit when its subject
+starts with `release `.
 
 ## Release signing (optional)
 

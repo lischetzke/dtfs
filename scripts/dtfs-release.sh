@@ -99,7 +99,14 @@ if command -v git-cliff >/dev/null 2>&1; then
     step "Generating release notes with git-cliff"
     if git-cliff --config "$PROJECT_ROOT/.github/cliff.toml" --tag "$VERSION" --unreleased --strip header -o "$OUT_DIR/notes.md"; then
         info "wrote $OUT_DIR/notes.md"
-        NOTES_ARGS=(--notes-file "$OUT_DIR/notes.md")
+        # Same composition as release.yml: release commit body + changelog.
+        MSG_ARGS=()
+        if git log -1 --format=%s | grep -q '^release '; then
+            git log -1 --format=%B > "$OUT_DIR/commit-message.txt"
+            MSG_ARGS=("$OUT_DIR/commit-message.txt")
+        fi
+        bash "$PROJECT_ROOT/scripts/ci/release-notes.sh" "$VERSION" "$OUT_DIR/notes.md" "${MSG_ARGS[@]}" > "$OUT_DIR/release-notes.md"
+        NOTES_ARGS=(--notes-file "$OUT_DIR/release-notes.md")
     else
         warn "git-cliff failed; release gets a one-line body"
     fi
