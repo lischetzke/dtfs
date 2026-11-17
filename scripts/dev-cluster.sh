@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Local Docker dev cluster: 3 managers + 3 data nodes (+ optional FUSE/NFS
 # clients) for runtime checks. Only needs docker and bash. See --help.
+# metrics-check (DTFS_DEV_METRICS=1): InfluxDB v1/v2 + Grafana containers on the dev
+# network; helper scripts/dev-cluster-metrics.py runs in a container for the queries.
 set -euo pipefail
 export MSYS_NO_PATHCONV=1   # Git Bash on Windows must not rewrite /paths
 
@@ -30,7 +32,7 @@ Usage: scripts/dev-cluster.sh <command>
 
   up [--no-build]   build, copy binaries, write configs, start 3 managers and
                     3 data nodes, wait for 3 healthy data nodes
-  deploy            rebuild, copy binaries, restart all daemons, wait healthy
+  deploy [--no-build]  rebuild, copy binaries, restart all daemons, wait healthy
   status            container states and a cluster summary from the REST API
   fuse [cmd...]     start (or reuse) the FUSE client container; with args, run
                     them inside it: fuse sh -c 'echo hi > /mnt/dtfs/x'
@@ -51,7 +53,14 @@ Usage: scripts/dev-cluster.sh <command>
                     one by one into data02's 512 MiB tmpfs, 60/50 watermarks, ~8 min):
                     usage reaches high, evicts oldest-read down to low, fills keep
                     going. Needs DTFS_DEV_VERSION=v0.1.17 DTFS_DEV_CACHE=1 up
-  down              remove all dtfs-dev-* containers, network and volumes
+  metrics-check     InfluxDB metrics pipeline end to end (~25 min, with the overhead runs).
+                    Starts influx v1/v2 + Grafana, runs a workload, then PASS/FAIL for:
+                    series from manager/data/fuse in both versions, proxy counters,
+                    gzip vs none POST, proxy failover (stops the manager the nodes push to),
+                    every dashboard panel query through Grafana (DATA/EMPTY/FAIL), and
+                    big-file overhead on/off/on/off (DTFS_DEV_METRICS_OVERHEAD_GIB, default
+                    2, 0 skips). Needs DTFS_DEV_METRICS=1 up (or deploy)
+  down              remove all dtfs-dev-* containers, network and volumes (incl. influx/Grafana)
 
 Topology: mgr01/02/03 (leli/toro/nrb), data01 leli cold, data02 toro warm,
 data03 nrb warm. Network dtfs-dev-net 172.31.250.0/24. REST published on host
@@ -66,6 +75,12 @@ makes data02's /mnt/d0 a 512 MiB tmpfs volume (placement min_free_bytes 1 MiB: t
 default headroom would exclude it) and writes nfs-toro.toml/fuse-bulk.toml.
 tmpfs content is lost when data02 restarts (deploy), so cache mode needs a fresh
 down + up.
+DTFS_DEV_METRICS=1 (with up/deploy) writes [metrics] into the configs: managers push to
+InfluxDB 1.8.10 and 2.7.11 (dtfs-dev-influx1/2, admin/dtfs-dev-pass, v2 token dtfs-dev-token,
+mgr01/02 gzip, mgr03 none); data nodes and FUSE clients proxy through a manager (gzip, 20 s
+flush). Grafana 11.6.0 is on host port 23000 (admin/dtfs-dev-grafana). deploy with
+DTFS_DEV_METRICS set (1 or 0) rewrites all configs, 0 switches metrics off (a cache-mode
+cluster also needs DTFS_DEV_CACHE=1 then). deploy --no-build skips the build.
 DTFS_DEV_RUST_LOG (default info) sets RUST_LOG for the FUSE/NFS client containers.
 No systemd, journald or sshd in the containers: MCP host_* tools and Ansible
 do not apply.
@@ -86,6 +101,23 @@ copy_bins() {
   # cp to tmp + mv so running daemons keep their old inode
   drun -v "$TARGET_VOL:/target:ro" -v "$BINVOL:/opt/dtfs" "$IMG" sh -c \
     "set -e; for b in $BINS; do cp /target/release/\$b /opt/dtfs/\$b.new && mv /opt/dtfs/\$b.new /opt/dtfs/\$b; done"
+}
+
+# DTFS_DEV_METRICS=1: managers push to InfluxDB v1 + v2 (mgr01/02 gzip, mgr03 none);
+# data nodes and FUSE clients have no server and proxy through a manager.
+MX_PASS="dtfs-dev-pass"; MX_TOKEN="dtfs-dev-token"; GF_PASS="dtfs-dev-grafana"
+INFLUX1_IMG=influxdb:1.8.10; INFLUX2_IMG=influxdb:2.7.11; GRAFANA_IMG=grafana/grafana:11.6.0
+
+metrics_cfg() { # metrics_cfg manager <gzip|none> | metrics_cfg proxy
+  [ "${DTFS_DEV_METRICS:-}" = 1 ] || return 0
+  if [ "$1" = proxy ]; then
+    printf '[metrics]\nmode = "proxy"\ncompression = "gzip"\npush_interval_secs = 10\nflush_interval_secs = 20\n'
+  else
+    # buffer_max_kb: 7 nodes x ~100 KB snapshot x 2 flush/push, with margin
+    printf '[metrics]\npush_interval_secs = 10\nbuffer_max_kb = 8192\ncompression = "%s"\n' "$2"
+    printf '[[metrics.servers]]\nname = "influx1"\nkind = "influxdb_v1"\nurl = "http://dtfs-dev-influx1:8086"\ndatabase = "dtfs"\nusername = "admin"\npassword = "%s"\n' "$MX_PASS"
+    printf '[[metrics.servers]]\nname = "influx2"\nkind = "influxdb_v2"\nurl = "http://dtfs-dev-influx2:8086"\norg = "dtfs"\nbucket = "dtfs"\ntoken = "%s"\n' "$MX_TOKEN"
+  fi
 }
 
 put_cfg() { # put_cfg <file>  (content on stdin)
@@ -128,6 +160,7 @@ $([ "${DTFS_DEV_CACHE:-}" = 1 ] && printf '[placement]
 min_free_bytes = 1048576
 ')
 EOF
+  metrics_cfg manager "$([ "$n" = mgr03 ] && echo none || echo gzip)"
 }
 
 data_cfg() {
@@ -157,6 +190,7 @@ $([ "${DTFS_DEV_CACHE:-}" = 1 ] && printf '[placement]
 min_free_bytes = 1048576
 ')
 EOF
+  metrics_cfg proxy
 }
 
 fuse_cfg() { # fuse_cfg <host> <allow_other> [dc] [volume_id] [chunk_size_mb]
@@ -182,6 +216,7 @@ EOF
   if [ -n "${DTFS_DEV_ASYNC_COMMIT:-}" ]; then
     printf '[write]\nasync_commit = true\nasync_commit_secs = %s\n' "$DTFS_DEV_ASYNC_COMMIT"
   fi
+  metrics_cfg proxy
 }
 
 write_configs() {
@@ -246,16 +281,55 @@ wait_healthy() {
   die "cluster did not become healthy"
 }
 
+ensure_metrics_servers() { # InfluxDB v1 + v2 on dtfs-dev-net, fixed dev credentials, data on named volumes
+  ensure_net
+  running dtfs-dev-influx1 || { exists dtfs-dev-influx1 && docker rm -f dtfs-dev-influx1 >/dev/null
+    docker run -d --name dtfs-dev-influx1 --network $NET -e INFLUXDB_DB=dtfs -e INFLUXDB_HTTP_AUTH_ENABLED=true \
+      -e INFLUXDB_ADMIN_USER=admin -e INFLUXDB_ADMIN_PASSWORD=$MX_PASS -v dtfs-dev-influx1-data:/var/lib/influxdb \
+      $INFLUX1_IMG >/dev/null; }
+  running dtfs-dev-influx2 || { exists dtfs-dev-influx2 && docker rm -f dtfs-dev-influx2 >/dev/null
+    docker run -d --name dtfs-dev-influx2 --network $NET -e DOCKER_INFLUXDB_INIT_MODE=setup \
+      -e DOCKER_INFLUXDB_INIT_USERNAME=admin -e DOCKER_INFLUXDB_INIT_PASSWORD=${MX_PASS}12 \
+      -e DOCKER_INFLUXDB_INIT_ORG=dtfs -e DOCKER_INFLUXDB_INIT_BUCKET=dtfs -e DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=$MX_TOKEN \
+      -v dtfs-dev-influx2-data:/var/lib/influxdb2 $INFLUX2_IMG >/dev/null; }
+  local i
+  for i in $(seq 1 60); do
+    docker exec dtfs-dev-influx1 curl -s -u admin:$MX_PASS "http://localhost:8086/query?q=SHOW+DATABASES" 2>/dev/null | grep -q dtfs \
+      && docker exec dtfs-dev-influx2 influx ping >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  die "InfluxDB containers did not become ready"
+}
+
+start_grafana() {
+  running dtfs-dev-grafana || { exists dtfs-dev-grafana && docker rm -f dtfs-dev-grafana >/dev/null
+    docker run -d --name dtfs-dev-grafana --network $NET -p 23000:3000 -e GF_SECURITY_ADMIN_USER=admin \
+      -e GF_SECURITY_ADMIN_PASSWORD=$GF_PASS -v dtfs-dev-grafana-data:/var/lib/grafana $GRAFANA_IMG >/dev/null; }
+  local i
+  for i in $(seq 1 60); do
+    docker exec dtfs-dev-grafana curl -sf http://localhost:3000/api/health >/dev/null 2>&1 && return 0
+    sleep 2
+  done
+  die "Grafana did not become ready"
+}
+
 cmd_up() {
   local nb=0; [ "${1:-}" = --no-build ] && nb=1
   docker image inspect "$IMG" >/dev/null 2>&1 || die "image $IMG missing (see CLAUDE.md A.4)"
   if [ $nb = 0 ]; then build; fi
+  if [ "${DTFS_DEV_METRICS:-}" = 1 ]; then ensure_metrics_servers; fi
   copy_bins; write_configs; ensure_cache_vol; start_all; wait_healthy
   log "REST: mgr01 http://127.0.0.1:29402 mgr02 :29412 mgr03 :29422"
 }
 
 cmd_deploy() {
-  build; copy_bins
+  if [ "${1:-}" != --no-build ]; then build; fi
+  copy_bins
+  # DTFS_DEV_METRICS set (1 or 0) rewrites the configs, so a deploy switches metrics on or off
+  if [ -n "${DTFS_DEV_METRICS+x}" ]; then
+    if [ "$DTFS_DEV_METRICS" = 1 ]; then ensure_metrics_servers; fi
+    write_configs
+  fi
   for n in $MGRS $DATAS; do exists dtfs-dev-$n || die "cluster not up (run: up)"; done
   for n in fuse nfs; do exists dtfs-dev-$n && docker rm -f dtfs-dev-$n >/dev/null; done
   docker restart $(for n in $MGRS $DATAS; do echo dtfs-dev-$n; done) >/dev/null
@@ -958,6 +1032,72 @@ cmd_cache_check3() {
   exit $RC
 }
 
+mpy() { # run the python helper on dtfs-dev-net
+  docker run --rm --network $NET -v "$HOST_ROOT/scripts:/scripts:ro" -v "$HOST_ROOT/deploy/grafana:/grafana:ro" \
+    "$IMG" python3 -I /scripts/dev-cluster-metrics.py "$@"
+}
+
+# metrics_overhead <GiB>: big-file with metrics on/off/on/off (deploy switches), ends with metrics on
+metrics_overhead() {
+  local g=$1 mode out i; local -a on_w=() on_r=() off_w=() off_r=()
+  for mode in 1 0 1 0; do
+    log "overhead: deploy with metrics $mode, big-file $g"
+    DTFS_DEV_METRICS=$mode cmd_deploy --no-build >/dev/null
+    out="$(cmd_big_file "$g" 2>&1)"; echo "$out" | grep -E '^(write|read):|FAIL' | sed "s/^/  metrics=$mode /"
+    if [ $mode = 1 ]; then
+      on_w+=("$(echo "$out" | awk '/^write:/{print $2}')"); on_r+=("$(echo "$out" | awk '/^read:/{print $2}')")
+    else
+      off_w+=("$(echo "$out" | awk '/^write:/{print $2}')"); off_r+=("$(echo "$out" | awk '/^read:/{print $2}')")
+    fi
+  done
+  for i in write read; do
+    local a b; if [ $i = write ]; then a="${on_w[*]}"; b="${off_w[*]}"; else a="${on_r[*]}"; b="${off_r[*]}"; fi
+    awk -v what="$i" -v a="$a" -v b="$b" 'function st(s, arr,  n, i, m, lo, hi) { n = split(s, arr, " "); m = 0; lo = 1e18; hi = 0
+        for (i = 1; i <= n; i++) { m += arr[i]; if (arr[i] < lo) lo = arr[i]; if (arr[i] > hi) hi = arr[i] }
+        R_mean = m / n; R_rng = hi - lo }
+      BEGIN { st(a, x); mon = R_mean; ron = R_rng; st(b, y); moff = R_mean; roff = R_rng
+        diff = (mon - moff) / moff * 100; noise = (ron > roff ? ron : roff) / moff * 100
+        printf "%s: on mean %.1f MB/s (runs %s), off mean %.1f MB/s (runs %s), diff %+.2f%%, run-to-run range %.2f%%\n", what, mon, a, moff, b, diff, noise
+        if (diff > -2) print "PASS: overhead " what ": metrics on is not more than 2% slower"
+        else if (noise > -diff) printf "PASS: overhead %s: slowdown %.2f%% is within the noise band %.2f%% (inconclusive against the 2%% target)\n", what, -diff, noise
+        else printf "FAIL: overhead %s: metrics on is %.2f%% slower, noise only %.2f%%\n", what, -diff, noise }'
+  done
+  log "overhead: leaving the cluster deployed with metrics on"
+  DTFS_DEV_METRICS=1 cmd_deploy --no-build >/dev/null
+}
+
+cmd_metrics_check() {
+  running dtfs-dev-mgr01 || die "cluster not up (run: DTFS_DEV_METRICS=1 up)"
+  docker exec dtfs-dev-mgr01 grep -q 'metrics.servers' /etc/dtfs/mgr01.toml || die "no [metrics] in the configs: run with DTFS_DEV_METRICS=1 up (or deploy)"
+  ensure_metrics_servers; start_grafana
+  local LOG; LOG="$(mktemp)"; local t0
+  run() { "$@" 2>&1 | tee -a "$LOG" || true; }
+  log "workload: 200 small files, ls/cat/rm, big-file 1"
+  start_client fuse fuse.toml 0
+  docker exec dtfs-dev-fuse bash -c 'mkdir -p /mnt/dtfs/mx; for i in $(seq 1 200); do head -c 65536 /dev/urandom > /mnt/dtfs/mx/f$i; done; ls -lR /mnt/dtfs/mx >/dev/null; cat /mnt/dtfs/mx/* >/dev/null; rm -f /mnt/dtfs/mx/f1?'
+  run cmd_big_file 1
+  log "waiting 75 s for push + flush (10 s snapshots, 20 s flush)"; sleep 75
+  log "a. series per role"; run mpy series
+  log "b. proxy counters"; run mpy proxy
+  log "d. gzip vs none POST (managers: $(for m in $MGRS; do printf '%s=%s ' $m "$(docker exec dtfs-dev-$m grep -h '^compression' /etc/dtfs/$m.toml | tr -d ' ')"; done))"; run mpy gzip
+  log "e. dashboards in Grafana (http://127.0.0.1:23000 admin/$GF_PASS)"; run mpy dash
+  log "c. failover"
+  local tgt; tgt="$(mpy target 45 | tee -a "$LOG" | awk '/^TARGET /{print $2}')"
+  echo "data nodes and FUSE push to: $tgt (first of the address lists: mgr01)" | tee -a "$LOG"
+  [ -n "$tgt" ] || die "no manager received proxied batches"
+  t0=$(date +%s); docker stop dtfs-dev-$tgt >/dev/null; echo "stopped $tgt at $t0" | tee -a "$LOG"
+  sleep 75
+  run mpy fresh $((t0 + 30))
+  local tgt2; tgt2="$(mpy target 30 | tee -a "$LOG" | awk '/^TARGET /{print $2}')"
+  if [ "$tgt2" != "$tgt" ] && [ -n "$tgt2" ]; then pass "after stopping $tgt the proxied batches go to $tgt2" | tee -a "$LOG"
+  else fail "proxied batches did not move off $tgt (now: ${tgt2:-none})" | tee -a "$LOG"; fi
+  docker start dtfs-dev-$tgt >/dev/null; wait_healthy
+  sleep 45; run mpy series
+  if [ "${DTFS_DEV_METRICS_OVERHEAD_GIB:-2}" != 0 ]; then run metrics_overhead "${DTFS_DEV_METRICS_OVERHEAD_GIB:-2}"; fi
+  log "metrics-check: $(grep -c '^PASS' "$LOG" || true) PASS, $(grep -c '^FAIL' "$LOG" || true) FAIL (log $LOG)"
+  [ "$(grep -c '^FAIL' "$LOG" || true)" = 0 ]
+}
+
 cmd_down() {
   local c; c="$(docker ps -aq --filter name=dtfs-dev-)"
   # shellcheck disable=SC2086
@@ -971,7 +1111,7 @@ cmd_down() {
 
 case "${1:-}" in
   up) shift; cmd_up "$@";;
-  deploy) cmd_deploy;;
+  deploy) shift; cmd_deploy "$@";;
   status) cmd_status;;
   fuse) shift; cmd_fuse "$@";;
   nfs-check) cmd_nfs_check;;
@@ -981,6 +1121,7 @@ case "${1:-}" in
   cache-check) cmd_cache_check;;
   cache-check2) cmd_cache_check2;;
   cache-check3) cmd_cache_check3;;
+  metrics-check) cmd_metrics_check;;
   down) cmd_down;;
   -h|--help|help|"") usage;;
   *) usage >&2; exit 2;;
