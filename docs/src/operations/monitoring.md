@@ -118,7 +118,10 @@ cluster. Two modes (`mode`):
   access. Data nodes start at the manager that last accepted (first the first one of
   `[cluster]`), FUSE clients at their active manager; on a connect error, `Unavailable`, `Unimplemented`,
   `FailedPrecondition`, `DeadlineExceeded`, `Cancelled` or `Unknown` the node tries the next
-  configured manager. When every manager fails, the batches stay in the node's bounded
+  configured manager. The order is the node's usual manager order (`manager_addr`, then
+  `manager_addrs`), so making a manager in the node's own DC its `manager_addr` keeps the
+  metrics, like its other manager calls, off the inter-DC link (gzip with a 60 s flush is
+  about 2 KB/min per node on the dev cluster). When every manager fails, the batches stay in the node's bounded
   queue (`buffer_max_kb`, drops counted in `dtfs_metrics_dropped_batches{server="proxy"}`)
   for the next flush. With `cluster.shared_secret` set the call carries the
   `dtfs-mgr-rpc` HMAC (binding: BLAKE3 of the payload). Mixed versions: a manager

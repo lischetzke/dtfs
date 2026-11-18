@@ -298,7 +298,7 @@ A manager with at least one `[[metrics.servers]]` also accepts `PushMetrics` bat
 | `push_interval_secs` | u64 | `10` | Snapshot interval. **Validated**: > 0. |
 | `timeout_secs` | u64 | `5` | HTTP (or `PushMetrics`) timeout per send. **Validated**: > 0. |
 | `buffer_max_kb` | u64 | `1024` | Retry buffer per server (one `proxy` buffer in proxy mode). **Validated**: > 0. |
-| `mode` | string | `direct` | `direct`: push to `[[metrics.servers]]`. `proxy` (data and FUSE only): send to a manager, which forwards. **Validated**: a manager refuses `proxy`; `proxy` with `[[metrics.servers]]` is refused; any other value is refused. |
+| `mode` | string | `direct` | `direct`: push to `[[metrics.servers]]`. `proxy` (data and FUSE only): send to a manager, which forwards; managers are tried in `manager_addr`, `manager_addrs` order, so set a manager in the node's own DC as `manager_addr`. **Validated**: a manager refuses `proxy`; `proxy` with `[[metrics.servers]]` is refused; any other value is refused. |
 | `flush_interval_secs` | u64 | `0` | Send every this many seconds; snapshots still accumulate every `push_interval_secs` (rounded up to whole snapshots). `0` = `push_interval_secs`. **Validated**: `0` or >= `push_interval_secs`. |
 | `compression` | string | `none` | `gzip`: gzip the InfluxDB POST body (`Content-Encoding: gzip`), or the `PushMetrics` payload in proxy mode. |
 | `[[metrics.servers]] name` | string | required | Non-empty; used in logs. |
