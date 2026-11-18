@@ -283,7 +283,8 @@ pub fn gauges_due() -> bool {
 pub async fn timed<T>(op: Op, fut: impl Future<Output = fuse3::Result<T>>) -> fuse3::Result<T> {
     let t0 = Instant::now();
     let r = fut.await;
-    fm().op_done(op, t0, r.as_ref().err().map(|e| i32::from(*e)));
+    // fuse3's `From<Errno> for c_int` negates (kernel reply form); the labels need the positive errno
+    fm().op_done(op, t0, r.as_ref().err().map(|e| -i32::from(*e)));
     r
 }
 
@@ -320,6 +321,16 @@ mod tests {
         m.op_done(Op::Rmdir, Instant::now(), None);
         assert_eq!(c(Op::Rmdir, "ENOTEMPTY").get(), e0 + 1, "success adds no error");
         assert_eq!(histogram("fuse_op_us", &[("op", "rmdir")]).count(), h0 + 2);
+    }
+
+    #[tokio::test]
+    async fn timed_labels_the_positive_errno() {
+        let c = |l: &str| counter("fuse_op_errors", &[("op", Op::Lookup.name()), ("errno", l)]);
+        let (n0, o0) = (c("ENOENT").get(), c("other").get());
+        let r: fuse3::Result<()> = timed(Op::Lookup, async { Err(fuse3::Errno::from(libc::ENOENT)) }).await;
+        assert!(r.is_err());
+        assert_eq!(c("ENOENT").get(), n0 + 1, "ENOENT counted under its own label");
+        assert_eq!(c("other").get(), o0, "not folded into other");
     }
 
     #[test]
