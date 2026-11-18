@@ -39,8 +39,8 @@
     {
       "id": 2,
       "type": "state-timeline",
-      "title": "Raft leader per manager",
-      "description": "One lane per manager: green is the Raft leader, blue a follower. Exactly one lane should be green at any time; flapping lanes mean repeated elections.",
+      "title": "Raft leader",
+      "description": "One lane per manager: green is the Raft leader, blue a follower. Exactly one lane should be green at any time; flapping lanes mean repeated elections. Green = leader, blue = follower.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
@@ -56,7 +56,8 @@
         "defaults": {
           "unit": "none",
           "color": {
-            "mode": "thresholds"
+            "mode": "fixed",
+            "fixedColor": "blue"
           },
           "custom": {
             "fillOpacity": 70,
@@ -85,10 +86,6 @@
               {
                 "color": "blue",
                 "value": null
-              },
-              {
-                "color": "green",
-                "value": 1
               }
             ]
           }
@@ -97,7 +94,7 @@
       },
       "options": {
         "mergeValues": true,
-        "showValue": "auto",
+        "showValue": "never",
         "alignValue": "left",
         "rowHeight": 0.9,
         "legend": {
@@ -121,14 +118,14 @@
           "query": "SELECT last(\"value\") AS \"v\" FROM \"dtfs_raft_is_leader\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "leader $tag_node"
+          "alias": "$tag_node"
         }
       ]
     },
     {
       "id": 3,
       "type": "stat",
-      "title": "Quorum has leader",
+      "title": "Has leader",
       "description": "Minimum of raft_has_leader over the selected managers: YES while every manager sees a leader, NO as soon as one does not (election in progress or no quorum).",
       "datasource": {
         "type": "influxdb",
@@ -212,7 +209,7 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Leader changes (range)",
+      "title": "Leader changes",
       "description": "Leader changes seen over the selected time range (largest count among the selected managers). 0 is normal; a few mean restarts or elections, many mean an unstable cluster.",
       "datasource": {
         "type": "influxdb",
@@ -285,7 +282,7 @@
     {
       "id": 5,
       "type": "stat",
-      "title": "Raft log fsync p99",
+      "title": "Log fsync p99",
       "description": "p99 of the Raft log append plus fsync (worst selected manager). Compare with Client write p99: if fsync is most of it, deferring the fsync would pay off.",
       "datasource": {
         "type": "influxdb",
@@ -321,7 +318,8 @@
                 "value": 50000
               }
             ]
-          }
+          },
+          "noValue": "n/a"
         },
         "overrides": []
       },
@@ -357,7 +355,7 @@
     {
       "id": 6,
       "type": "stat",
-      "title": "Client write p99",
+      "title": "Write p99",
       "description": "p99 of a client_write on the local Raft, from proposal to applied (worst selected manager). This is the end-to-end cost of one metadata mutation.",
       "datasource": {
         "type": "influxdb",
@@ -393,7 +391,8 @@
                 "value": 250000
               }
             ]
-          }
+          },
+          "noValue": "n/a"
         },
         "overrides": []
       },
@@ -429,7 +428,7 @@
     {
       "id": 7,
       "type": "stat",
-      "title": "Max follower lag",
+      "title": "Follower lag",
       "description": "Largest follower lag in log entries across all peers, reported by the leader. Near 0 is normal; a growing value means a follower is slow, partitioned or down.",
       "datasource": {
         "type": "influxdb",
@@ -580,7 +579,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -688,7 +687,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -765,7 +764,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -1438,7 +1437,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1503,7 +1502,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "lastNotNull",
             "max"
@@ -1709,7 +1708,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -1786,7 +1785,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -2015,7 +2014,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -2091,7 +2090,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -2216,7 +2215,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"

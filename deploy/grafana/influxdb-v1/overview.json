@@ -117,7 +117,7 @@
     {
       "id": 2,
       "type": "stat",
-      "title": "Managers reporting",
+      "title": "Managers",
       "description": "Managers that pushed a point in the last minute; expect your configured manager count (3). Red means no manager reports.",
       "datasource": {
         "type": "influxdb",
@@ -186,7 +186,7 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "Data nodes reporting",
+      "title": "Data nodes",
       "description": "Data nodes that pushed a point in the last minute. Fewer than deployed means a node is down or cannot push metrics.",
       "datasource": {
         "type": "influxdb",
@@ -255,7 +255,7 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "FUSE clients reporting",
+      "title": "FUSE clients",
       "description": "FUSE clients that pushed a point in the last minute. Fewer than mounted means a client is down or cannot push metrics.",
       "datasource": {
         "type": "influxdb",
@@ -466,7 +466,7 @@
     {
       "id": 7,
       "type": "stat",
-      "title": "Dropped metrics batches",
+      "title": "Dropped batches",
       "description": "Metrics batches dropped from a full push queue over the selected range. Non-zero means the metrics path is lossy, so other panels may have gaps.",
       "datasource": {
         "type": "influxdb",
@@ -641,7 +641,7 @@
       "id": 9,
       "type": "stat",
       "title": "FUSE op errors",
-      "description": "Failed FUSE operations over the selected range, all ops and errnos. 0 is normal; open the read-path dashboard for the split.",
+      "description": "Failed FUSE operations over the selected range. 0 is normal; open the read-path dashboard for the split. ENOENT and EEXIST are left out: a lookup of a missing name or a create of an existing one is a normal answer, not a failure (the errno panels show them).",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
@@ -699,7 +699,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT sum(\"c\") AS \"op errors\" FROM (SELECT spread(\"value\") AS \"c\" FROM \"dtfs_fuse_op_errors\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\", \"op\", \"errno\")",
+          "query": "SELECT sum(\"c\") AS \"op errors\" FROM (SELECT spread(\"value\") AS \"c\" FROM \"dtfs_fuse_op_errors\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"errno\" !~ /^(ENOENT|EEXIST)$/ GROUP BY \"node\", \"op\", \"errno\")",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "op errors"
@@ -828,7 +828,8 @@
             ]
           },
           "color": {
-            "mode": "thresholds"
+            "mode": "fixed",
+            "fixedColor": "blue"
           },
           "mappings": [
             {
@@ -909,19 +910,12 @@
               {
                 "color": "green",
                 "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 2
               }
             ]
           },
           "color": {
-            "mode": "thresholds"
+            "mode": "fixed",
+            "fixedColor": "green"
           },
           "mappings": [
             {
@@ -1120,7 +1114,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -1459,7 +1453,7 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT last(\"value\") AS \"cap\" FROM \"dtfs_memory_hard_cap_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\"",
+          "query": "SELECT last(\"value\") AS \"cap\" FROM \"dtfs_memory_hard_cap_bytes\" WHERE $timeFilter AND \"value\" > 0 AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\"",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "cap $tag_node"
@@ -1483,7 +1477,7 @@
           },
           "refId": "D",
           "hide": false,
-          "query": "SELECT last(\"value\") AS \"cap\" FROM \"dtfs_data_mem_cap_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\"",
+          "query": "SELECT last(\"value\") AS \"cap\" FROM \"dtfs_data_mem_cap_bytes\" WHERE $timeFilter AND \"value\" > 0 AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\"",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "cap $tag_node"

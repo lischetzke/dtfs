@@ -105,7 +105,7 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "Quarantines in range",
+      "title": "Quarantines",
       "description": "Chunks quarantined (renamed to .bad) on the selected disks during the selected time range. Normally 0.",
       "gridPos": {
         "h": 4,
@@ -170,7 +170,7 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Read data loss in range",
+      "title": "Read data loss",
       "description": "Reads that failed checksum verification during the selected range. Normally 0; any hit means a replica served bad bytes.",
       "gridPos": {
         "h": 4,
@@ -235,7 +235,7 @@
     {
       "id": 5,
       "type": "stat",
-      "title": "Least free disk space",
+      "title": "Least free",
       "description": "Smallest free space on any selected disk. Red below 10 GB, yellow below 50 GB.",
       "gridPos": {
         "h": 4,
@@ -270,7 +270,8 @@
           },
           "color": {
             "mode": "thresholds"
-          }
+          },
+          "noValue": "n/a"
         },
         "overrides": []
       },
@@ -330,7 +331,8 @@
           },
           "color": {
             "mode": "thresholds"
-          }
+          },
+          "noValue": "n/a"
         },
         "overrides": []
       },
@@ -390,7 +392,8 @@
           },
           "color": {
             "mode": "thresholds"
-          }
+          },
+          "noValue": "n/a"
         },
         "overrides": []
       },
@@ -460,14 +463,15 @@
             "gradientMode": "opacity",
             "showPoints": "never",
             "spanNulls": 30000
-          }
+          },
+          "min": 0
         },
         "overrides": []
       },
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "lastNotNull",
             "max"
@@ -532,7 +536,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "lastNotNull",
             "max"
@@ -580,7 +584,8 @@
             "spanNulls": 30000
           },
           "color": {
-            "mode": "thresholds"
+            "mode": "fixed",
+            "fixedColor": "green"
           },
           "thresholds": {
             "mode": "absolute",
@@ -588,10 +593,6 @@
               {
                 "color": "green",
                 "value": null
-              },
-              {
-                "color": "red",
-                "value": 1
               }
             ]
           },
@@ -771,7 +772,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -828,7 +829,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -885,7 +886,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -942,7 +943,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -999,7 +1000,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1064,7 +1065,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1322,7 +1323,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1378,7 +1379,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1434,7 +1435,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "lastNotNull",
             "max"
@@ -1490,7 +1491,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1578,7 +1579,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1634,7 +1635,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1690,7 +1691,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1746,7 +1747,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1917,7 +1918,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1973,7 +1974,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -2038,7 +2039,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -2231,8 +2232,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement == \"dtfs_data_disk_used_bytes\", start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement == \"dtfs_data_disk_used_bytes\", start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement == \"dtfs_data_disk_used_bytes\", start: -1d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement == \"dtfs_data_disk_used_bytes\", start: -1d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,
@@ -2254,8 +2255,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement == \"dtfs_data_disk_used_bytes\" and contains(value: r.dc, set: ${dc:json}), start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement == \"dtfs_data_disk_used_bytes\" and contains(value: r.dc, set: ${dc:json}), start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement == \"dtfs_data_disk_used_bytes\" and contains(value: r.dc, set: ${dc:json}), start: -1d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement == \"dtfs_data_disk_used_bytes\" and contains(value: r.dc, set: ${dc:json}), start: -1d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,
@@ -2277,8 +2278,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"disk\", predicate: (r) => r._measurement == \"dtfs_data_disk_used_bytes\" and contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}), start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"disk\", predicate: (r) => r._measurement == \"dtfs_data_disk_used_bytes\" and contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}), start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"disk\", predicate: (r) => r._measurement == \"dtfs_data_disk_used_bytes\" and contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}), start: -1d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"disk\", predicate: (r) => r._measurement == \"dtfs_data_disk_used_bytes\" and contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}), start: -1d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,

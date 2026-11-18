@@ -39,7 +39,7 @@
     {
       "id": 2,
       "type": "state-timeline",
-      "title": "Memory pressure level per node",
+      "title": "Memory pressure",
       "description": "Pressure level of each manager and data node: green normal, yellow warn (caches shrink), red shed (puts refused). Anything not green for long needs attention.",
       "datasource": {
         "type": "influxdb",
@@ -80,7 +80,8 @@
             }
           ],
           "color": {
-            "mode": "thresholds"
+            "mode": "fixed",
+            "fixedColor": "green"
           },
           "thresholds": {
             "mode": "absolute",
@@ -88,14 +89,6 @@
               {
                 "color": "green",
                 "value": null
-              },
-              {
-                "color": "yellow",
-                "value": 1
-              },
-              {
-                "color": "red",
-                "value": 2
               }
             ]
           },
@@ -142,7 +135,7 @@
     {
       "id": 3,
       "type": "bargauge",
-      "title": "RSS per node (latest)",
+      "title": "RSS per node",
       "description": "Latest resident memory of each manager and data node. Compare with the cap and thresholds in the Memory section; the percent-of-budget ratio needs a join across measurements that InfluxQL cannot express.",
       "datasource": {
         "type": "influxdb",
@@ -202,7 +195,7 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Dropped metrics batches (range)",
+      "title": "Dropped batches",
       "description": "Metrics batches dropped from a full push queue over the selected range, all nodes and servers. 0 is normal; any drop means points were lost, see the Metrics pipeline section.",
       "datasource": {
         "type": "influxdb",
@@ -265,7 +258,7 @@
     {
       "id": 5,
       "type": "stat",
-      "title": "Proxy rejected batches (range)",
+      "title": "Proxy rejected",
       "description": "PushMetrics batches a manager refused over the selected range (auth, no servers, bad encoding, too large, bad line). 0 is normal; any rejection means proxy-mode nodes are losing metrics.",
       "datasource": {
         "type": "influxdb",
@@ -364,7 +357,8 @@
             "gradientMode": "opacity",
             "showPoints": "never",
             "spanNulls": 30000
-          }
+          },
+          "min": 0
         },
         "overrides": []
       },
@@ -447,7 +441,8 @@
             "gradientMode": "opacity",
             "showPoints": "never",
             "spanNulls": 30000
-          }
+          },
+          "min": 0
         },
         "overrides": []
       },
@@ -1459,8 +1454,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement =~ /^dtfs_/, start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement =~ /^dtfs_/, start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement =~ /^dtfs_/, start: -1d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement =~ /^dtfs_/, start: -1d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,
@@ -1482,8 +1477,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -1d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -1d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,
@@ -1505,8 +1500,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -1d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -1d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,

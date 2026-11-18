@@ -77,8 +77,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement =~ /^dtfs_/, start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement =~ /^dtfs_/, start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement =~ /^dtfs_/, start: -1d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement =~ /^dtfs_/, start: -1d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,
@@ -100,8 +100,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -1d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -1d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,
@@ -123,8 +123,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -1d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -1d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,
@@ -157,7 +157,7 @@
     {
       "id": 2,
       "type": "stat",
-      "title": "Chunk fetch throughput",
+      "title": "Fetch rate",
       "description": "Bytes per second the FUSE clients fetch from data nodes (cache hits excluded), summed over the selection. Should follow the number of active streams.",
       "datasource": {
         "type": "influxdb",
@@ -195,7 +195,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "n/a"
         },
         "overrides": []
       },
@@ -216,7 +217,7 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "Chunk cache misses",
+      "title": "Cache misses",
       "description": "Chunk reads over the selected range that no client cache served and had to go to a data node. A high count with slow reads means readahead is not keeping up.",
       "datasource": {
         "type": "influxdb",
@@ -276,7 +277,7 @@
       "id": 4,
       "type": "stat",
       "title": "FUSE op errors",
-      "description": "Failed FUSE operations over the selected range, all ops and errnos. Anything above 0 means a player may have seen an I/O error; see the errno panel.",
+      "description": "Failed FUSE operations over the selected range. Anything above 0 means a player may have seen an I/O error; see the errno panel. ENOENT and EEXIST are left out: a lookup of a missing name or a create of an existing one is a normal answer, not a failure (the errno panels show them).",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
@@ -296,7 +297,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_op_errors\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> spread()\n  |> map(fn: (r) => ({r with _field: \"errors\"}))\n  |> group(columns: [\"_field\"])\n  |> sum()\n  |> keep(columns: [\"_value\", \"_field\"])"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_op_errors\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> filter(fn: (r) => r.errno != \"ENOENT\" and r.errno != \"EEXIST\")\n  |> spread()\n  |> map(fn: (r) => ({r with _field: \"errors\"}))\n  |> group(columns: [\"_field\"])\n  |> sum()\n  |> keep(columns: [\"_value\", \"_field\"])"
         }
       ],
       "fieldConfig": {
@@ -338,7 +339,7 @@
     {
       "id": 5,
       "type": "stat",
-      "title": "GetChunk failures",
+      "title": "Get failures",
       "description": "Failed chunk fetches from data nodes over the selected range. Each one costs a failover to another replica; 0 is normal.",
       "datasource": {
         "type": "influxdb",
@@ -502,7 +503,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "n/a"
         },
         "overrides": []
       },
@@ -643,7 +645,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -1644,7 +1646,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -1714,7 +1716,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -2021,7 +2023,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -2144,7 +2146,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -2205,7 +2207,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -2275,7 +2277,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",

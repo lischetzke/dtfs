@@ -39,7 +39,7 @@
     {
       "id": 2,
       "type": "stat",
-      "title": "Write throughput",
+      "title": "Write rate",
       "description": "Bytes per second FUSE clients push to data nodes (all selected clients, all tiers). Zero when nobody writes.",
       "datasource": {
         "type": "influxdb",
@@ -55,7 +55,7 @@
       "fieldConfig": {
         "defaults": {
           "unit": "Bps",
-          "noValue": "0",
+          "noValue": "n/a",
           "color": {
             "mode": "thresholds"
           },
@@ -100,7 +100,7 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "PutChunk failures over range",
+      "title": "Put failures",
       "description": "PutChunk failures seen by FUSE clients in the selected time range. Any value above zero means a data node refused or lost an upload; the client retries another target.",
       "datasource": {
         "type": "influxdb",
@@ -164,8 +164,8 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "FUSE write op errors over range",
-      "description": "Failed FUSE write, create, flush, fsync, release and setattr calls in the selected range: errors the application sees. Should stay zero.",
+      "title": "Write errors",
+      "description": "Failed FUSE write, create, flush, fsync, release and setattr calls in the selected range: errors the application sees. Should stay zero. ENOENT and EEXIST are left out: a lookup of a missing name or a create of an existing one is a normal answer, not a failure (the errno panels show them).",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
@@ -221,14 +221,14 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_op_errors\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> filter(fn: (r) => r.op =~ /^(write|create|flush|fsync|release|setattr)$/)\n  |> spread()\n  |> map(fn: (r) => ({r with _field: \"errors\"}))\n  |> group(columns: [\"_field\", \"_stop\"])\n  |> sum()\n  |> duplicate(column: \"_stop\", as: \"_time\")\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_op_errors\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> filter(fn: (r) => r.op =~ /^(write|create|flush|fsync|release|setattr)$/)\n  |> filter(fn: (r) => r.errno != \"ENOENT\" and r.errno != \"EEXIST\")\n  |> spread()\n  |> map(fn: (r) => ({r with _field: \"errors\"}))\n  |> group(columns: [\"_field\", \"_stop\"])\n  |> sum()\n  |> duplicate(column: \"_stop\", as: \"_time\")\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         }
       ]
     },
     {
       "id": 5,
       "type": "stat",
-      "title": "Commit rejects over range",
+      "title": "Commit rejects",
       "description": "Chunk commits the manager rejected in the selected range (for example fewer replicas than write_safety.min_replicas_before_ack). Should stay zero; see the Manager panels for the reason.",
       "datasource": {
         "type": "influxdb",
@@ -292,7 +292,7 @@
     {
       "id": 6,
       "type": "stat",
-      "title": "Raft client write p99",
+      "title": "Raft write p99",
       "description": "Highest p99 of a Raft client_write (proposal to applied) on the selected managers. Normal is a few ms to tens of ms; seconds mean a slow log fsync or a lagging follower.",
       "datasource": {
         "type": "influxdb",
@@ -308,7 +308,7 @@
       "fieldConfig": {
         "defaults": {
           "unit": "µs",
-          "noValue": "0",
+          "noValue": "n/a",
           "color": {
             "mode": "thresholds"
           },
@@ -360,7 +360,7 @@
     {
       "id": 7,
       "type": "stat",
-      "title": "Async batches in flight",
+      "title": "Async batches",
       "description": "Background upload batches of FUSE async_commit writers, summed over the selected clients. Persistently at the configured maximum means uploads cannot keep up with the writers.",
       "datasource": {
         "type": "influxdb",
@@ -528,7 +528,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -589,7 +589,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -951,7 +951,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -1012,7 +1012,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1072,7 +1072,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1302,7 +1302,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -1417,7 +1417,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -1740,7 +1740,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -1813,7 +1813,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max",
@@ -1883,7 +1883,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "calcs": [
             "mean",
             "max"
@@ -2190,8 +2190,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement =~ /^dtfs_/, start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement =~ /^dtfs_/, start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement =~ /^dtfs_/, start: -1d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"dc\", predicate: (r) => r._measurement =~ /^dtfs_/, start: -1d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,
@@ -2213,8 +2213,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -1d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -1d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,
@@ -2236,8 +2236,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -1d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -1d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,

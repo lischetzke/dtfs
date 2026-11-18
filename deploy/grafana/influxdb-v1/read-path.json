@@ -141,7 +141,7 @@
     {
       "id": 2,
       "type": "stat",
-      "title": "Chunk fetch throughput",
+      "title": "Fetch rate",
       "description": "Bytes per second the FUSE clients fetch from data nodes (cache hits excluded), summed over the selection. Should follow the number of active streams.",
       "datasource": {
         "type": "influxdb",
@@ -182,7 +182,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "n/a"
         },
         "overrides": []
       },
@@ -203,7 +204,7 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "Chunk cache misses",
+      "title": "Cache misses",
       "description": "Chunk reads over the selected range that no client cache served and had to go to a data node. A high count with slow reads means readahead is not keeping up.",
       "datasource": {
         "type": "influxdb",
@@ -266,7 +267,7 @@
       "id": 4,
       "type": "stat",
       "title": "FUSE op errors",
-      "description": "Failed FUSE operations over the selected range, all ops and errnos. Anything above 0 means a player may have seen an I/O error; see the errno panel.",
+      "description": "Failed FUSE operations over the selected range. Anything above 0 means a player may have seen an I/O error; see the errno panel. ENOENT and EEXIST are left out: a lookup of a missing name or a create of an existing one is a normal answer, not a failure (the errno panels show them).",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
@@ -289,7 +290,7 @@
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "errors",
-          "query": "SELECT sum(\"s\") AS \"total\" FROM (SELECT spread(\"value\") AS \"s\" FROM \"dtfs_fuse_op_errors\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\", \"op\", \"errno\") WHERE $timeFilter"
+          "query": "SELECT sum(\"s\") AS \"total\" FROM (SELECT spread(\"value\") AS \"s\" FROM \"dtfs_fuse_op_errors\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ AND \"errno\" !~ /^(ENOENT|EEXIST)$/ GROUP BY \"node\", \"op\", \"errno\") WHERE $timeFilter"
         }
       ],
       "fieldConfig": {
@@ -331,7 +332,7 @@
     {
       "id": 5,
       "type": "stat",
-      "title": "GetChunk failures",
+      "title": "Get failures",
       "description": "Failed chunk fetches from data nodes over the selected range. Each one costs a failover to another replica; 0 is normal.",
       "datasource": {
         "type": "influxdb",
@@ -504,7 +505,8 @@
                 "value": null
               }
             ]
-          }
+          },
+          "noValue": "n/a"
         },
         "overrides": []
       },
@@ -651,7 +653,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -1721,7 +1723,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -1797,7 +1799,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -2128,7 +2130,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -2257,7 +2259,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -2321,7 +2323,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
@@ -2397,7 +2399,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "right",
+          "placement": "bottom",
           "showLegend": true,
           "calcs": [
             "mean",
