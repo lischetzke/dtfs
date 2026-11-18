@@ -1394,7 +1394,7 @@
       "id": 20,
       "type": "bargauge",
       "title": "RSS vs budget",
-      "description": "Resident memory and hard cap of each manager and data node, one bar pair per node (InfluxQL cannot divide; the InfluxDB v2 dashboard shows RSS over the cap). RSS near the cap means memory pressure.",
+      "description": "Resident memory and hard cap of each manager and data node (last value). RSS close to its cap means memory pressure; cap 0 means no hard_cap_mb is configured. FUSE clients export no RSS gauge.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"

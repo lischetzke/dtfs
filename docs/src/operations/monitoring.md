@@ -161,7 +161,7 @@ configured manager is a failover target for the nodes.
 
 ### Import the dashboards
 
-Two sets with the same five dashboards, panels and variables (`dc`, `node`, `disk`):
+Two sets with the same six dashboards, panels and variables (`dc`, `role`, `node`, `disk`):
 
 | Folder | Query language | Grafana datasource |
 |---|---|---|
@@ -169,10 +169,19 @@ Two sets with the same five dashboards, panels and variables (`dc`, `node`, `dis
 | `deploy/grafana/influxdb-v2/` | Flux | InfluxDB, query language Flux (InfluxDB v2); pick the bucket in the `bucket` variable |
 
 In Grafana: Dashboards, New, Import, upload the JSON files of one folder, and choose the
-datasource in the `DS` variable at the top of each dashboard. Dashboards: `write-path`
-(FUSE write, PutChunk, client allocate/commit, data-node put stages, Raft log fsync, to
-answer whether the Raft fsync is the write bottleneck), `read-path`, `raft-manager`,
-`data-node` (per disk) and `memory-health`. The files use dashboard schema version 41
+datasource in the `DS` variable at the top of each dashboard. Dashboards: `overview`
+(landing page: nodes reporting per role, Raft leader, integrity and error counts over the
+range, memory pressure, throughput, Raft write p99, disk use; every dashboard links to the
+others through the `dtfs` tag, keeping time range and variables), `write-path` (FUSE
+write, PutChunk, client allocate/commit, data-node put stages, Raft log fsync, to answer
+whether the Raft fsync is the write bottleneck), `read-path`, `raft-manager`, `data-node`
+(per disk) and `memory-health`. Each starts with an Overview row of stats and state
+timelines, then one row per section; every series has a readable name (v1 `alias`, v2
+`map` -> `group(columns: ["_field"])` -> `keep(columns: ["_time", "_value", "_field"])`;
+without the `keep` Grafana shows the extra columns as series). Counts "over the range" use
+the spread of the cumulative counter, so a process restart inside the range undercounts.
+InfluxQL cannot divide two measurements, so memory and disk use show the value next to
+its cap or total, not a percentage (cap 0 = no `hard_cap_mb`). The files use dashboard schema version 41
 (the `DASHBOARD_SCHEMA_VERSION` of Grafana 11.6). `tests/grafana_dashboards.rs` in
 `dtfs-common` fails when a dashboard queries a measurement that no crate registers, or
 when the two sets drift apart.

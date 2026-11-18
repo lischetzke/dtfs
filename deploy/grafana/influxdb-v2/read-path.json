@@ -5,7 +5,23 @@
   "editable": true,
   "graphTooltip": 1,
   "id": null,
-  "links": [],
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "DTFS dashboards",
+      "tags": [
+        "dtfs",
+        "influxdb-v2"
+      ],
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "",
+      "url": ""
+    }
+  ],
   "refresh": "30s",
   "schemaVersion": 41,
   "tags": [

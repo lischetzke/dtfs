@@ -194,7 +194,7 @@ def ds_query(uid, ver, q):
     return ("DATA" if cols else "EMPTY"), r.get("frames") or []
 
 
-VAR = re.compile(r"\$\{?(dc|node|disk|bucket)(:json)?\}?")
+VAR = re.compile(r"\$\{?(dc|role|node|disk|bucket)(:json)?\}?")
 MACRO = re.compile(r"\$\{?(?!timeFilter\b|__interval\b|__interval_ms\b)[A-Za-z_]")
 
 
