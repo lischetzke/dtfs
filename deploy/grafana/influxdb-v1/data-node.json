@@ -9,102 +9,70 @@
   "panels": [
     {
       "id": 1,
-      "type": "timeseries",
-      "title": "Put latency per disk",
+      "type": "row",
+      "title": "Overview",
       "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 1,
+        "w": 24,
         "x": 0,
         "y": 0
       },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_total_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "put $tag_node $tag_disk $col"
-        }
-      ]
+      "collapsed": false,
+      "panels": []
     },
     {
       "id": 2,
-      "type": "timeseries",
-      "title": "Get latency per disk",
-      "description": "",
+      "type": "stat",
+      "title": "Failed disks",
+      "description": "Number of data disks currently flagged failed (EIO/EROFS). Anything above 0 needs attention: the disk is skipped for new writes.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
+      },
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 0
-      },
+      "interval": "10s",
       "fieldConfig": {
         "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
         },
         "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
+        "reduceOptions": {
+          "values": false,
           "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+            "lastNotNull"
+          ],
+          "fields": ""
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
       },
       "targets": [
         {
@@ -114,54 +82,65 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_get_total_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
+          "query": "SELECT sum(\"g\") AS \"failed disks\" FROM (SELECT last(\"value\") AS \"g\" FROM \"dtfs_data_disk_failed\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)) GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "get $tag_node $tag_disk $col"
+          "alias": "$col"
         }
       ]
     },
     {
       "id": 3,
-      "type": "timeseries",
-      "title": "Throughput per disk",
-      "description": "",
+      "type": "stat",
+      "title": "Quarantines in range",
+      "description": "Chunks quarantined (renamed to .bad) on the selected disks during the selected time range. Normally 0.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 8
-      },
+      "interval": "10s",
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
         },
         "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
+        "reduceOptions": {
+          "values": false,
           "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+            "lastNotNull"
+          ],
+          "fields": ""
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
       },
       "targets": [
         {
@@ -171,66 +150,65 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_put_bytes_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
+          "query": "SELECT sum(\"s\") AS \"quarantines\" FROM (SELECT spread(\"value\") AS \"s\" FROM \"dtfs_data_quarantines_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY \"node\", \"disk\")",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "put  $tag_node $tag_disk"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_get_bytes_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "get  $tag_node $tag_disk"
+          "alias": "$col"
         }
       ]
     },
     {
       "id": 4,
-      "type": "timeseries",
-      "title": "Operations per disk",
-      "description": "",
+      "type": "stat",
+      "title": "Read data loss in range",
+      "description": "Reads that failed checksum verification during the selected range. Normally 0; any hit means a replica served bad bytes.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 8
-      },
+      "interval": "10s",
       "fieldConfig": {
         "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0
         },
         "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
+        "reduceOptions": {
+          "values": false,
           "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+            "lastNotNull"
+          ],
+          "fields": ""
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
       },
       "targets": [
         {
@@ -240,66 +218,68 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_puts_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
+          "query": "SELECT sum(\"s\") AS \"data loss\" FROM (SELECT spread(\"value\") AS \"s\" FROM \"dtfs_data_get_data_loss_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY \"node\", \"disk\")",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "puts  $tag_node $tag_disk"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_gets_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "gets  $tag_node $tag_disk"
+          "alias": "$col"
         }
       ]
     },
     {
       "id": 5,
-      "type": "timeseries",
-      "title": "Disk used vs total",
-      "description": "",
+      "type": "stat",
+      "title": "Least free disk space",
+      "description": "Smallest free space on any selected disk. Red below 10 GB, yellow below 50 GB.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 16
-      },
+      "interval": "10s",
       "fieldConfig": {
         "defaults": {
           "unit": "bytes",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 10000000000.0
+              },
+              {
+                "color": "green",
+                "value": 50000000000.0
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
           }
         },
         "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
+        "reduceOptions": {
+          "values": false,
           "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+            "lastNotNull"
+          ],
+          "fields": ""
         },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
       },
       "targets": [
         {
@@ -309,49 +289,179 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_disk_used_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
+          "query": "SELECT min(\"g\") AS \"least free\" FROM (SELECT mean(\"value\") AS \"g\" FROM \"dtfs_data_disk_free_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)) GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "used  $tag_node $tag_disk"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_disk_total_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "total  $tag_node $tag_disk"
+          "alias": "$col"
         }
       ]
     },
     {
       "id": 6,
-      "type": "timeseries",
-      "title": "Disk free, failed flag",
-      "description": "",
+      "type": "stat",
+      "title": "Put p99",
+      "description": "Worst PutChunk p99 across the selected disks (whole call, includes the network receive). Compare per disk in the Put and get section.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 16
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
       },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_total_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "$col"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Get p99",
+      "description": "Worst GetChunk p99 across the selected disks (whole call, includes the send to the client).",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_get_total_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "$col"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "Disks",
+      "description": "",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Disk used vs total",
+      "description": "Used and total bytes per disk. Used approaching total means the disk is filling up.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
       "fieldConfig": {
         "defaults": {
           "unit": "bytes",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
           }
         },
         "overrides": []
@@ -359,7 +469,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
             "lastNotNull",
             "max"
@@ -378,10 +488,10 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_disk_free_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"used\" FROM \"dtfs_data_disk_used_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "free  $tag_node $tag_disk"
+          "alias": "used $tag_node $tag_disk"
         },
         {
           "datasource": {
@@ -390,292 +500,39 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_disk_failed\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"total\" FROM \"dtfs_data_disk_total_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "failed  $tag_node $tag_disk"
-        }
-      ]
-    },
-    {
-      "id": 7,
-      "type": "timeseries",
-      "title": "Scrub progress",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 24
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "Bps",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_scrub_chunks_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "chunks/s  $tag_node $tag_disk"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_scrub_bytes_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "bytes/s  $tag_node $tag_disk"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_scrub_throttle_us_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "throttle us/s  $tag_node $tag_disk"
-        }
-      ]
-    },
-    {
-      "id": 8,
-      "type": "timeseries",
-      "title": "Scrub findings",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 24
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_scrub_corrupt_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "corrupt  $tag_node $tag_disk"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_scrub_missing_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "missing  $tag_node $tag_disk"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_scrub_size_mismatch_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "size mismatch  $tag_node $tag_disk"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_scrub_meta_repaired_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "meta repaired  $tag_node $tag_disk"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "E",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_scrub_io_errors_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "io errors  $tag_node $tag_disk"
-        }
-      ]
-    },
-    {
-      "id": 9,
-      "type": "timeseries",
-      "title": "Quarantines and read data loss (increase)",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 32
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT non_negative_difference(max(\"value\")) FROM \"dtfs_data_quarantines_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "quarantines  $tag_node $tag_disk"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT non_negative_difference(max(\"value\")) FROM \"dtfs_data_get_data_loss_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "get data loss  $tag_node $tag_disk"
+          "alias": "total $tag_node $tag_disk"
         }
       ]
     },
     {
       "id": 10,
       "type": "timeseries",
-      "title": "gRPC latency by method",
-      "description": "",
+      "title": "Disk free",
+      "description": "Free bytes per disk. Falling toward zero predicts ENOSPC on puts.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 32
-      },
+      "interval": "10s",
       "fieldConfig": {
         "defaults": {
-          "unit": "µs",
+          "unit": "bytes",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
           }
         },
         "overrides": []
@@ -683,7 +540,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
             "lastNotNull",
             "max"
@@ -702,53 +559,86 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_grpc_latency_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"free\" FROM \"dtfs_data_disk_free_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "$tag_node $tag_method $col"
+          "alias": "free $tag_node $tag_disk"
         }
       ]
     },
     {
       "id": 11,
-      "type": "timeseries",
-      "title": "gRPC requests, errors by method and code, inflight, put rejects",
-      "description": "",
+      "type": "state-timeline",
+      "title": "Disk failed",
+      "description": "Failed flag per disk: green is ok, red is failed (EIO/EROFS seen). A failed disk takes no new writes.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      },
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 40
-      },
+      "interval": "10s",
       "fieldConfig": {
         "defaults": {
-          "unit": "ops",
+          "unit": "short",
           "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
+            "fillOpacity": 70,
+            "lineWidth": 0,
+            "spanNulls": 30000
+          },
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "ok",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "failed",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            }
+          ]
         },
         "overrides": []
       },
       "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.9,
         "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom"
         },
         "tooltip": {
           "mode": "multi",
-          "sort": "desc"
+          "sort": "none"
         }
       },
       "targets": [
@@ -759,88 +649,59 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_grpc_requests_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\" fill(null)",
+          "query": "SELECT max(\"value\") AS \"failed\" FROM \"dtfs_data_disk_failed\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "$tag_node $tag_method"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_grpc_errors_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\", \"code\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "error  $tag_node $tag_method $tag_code"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_grpc_inflight\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "inflight  $tag_node $tag_method"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_put_rejects_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"code\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "put reject  $tag_node $tag_code"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "E",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_put_shed_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "shed $tag_node"
+          "alias": "failed $tag_node $tag_disk"
         }
       ]
     },
     {
       "id": 12,
       "type": "timeseries",
-      "title": "Replication out by peer",
-      "description": "",
+      "title": "Store chunks and bytes",
+      "description": "Chunks (right axis) and bytes held by each data node's store. Steady growth is normal; a sudden drop means chunks were removed.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 40
-      },
+      "interval": "10s",
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps",
+          "unit": "bytes",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "A"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
@@ -864,10 +725,10 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_replicate_out_bytes_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"peer\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"chunks\" FROM \"dtfs_data_store_chunks\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "bytes/s  $tag_node $tag_peer"
+          "alias": "chunks $tag_node"
         },
         {
           "datasource": {
@@ -876,49 +737,435 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_replicate_out_failures_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"peer\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"bytes\" FROM \"dtfs_data_store_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "failures/s  $tag_node $tag_peer"
+          "alias": "bytes $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Put and get",
+      "description": "",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Put latency p99 per disk",
+      "description": "PutChunk p99 per disk, whole call. A disk much slower than its peers is the first suspect; the stage panels below isolate where.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 25
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_total_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "p99 $tag_node $tag_disk"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Get latency p99 per disk",
+      "description": "GetChunk p99 per disk, whole call. High values on one disk point at a slow or failing drive.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 25
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_get_total_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "p99 $tag_node $tag_disk"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Put fsync p99 per disk",
+      "description": "Time to fsync the chunk file per disk, p99. A slow HDD shows up here first; healthy disks stay in the low milliseconds.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 34
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_fsync_dat_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "p99 $tag_node $tag_disk"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Put tmp write p99 per disk",
+      "description": "Time to write the chunk to its tmp file per disk, p99. Separates write-cache or throughput trouble from fsync trouble.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 34
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_tmp_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "p99 $tag_node $tag_disk"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Throughput per disk",
+      "description": "Bytes stored (put) and served (get) per second per disk.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 43
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"put\" FROM \"dtfs_data_put_bytes_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "put $tag_node $tag_disk"
         },
         {
           "datasource": {
             "type": "influxdb",
             "uid": "${DS}"
           },
-          "refId": "C",
+          "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_replicate_out_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"peer\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"get\" FROM \"dtfs_data_get_bytes_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "latency  $tag_node $tag_peer $col"
+          "alias": "get $tag_node $tag_disk"
         }
       ]
     },
     {
-      "id": 13,
+      "id": 19,
       "type": "timeseries",
-      "title": "Put / get inflight, put slot wait",
-      "description": "",
+      "title": "Operations per disk",
+      "description": "Chunk puts and gets per second per disk.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 43
+      },
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 48
-      },
+      "interval": "10s",
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "ops",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"puts\" FROM \"dtfs_data_puts_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "puts $tag_node $tag_disk"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"gets\" FROM \"dtfs_data_gets_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "gets $tag_node $tag_disk"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Put and get inflight",
+      "description": "PutChunk and GetChunk calls currently in progress per node. Sustained high values with rising latency mean the node is saturated.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 52
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
           }
         },
         "overrides": []
@@ -945,7 +1192,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_put_inflight\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"put inflight\" FROM \"dtfs_data_put_inflight\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "put inflight $tag_node"
@@ -957,49 +1204,39 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_get_inflight\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"get inflight\" FROM \"dtfs_data_get_inflight\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "get inflight $tag_node"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_slot_wait_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "slot wait us $tag_node $col"
         }
       ]
     },
     {
-      "id": 14,
+      "id": 21,
       "type": "timeseries",
-      "title": "Heartbeat latency, failures, rejections; store size",
-      "description": "",
+      "title": "Put slot wait p99",
+      "description": "How long a put waits for a free put slot, p99. Normally near zero; growth means puts are queueing behind the memory or concurrency cap.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 52
+      },
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 48
-      },
+      "interval": "10s",
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "µs",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
           }
         },
         "overrides": []
@@ -1008,6 +1245,258 @@
         "legend": {
           "displayMode": "table",
           "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_slot_wait_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "p99 $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "row",
+      "title": "RPC",
+      "description": "",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 61
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "gRPC latency p99 by method",
+      "description": "p99 latency per gRPC method per node (max across each window).",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 62
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_grpc_latency_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "p99 $tag_node $tag_method"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "gRPC requests by method",
+      "description": "gRPC requests per second per method.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 71
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"requests\" FROM \"dtfs_data_grpc_requests_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "requests $tag_node $tag_method"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "gRPC errors by method and code",
+      "description": "gRPC calls that returned an error, per second by method and status code. Should be flat zero; data_loss or unavailable deserve a look.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 71
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"errors\" FROM \"dtfs_data_grpc_errors_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\", \"code\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "errors $tag_node $tag_method $tag_code"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "gRPC inflight by method",
+      "description": "gRPC calls currently in flight per method.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 80
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
           "calcs": [
             "lastNotNull",
             "max"
@@ -1026,10 +1515,69 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_heartbeat_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"inflight\" FROM \"dtfs_data_grpc_inflight\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "heartbeat us $tag_node $col"
+          "alias": "inflight $tag_node $tag_method"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Rejects, sheds and not-found",
+      "description": "Rejected puts by gRPC code, puts shed under memory pressure and gets for unknown chunks, per second. Sheds mean the node is overloaded.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 80
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"put rejects\" FROM \"dtfs_data_put_rejects_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\", \"code\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "put rejects $tag_node $tag_method $tag_code"
         },
         {
           "datasource": {
@@ -1038,10 +1586,10 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_heartbeat_failures_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"put shed\" FROM \"dtfs_data_put_shed_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "hb failures/s $tag_node"
+          "alias": "put shed $tag_node"
         },
         {
           "datasource": {
@@ -1050,10 +1598,355 @@
           },
           "refId": "C",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_heartbeat_rejected_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"get not found\" FROM \"dtfs_data_get_not_found_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "hb rejected/s $tag_node"
+          "alias": "get not found $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "row",
+      "title": "Scrub and integrity",
+      "description": "",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 89
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Scrub throughput",
+      "description": "Bytes verified by the background scrub per second per disk.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 90
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"scrub\" FROM \"dtfs_data_scrub_bytes_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "scrub $tag_node $tag_disk"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Scrub chunks",
+      "description": "Chunks verified by the scrub per second per disk. Zero means no scrub pass is running on that disk.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 90
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"chunks\" FROM \"dtfs_data_scrub_chunks_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "chunks $tag_node $tag_disk"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Scrub throttle time",
+      "description": "Microseconds of throttle sleep per second of wall time per disk (1 s means fully throttled). High values mean the scrub is rate-limited, not that the disk is slow.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 99
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"throttle\" FROM \"dtfs_data_scrub_throttle_us_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "throttle $tag_node $tag_disk"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Quarantines and read data loss",
+      "description": "Chunks quarantined and reads that failed verification, per second per disk. Any non-zero line is an integrity event.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 99
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"quarantines\" FROM \"dtfs_data_quarantines_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "quarantines $tag_node $tag_disk"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"data loss\" FROM \"dtfs_data_get_data_loss_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "data loss $tag_node $tag_disk"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Scrub findings",
+      "description": "Scrub findings per second per disk: corrupt, missing, size mismatch, meta repaired and I/O errors. Only meta repaired is benign.",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 108
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"corrupt\" FROM \"dtfs_data_scrub_corrupt_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "corrupt $tag_node $tag_disk"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"missing\" FROM \"dtfs_data_scrub_missing_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "missing $tag_node $tag_disk"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"size mismatch\" FROM \"dtfs_data_scrub_size_mismatch_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "size mismatch $tag_node $tag_disk"
         },
         {
           "datasource": {
@@ -1062,10 +1955,10 @@
           },
           "refId": "D",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_store_chunks\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"meta repaired\" FROM \"dtfs_data_scrub_meta_repaired_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "chunks $tag_node"
+          "alias": "meta repaired $tag_node $tag_disk"
         },
         {
           "datasource": {
@@ -1074,10 +1967,345 @@
           },
           "refId": "E",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_store_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"io errors\" FROM \"dtfs_data_scrub_io_errors_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"disk\" =~ /^$disk$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "store bytes $tag_node"
+          "alias": "io errors $tag_node $tag_disk"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "type": "row",
+      "title": "Replication and heartbeat",
+      "description": "",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 117
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Replication out bytes by peer",
+      "description": "Bytes per second this node sends to each replication peer.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 118
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"bytes\" FROM \"dtfs_data_replicate_out_bytes_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"peer\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "bytes $tag_node $tag_peer"
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Replication out operations and failures",
+      "description": "Completed and failed outgoing replications per second by peer. Failures should be flat zero.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 118
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"copies\" FROM \"dtfs_data_replicate_out_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"peer\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "copies $tag_node $tag_peer"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"failures\" FROM \"dtfs_data_replicate_out_failures_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"peer\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "failures $tag_node $tag_peer"
+        }
+      ]
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Replication out latency p99",
+      "description": "p99 latency of outgoing replication per peer. WAN peers are slower by design.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 127
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_replicate_out_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"peer\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "p99 $tag_node $tag_peer"
+        }
+      ]
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Heartbeat latency p99",
+      "description": "p99 latency of the heartbeat call to the manager. Spikes precede missed heartbeats.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 127
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_heartbeat_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "p99 $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 39,
+      "type": "timeseries",
+      "title": "Heartbeat failures and rejections",
+      "description": "Heartbeats that failed to reach the manager or were refused, per second. Should be flat zero.",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 136
+      },
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"failures\" FROM \"dtfs_data_heartbeat_failures_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "failures $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rejected\" FROM \"dtfs_data_heartbeat_rejected_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "rejected $tag_node"
         }
       ]
     }
