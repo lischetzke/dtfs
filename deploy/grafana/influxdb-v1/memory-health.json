@@ -9,206 +9,97 @@
   "panels": [
     {
       "id": 1,
-      "type": "timeseries",
-      "title": "Manager RSS vs cap, warn and shed thresholds",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
+      "type": "row",
+      "title": "Overview",
+      "collapsed": false,
+      "panels": [],
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 1,
+        "w": 24,
         "x": 0,
         "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_memory_rss_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "rss $tag_node"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_memory_hard_cap_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "hard cap $tag_node"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_memory_warn_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "warn $tag_node"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_memory_shed_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "shed $tag_node"
-        }
-      ]
+      }
     },
     {
       "id": 2,
-      "type": "timeseries",
-      "title": "Data node RSS vs cap",
-      "description": "",
+      "type": "state-timeline",
+      "title": "Memory pressure level per node",
+      "description": "Pressure level of each manager and data node: green normal, yellow warn (caches shrink), red shed (puts refused). Anything not green for long needs attention.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_mem_rss_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "rss $tag_node"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_mem_cap_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "cap $tag_node"
-        }
-      ]
-    },
-    {
-      "id": 3,
-      "type": "timeseries",
-      "title": "Pressure level (0 normal, 1 warn, 2 shed)",
-      "description": "The FUSE client exports no RSS or pressure gauge; see its cache panels.",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 4,
+        "w": 6,
         "x": 0,
-        "y": 8
+        "y": 1
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "short",
+          "min": 0,
+          "max": 2,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "normal",
+                  "color": "green",
+                  "index": 0
+                },
+                "1": {
+                  "text": "warn",
+                  "color": "yellow",
+                  "index": 1
+                },
+                "2": {
+                  "text": "shed",
+                  "color": "red",
+                  "index": 2
+                }
+              }
+            }
+          ],
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 2
+              }
+            ]
+          },
           "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
+            "fillOpacity": 70,
+            "lineWidth": 0
           }
         },
         "overrides": []
       },
       "options": {
+        "showValue": "never",
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "alignValue": "center",
         "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+          "showLegend": false
         },
         "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+          "mode": "single"
         }
       },
       "targets": [
@@ -219,7 +110,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_memory_pressure_level\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"value\") AS \"x\" FROM \"dtfs_memory_pressure_level\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "manager $tag_node"
@@ -231,7 +122,73 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_mem_pressure_level\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"value\") AS \"x\" FROM \"dtfs_data_mem_pressure_level\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "data $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "bargauge",
+      "title": "RSS per node (latest)",
+      "description": "Latest resident memory of each manager and data node. Compare with the cap and thresholds in the Memory section; the percent-of-budget ratio needs a join across measurements that InfluxQL cannot express.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0,
+          "color": {
+            "mode": "continuous-GrYlRd"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "valueMode": "color"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT last(\"value\") AS \"x\" FROM \"dtfs_memory_rss_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\"",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "manager $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT last(\"value\") AS \"x\" FROM \"dtfs_data_mem_rss_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\"",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "data $tag_node"
@@ -240,18 +197,164 @@
     },
     {
       "id": 4,
-      "type": "timeseries",
-      "title": "FUSE readahead cache vs budget",
-      "description": "",
+      "type": "stat",
+      "title": "Dropped metrics batches (range)",
+      "description": "Metrics batches dropped from a full push queue over the selected range, all nodes and servers. 0 is normal; any drop means points were lost, see the Metrics pipeline section.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 4,
+        "w": 6,
         "x": 12,
-        "y": 8
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"s\") AS \"x\" FROM (SELECT spread(\"value\") AS \"s\" FROM \"dtfs_metrics_dropped_batches\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\", \"server\") WHERE $timeFilter",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "dropped"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Proxy rejected batches (range)",
+      "description": "PushMetrics batches a manager refused over the selected range (auth, no servers, bad encoding, too large, bad line). 0 is normal; any rejection means proxy-mode nodes are losing metrics.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          },
+          "color": {
+            "mode": "thresholds"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"s\") AS \"x\" FROM (SELECT spread(\"value\") AS \"s\" FROM \"dtfs_metrics_proxy_rejected\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\", \"reason\") WHERE $timeFilter",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "rejected"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "Memory",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Manager RSS vs cap, warn and shed thresholds",
+      "description": "Resident memory of each manager against its hard cap and the warn and shed thresholds. RSS should stay below warn; crossing shed makes the manager refuse new work.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 6
       },
       "fieldConfig": {
         "defaults": {
@@ -259,9 +362,189 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_memory_rss_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "rss $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_memory_hard_cap_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "hard cap $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_memory_warn_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "warn $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "D",
+          "hide": false,
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_memory_shed_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "shed $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Data node RSS vs cap",
+      "description": "Resident memory of each data node against its memory cap. Steady growth towards the cap means the node will start shedding puts.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_data_mem_rss_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "rss $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_data_mem_cap_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "cap $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "Caches and backpressure",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 24
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "FUSE readahead cache vs budget",
+      "description": "Bytes held in the FUSE readahead cache against its budget. Sitting at the budget is normal while streaming; the budget shrinking means memory pressure.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 25
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
           }
         },
         "overrides": []
@@ -288,7 +571,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_fuse_readahead_cache_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_fuse_readahead_cache_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "cache $tag_node"
@@ -300,7 +583,7 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_fuse_readahead_budget_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_fuse_readahead_budget_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "budget $tag_node"
@@ -308,19 +591,20 @@
       ]
     },
     {
-      "id": 5,
+      "id": 11,
       "type": "timeseries",
       "title": "FUSE disk cache vs max",
-      "description": "",
+      "description": "FUSE on-disk cache size against its configured maximum. Staying at max is normal for a busy cache.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 0,
-        "y": 16
+        "x": 12,
+        "y": 25
       },
       "fieldConfig": {
         "defaults": {
@@ -328,9 +612,10 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
           }
         },
         "overrides": []
@@ -357,7 +642,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_fuse_disk_cache_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_fuse_disk_cache_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "disk cache $tag_node"
@@ -369,7 +654,7 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_fuse_disk_cache_max_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_fuse_disk_cache_max_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "max $tag_node"
@@ -377,19 +662,20 @@
       ]
     },
     {
-      "id": 6,
+      "id": 12,
       "type": "timeseries",
       "title": "FUSE write buffer vs dirty cap",
-      "description": "",
+      "description": "Buffered unwritten bytes against the dirty cap. Reaching the cap blocks writers (see write cap waits).",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 12,
-        "y": 16
+        "x": 0,
+        "y": 34
       },
       "fieldConfig": {
         "defaults": {
@@ -397,9 +683,10 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
           }
         },
         "overrides": []
@@ -426,7 +713,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_fuse_write_buffered_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_fuse_write_buffered_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "buffered $tag_node"
@@ -438,7 +725,7 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_fuse_write_dirty_cap_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_fuse_write_dirty_cap_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "cap $tag_node"
@@ -446,29 +733,31 @@
       ]
     },
     {
-      "id": 7,
+      "id": 13,
       "type": "timeseries",
       "title": "FUSE metadata cache entries",
-      "description": "",
+      "description": "Number of cached metadata entries per FUSE client. A bounded plateau is normal.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 0,
-        "y": 24
+        "x": 12,
+        "y": 34
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "short",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
           }
         },
         "overrides": []
@@ -495,7 +784,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_fuse_meta_cache_entries\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_fuse_meta_cache_entries\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "entries $tag_node"
@@ -503,19 +792,20 @@
       ]
     },
     {
-      "id": 8,
+      "id": 14,
       "type": "timeseries",
-      "title": "FUSE write cap waits",
-      "description": "",
+      "title": "FUSE write cap waits per second",
+      "description": "How often writers blocked at the dirty cap, per second. Non-zero means writes are limited by upload speed or the cap.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 12,
-        "y": 24
+        "x": 0,
+        "y": 43
       },
       "fieldConfig": {
         "defaults": {
@@ -523,9 +813,10 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
           }
         },
         "overrides": []
@@ -535,7 +826,7 @@
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
+            "mean",
             "max"
           ]
         },
@@ -552,106 +843,39 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_fuse_write_cap_waits\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"x\" FROM \"dtfs_fuse_write_cap_waits\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "waits/s $tag_node"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_fuse_write_cap_wait_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "wait us $tag_node $col"
+          "alias": "waits $tag_node"
         }
       ]
     },
     {
-      "id": 9,
+      "id": 15,
       "type": "timeseries",
-      "title": "Metrics push: dropped batches (increase)",
-      "description": "",
+      "title": "FUSE write cap wait time (p99)",
+      "description": "p99 of the time writers were blocked at the dirty cap. Rising values mean slow uploads or a too small cap.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 32
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT non_negative_difference(max(\"value\")) FROM \"dtfs_metrics_dropped_batches\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"server\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "dropped  $tag_node $tag_server"
-        }
-      ]
-    },
-    {
-      "id": 10,
-      "type": "timeseries",
-      "title": "Data node backpressure (put shed, slot wait)",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 43
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "µs",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
           }
         },
         "overrides": []
@@ -661,7 +885,67 @@
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"x\" FROM \"dtfs_fuse_write_cap_wait_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "wait p99 $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Data node puts shed per second",
+      "description": "Puts refused by a data node under memory pressure, per second. Anything above 0 means the node is in the shed level.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 52
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
             "max"
           ]
         },
@@ -678,10 +962,319 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_put_shed_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"x\" FROM \"dtfs_data_put_shed_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "shed/s $tag_node"
+          "alias": "shed $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Data node put slot wait (p99)",
+      "description": "p99 wait for a free put slot on a data node. Rising values mean puts queue behind the concurrency limit.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 52
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"x\" FROM \"dtfs_data_put_slot_wait_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "slot wait p99 $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "Metrics pipeline",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 61
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Metrics batches dropped per second",
+      "description": "Batches dropped from a full push queue (server=proxy in proxy mode). Should be flat zero; drops mean the metrics server or proxy path is down or slow.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 62
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"x\" FROM \"dtfs_metrics_dropped_batches\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"server\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "dropped $tag_node $tag_server"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Proxy rejected batches per second",
+      "description": "PushMetrics batches a manager refused, by reason. Should be flat zero; auth means a wrong secret, no_servers a manager without a metrics server.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 62
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"x\" FROM \"dtfs_metrics_proxy_rejected\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"reason\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "rejected $tag_node $tag_reason"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Proxy batches received per second",
+      "description": "PushMetrics batches a manager accepted from data nodes and FUSE clients in proxy mode. Zero while proxy nodes run means the proxy path is down.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 71
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"x\" FROM \"dtfs_metrics_proxy_received_batches\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "received $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Proxy payload bytes per second",
+      "description": "Bytes pushed through the proxy: sent is the (gzip) payload a data or FUSE node got accepted, received is what a manager accepted. They should track each other.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 71
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"x\" FROM \"dtfs_metrics_proxy_sent_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "sent $tag_node"
         },
         {
           "datasource": {
@@ -690,37 +1283,52 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_slot_wait_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"x\" FROM \"dtfs_metrics_proxy_received_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "slot wait us $tag_node $col"
+          "alias": "received $tag_node"
         }
       ]
     },
     {
-      "id": 11,
+      "id": 23,
+      "type": "row",
+      "title": "Node health",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 80
+      }
+    },
+    {
+      "id": 24,
       "type": "timeseries",
       "title": "Node health (managers' view)",
-      "description": "",
+      "description": "Nodes per health state as seen by each manager. Healthy should hold the full node count; others should be zero.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 9,
+        "w": 24,
         "x": 0,
-        "y": 40
+        "y": 81
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "short",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
           }
         },
         "overrides": []
@@ -728,7 +1336,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
             "lastNotNull",
             "max"
@@ -747,37 +1355,39 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_sm_nodes_by_health\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"health\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"x\" FROM \"dtfs_sm_nodes_by_health\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"health\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "nodes  $tag_node $tag_health"
+          "alias": "nodes $tag_node $tag_health"
         }
       ]
     },
     {
-      "id": 12,
+      "id": 25,
       "type": "timeseries",
-      "title": "Disk failed flag and heartbeat failures",
-      "description": "",
+      "title": "Disk failed flag",
+      "description": "1 for a data disk flagged failed. Should be flat zero.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 12,
-        "y": 40
+        "x": 0,
+        "y": 90
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "short",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000
           }
         },
         "overrides": []
@@ -804,10 +1414,69 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_data_disk_failed\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"disk\" fill(null)",
+          "query": "SELECT max(\"value\") AS \"x\" FROM \"dtfs_data_disk_failed\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "disk failed  $tag_node $tag_disk"
+          "alias": "disk failed $tag_node $tag_disk $tag_tier"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Heartbeat failures and refusals per second",
+      "description": "Data node heartbeats that failed or were refused by the manager, per second. Should be zero; sustained values mean the node is marked unhealthy.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 90
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"x\" FROM \"dtfs_data_heartbeat_failures_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "hb failures $tag_node"
         },
         {
           "datasource": {
@@ -816,10 +1485,10 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_heartbeat_failures_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"x\" FROM \"dtfs_data_heartbeat_rejected_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "hb failures/s $tag_node"
+          "alias": "hb rejected $tag_node"
         }
       ]
     }
@@ -857,7 +1526,6 @@
         "sort": 1,
         "multi": true,
         "includeAll": true,
-        "allValue": ".*",
         "current": {
           "selected": true,
           "text": "All",
@@ -865,7 +1533,32 @@
         },
         "options": [],
         "regex": "",
-        "hide": 0
+        "hide": 0,
+        "allValue": ".*"
+      },
+      {
+        "name": "role",
+        "label": "Role",
+        "type": "query",
+        "datasource": {
+          "type": "influxdb",
+          "uid": "${DS}"
+        },
+        "query": "SHOW TAG VALUES WITH KEY = \"role\" WHERE \"dc\" =~ /^$dc$/",
+        "definition": "SHOW TAG VALUES WITH KEY = \"role\" WHERE \"dc\" =~ /^$dc$/",
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": [],
+        "regex": "",
+        "hide": 0,
+        "allValue": ".*"
       },
       {
         "name": "node",
@@ -875,13 +1568,12 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "SHOW TAG VALUES WITH KEY = \"node\" WHERE \"dc\" =~ /^$dc$/",
-        "definition": "SHOW TAG VALUES WITH KEY = \"node\" WHERE \"dc\" =~ /^$dc$/",
+        "query": "SHOW TAG VALUES WITH KEY = \"node\" WHERE \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/",
+        "definition": "SHOW TAG VALUES WITH KEY = \"node\" WHERE \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/",
         "refresh": 1,
         "sort": 1,
         "multi": true,
         "includeAll": true,
-        "allValue": ".*",
         "current": {
           "selected": true,
           "text": "All",
@@ -889,7 +1581,8 @@
         },
         "options": [],
         "regex": "",
-        "hide": 0
+        "hide": 0,
+        "allValue": ".*"
       }
     ]
   },
