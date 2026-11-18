@@ -9,101 +9,64 @@
   "panels": [
     {
       "id": 1,
-      "type": "timeseries",
-      "title": "FUSE write op latency",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
+      "type": "row",
+      "title": "Overview",
+      "collapsed": false,
+      "panels": [],
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 1,
+        "w": 24,
         "x": 0,
         "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_fuse_op_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"op\" =~ /^write$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "write $tag_node $col"
-        }
-      ]
+      }
     },
     {
       "id": 2,
-      "type": "timeseries",
-      "title": "FUSE fsync / flush / release latency (p99 by op)",
-      "description": "",
+      "type": "stat",
+      "title": "Write throughput",
+      "description": "Bytes per second FUSE clients push to data nodes (all selected clients, all tiers). Zero when nobody writes.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 0
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
+          "unit": "Bps",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
         },
         "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
           "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         }
       },
       "targets": [
@@ -114,27 +77,376 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_fuse_op_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ AND \"op\" =~ /^(fsync|flush|release)$/ GROUP BY time($__interval), \"node\", \"op\" fill(null)",
+          "query": "SELECT sum(\"r\") AS \"write\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_fuse_put_chunk_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"tier\", \"src_dc\") GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "$tag_node $tag_op $col"
+          "alias": "write"
         }
       ]
     },
     {
       "id": 3,
-      "type": "timeseries",
-      "title": "FUSE PutChunk latency by tier and DC",
-      "description": "",
+      "type": "stat",
+      "title": "PutChunk failures over range",
+      "description": "PutChunk failures seen by FUSE clients in the selected time range. Any value above zero means a data node refused or lost an upload; the client retries another target.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"s\") AS \"failures\" FROM (SELECT spread(\"value\") AS \"s\" FROM \"dtfs_fuse_put_chunk_failures\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\", \"tier\", \"src_dc\")",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "failures"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "FUSE write op errors over range",
+      "description": "Failed FUSE write, create, flush, fsync, release and setattr calls in the selected range: errors the application sees. Should stay zero.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"s\") AS \"errors\" FROM (SELECT spread(\"value\") AS \"s\" FROM \"dtfs_fuse_op_errors\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ AND \"op\" =~ /^(write|create|flush|fsync|release|setattr)$/ GROUP BY \"node\", \"op\", \"errno\")",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "errors"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Commit rejects over range",
+      "description": "Chunk commits the manager rejected in the selected range (for example fewer replicas than write_safety.min_replicas_before_ack). Should stay zero; see the Manager panels for the reason.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"s\") AS \"rejects\" FROM (SELECT spread(\"value\") AS \"s\" FROM \"dtfs_write_commit_rejects\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\", \"reason\")",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "rejects"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Raft client write p99",
+      "description": "Highest p99 of a Raft client_write (proposal to applied) on the selected managers. Normal is a few ms to tens of ms; seconds mean a slow log fsync or a lagging follower.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 100000
+              },
+              {
+                "color": "red",
+                "value": 1000000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_client_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "p99"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Async batches in flight",
+      "description": "Background upload batches of FUSE async_commit writers, summed over the selected clients. Persistently at the configured maximum means uploads cannot keep up with the writers.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"g\") AS \"in flight\" FROM (SELECT mean(\"value\") AS \"g\" FROM \"dtfs_fuse_async_inflight_batches\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\") GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "in flight"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "Client (FUSE)",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "FUSE write latency (p50 vs p99)",
+      "description": "Latency of write(2) calls inside the FUSE client. Writes are buffered, so normal is microseconds; a p99 near the cap-wait time means writers are blocked at the dirty cap.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 6
       },
       "fieldConfig": {
         "defaults": {
@@ -142,9 +454,14 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -154,8 +471,9 @@
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
-            "max"
+            "mean",
+            "max",
+            "lastNotNull"
           ]
         },
         "tooltip": {
@@ -171,37 +489,43 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_fuse_put_chunk_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"tier\", \"src_dc\" fill(null)",
+          "query": "SELECT mean(\"p50\") AS \"p50\", max(\"p99\") AS \"p99\" FROM \"dtfs_fuse_op_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ AND \"op\" =~ /^write$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "$tag_node $tag_tier $tag_src_dc $col"
+          "alias": "$col $tag_node"
         }
       ]
     },
     {
-      "id": 4,
+      "id": 10,
       "type": "timeseries",
-      "title": "FUSE PutChunk bytes and failures",
-      "description": "",
+      "title": "FUSE flush / fsync / release latency (p99)",
+      "description": "p99 latency of the calls that force data out. This is where a write waits for upload and commit: normal is bounded by one chunk upload, much more points at a slow data node or manager.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 6
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "Bps",
+          "unit": "µs",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -209,10 +533,11 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
-            "lastNotNull",
-            "max"
+            "mean",
+            "max",
+            "lastNotNull"
           ]
         },
         "tooltip": {
@@ -228,39 +553,28 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_fuse_put_chunk_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"tier\" fill(null)",
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_fuse_op_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ AND \"op\" =~ /^(fsync|flush|release)$/ GROUP BY time($__interval), \"node\", \"op\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "bytes/s $tag_node $tag_tier"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_fuse_put_chunk_failures\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"tier\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "failures/s $tag_node $tag_tier"
+          "alias": "p99 $tag_node $tag_op"
         }
       ]
     },
     {
-      "id": 5,
+      "id": 11,
       "type": "timeseries",
-      "title": "FUSE commits by trigger",
-      "description": "",
+      "title": "FUSE op errors by op and errno",
+      "description": "Failed FUSE calls on the write path per second, by operation and errno: what the application sees. Should be empty; EIO or ENOSPC under load is an incident.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 0,
-        "y": 16
+        "y": 15
       },
       "fieldConfig": {
         "defaults": {
@@ -269,10 +583,74 @@
             "drawStyle": "line",
             "lineWidth": 1,
             "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": 30000,
             "stacking": {
-              "mode": "normal",
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_fuse_op_errors\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ AND \"op\" =~ /^(write|create|flush|fsync|release|setattr)$/ GROUP BY time($__interval), \"node\", \"op\", \"errno\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "errors $tag_node $tag_op $tag_errno"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "FUSE write buffer vs dirty cap",
+      "description": "Buffered dirty bytes against the dirty cap per client. A buffer that sits at the cap means writers are throttled by upload speed.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
               "group": "A"
             }
           }
@@ -301,64 +679,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_fuse_commits\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"trigger\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "$tag_node $tag_trigger"
-        }
-      ]
-    },
-    {
-      "id": 6,
-      "type": "timeseries",
-      "title": "FUSE write buffer vs dirty cap, cap waits",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 16
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_fuse_write_buffered_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"v\" FROM \"dtfs_fuse_write_buffered_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "buffered $tag_node"
@@ -370,59 +691,70 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_fuse_write_dirty_cap_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"v\" FROM \"dtfs_fuse_write_dirty_cap_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "dirty cap $tag_node"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_fuse_write_cap_wait_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "cap wait $tag_node $col"
         }
       ]
     },
     {
-      "id": 7,
+      "id": 13,
       "type": "timeseries",
-      "title": "Client allocate / commit latency",
-      "description": "",
+      "title": "FUSE writers blocked at the dirty cap",
+      "description": "Rate of writers blocked at the dirty cap (left axis) and the p99 time they waited (right axis). Any sustained blocking means the write rate exceeds what the cluster ingests.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 0,
         "y": 24
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "µs",
+          "unit": "ops",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "µs"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
+            "mean",
             "max"
           ]
         },
@@ -439,10 +771,10 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_client_allocate_chunks_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_fuse_write_cap_waits\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "allocate $tag_node $col"
+          "alias": "cap waits $tag_node"
         },
         {
           "datasource": {
@@ -451,24 +783,25 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_client_commit_chunk_locations_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_fuse_write_cap_wait_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "commit $tag_node $col"
+          "alias": "cap wait p99 $tag_node"
         }
       ]
     },
     {
-      "id": 8,
+      "id": 14,
       "type": "timeseries",
-      "title": "Client failures and PutChunk retries",
-      "description": "",
+      "title": "FUSE commits by trigger",
+      "description": "Commit rate by what triggered it: batch_full is the healthy case, timer and dirty_cap mean slow or partial writers, close is the last writer closing the file.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 12,
         "y": 24
@@ -479,9 +812,14 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -491,7 +829,7 @@
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
+            "mean",
             "max"
           ]
         },
@@ -508,7 +846,429 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_client_allocate_chunks_failures\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_fuse_commits\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"trigger\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "commits $tag_node $tag_trigger"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "FUSE async batches: commit latency and in flight",
+      "description": "For async_commit writers: p99 time to commit one background batch (left axis) and the batches currently uploading (right axis). Latency rising while in-flight sits at the maximum means the cluster is the bottleneck.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_fuse_async_batch_commit_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "commit p99 $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT mean(\"value\") AS \"v\" FROM \"dtfs_fuse_async_inflight_batches\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "in flight $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "FUSE PutChunk latency by tier and DC (p99)",
+      "description": "p99 of one PutChunk upload from the client, per destination tier and source DC. The highest line is the slowest link; cross-DC uploads are expected to be slower.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 33
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_fuse_put_chunk_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"tier\", \"src_dc\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "p99 $tag_node $tag_tier $tag_src_dc"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "FUSE PutChunk throughput by tier and DC",
+      "description": "Upload rate per client, destination tier and source DC. Compare with the DC link speed to see whether the link is saturated.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_fuse_put_chunk_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"tier\", \"src_dc\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "bytes $tag_node $tag_tier $tag_src_dc"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "FUSE PutChunk failures by tier and DC",
+      "description": "Failed uploads per second per client, tier and source DC. Should be empty; occasional failures are retried on the next target (see the retry panel).",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_fuse_put_chunk_failures\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"tier\", \"src_dc\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "failures $tag_node $tag_tier $tag_src_dc"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Client allocate / commit latency (p99)",
+      "description": "p99 of the manager calls a client makes per chunk: AllocateChunks (placement) and CommitChunkLocations (Raft write). Compare with the manager Raft panels to see whether the time is in Raft or on the network.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 51
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_client_allocate_chunks_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "allocate p99 $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_client_commit_chunk_locations_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "commit p99 $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Client failures and PutChunk retries",
+      "description": "Failed manager calls and PutChunk retries per second. Retries are the client moving to the next target; failures surface as write errors if they persist.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 51
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_client_allocate_chunks_failures\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "allocate fail $tag_node"
@@ -520,7 +1280,7 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_client_commit_chunk_locations_failures\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_client_commit_chunk_locations_failures\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "commit fail $tag_node"
@@ -532,7 +1292,7 @@
           },
           "refId": "C",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_client_put_chunk_retries\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_client_put_chunk_retries\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "put retries $tag_node"
@@ -544,7 +1304,7 @@
           },
           "refId": "D",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_fuse_put_ladder_retries\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_fuse_put_ladder_retries\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "ladder retries $tag_node"
@@ -552,19 +1312,33 @@
       ]
     },
     {
-      "id": 9,
+      "id": 21,
+      "type": "row",
+      "title": "Data node",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      }
+    },
+    {
+      "id": 22,
       "type": "timeseries",
-      "title": "Data node put stages stacked (p50)",
-      "description": "Sum of stage medians. Compare with the total below.",
+      "title": "Data node put stages (p50)",
+      "description": "Median time per PutChunk stage on the selected data nodes (mean over nodes and disks), stacked in request order. Approximate: percentiles do not add exactly. The tallest band is where a normal put spends its time.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 61
       },
       "fieldConfig": {
         "defaults": {
@@ -573,8 +1347,9 @@
             "drawStyle": "line",
             "lineWidth": 1,
             "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": 30000,
             "stacking": {
               "mode": "normal",
               "group": "A"
@@ -586,10 +1361,11 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
-            "lastNotNull",
-            "max"
+            "mean",
+            "max",
+            "lastNotNull"
           ]
         },
         "tooltip": {
@@ -605,10 +1381,10 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_recv_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"p50\") AS \"p50\" FROM \"dtfs_data_put_recv_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "recv $tag_node $col"
+          "alias": "recv"
         },
         {
           "datasource": {
@@ -617,10 +1393,10 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_tmp_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"p50\") AS \"p50\" FROM \"dtfs_data_put_tmp_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "tmp_write $tag_node $col"
+          "alias": "tmp write"
         },
         {
           "datasource": {
@@ -629,10 +1405,10 @@
           },
           "refId": "C",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_hash_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"p50\") AS \"p50\" FROM \"dtfs_data_put_hash_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "hash $tag_node $col"
+          "alias": "hash"
         },
         {
           "datasource": {
@@ -641,10 +1417,10 @@
           },
           "refId": "D",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_fsync_dat_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"p50\") AS \"p50\" FROM \"dtfs_data_put_fsync_dat_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "fsync_dat $tag_node $col"
+          "alias": "fsync dat"
         },
         {
           "datasource": {
@@ -653,10 +1429,10 @@
           },
           "refId": "E",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_rename_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"p50\") AS \"p50\" FROM \"dtfs_data_put_rename_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "rename $tag_node $col"
+          "alias": "rename"
         },
         {
           "datasource": {
@@ -665,10 +1441,10 @@
           },
           "refId": "F",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_meta_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"p50\") AS \"p50\" FROM \"dtfs_data_put_meta_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "meta $tag_node $col"
+          "alias": "meta"
         },
         {
           "datasource": {
@@ -677,27 +1453,28 @@
           },
           "refId": "G",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_commit_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"p50\") AS \"p50\" FROM \"dtfs_data_put_commit_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "commit $tag_node $col"
+          "alias": "commit"
         }
       ]
     },
     {
-      "id": 10,
+      "id": 23,
       "type": "timeseries",
-      "title": "Data node put stages stacked (p99)",
-      "description": "Sum of stage p99s is an upper bound of the total p99.",
+      "title": "Data node put stages (p99)",
+      "description": "p99 time per PutChunk stage (max over the selected nodes and disks), not stacked. A stage far above the others (usually recv or fsync dat) is the bottleneck for the slow puts.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 61
       },
       "fieldConfig": {
         "defaults": {
@@ -706,10 +1483,147 @@
             "drawStyle": "line",
             "lineWidth": 1,
             "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": 30000,
             "stacking": {
-              "mode": "normal",
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_recv_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "recv"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_tmp_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "tmp write"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_hash_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "hash"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "D",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_fsync_dat_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "fsync dat"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "E",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_rename_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "rename"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "F",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_meta_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "meta"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "G",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_commit_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "commit"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Data node put total latency (p50 vs p99)",
+      "description": "Whole-call PutChunk latency per data node (mean p50, max p99 over its disks). A p99 far above p50 means a few slow puts, typically one slow disk or a congested link.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 70
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
               "group": "A"
             }
           }
@@ -721,8 +1635,9 @@
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
-            "max"
+            "mean",
+            "max",
+            "lastNotNull"
           ]
         },
         "tooltip": {
@@ -738,99 +1653,28 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_recv_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"p50\") AS \"p50\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_total_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "recv $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_tmp_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "tmp_write $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_hash_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "hash $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_fsync_dat_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "fsync_dat $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "E",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_rename_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "rename $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "F",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_meta_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "meta $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "G",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_commit_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "commit $tag_node $col"
+          "alias": "$col $tag_node"
         }
       ]
     },
     {
-      "id": 11,
+      "id": 25,
       "type": "timeseries",
-      "title": "Data node put total, slot wait, shed",
-      "description": "",
+      "title": "Data node put slot wait (p99)",
+      "description": "p99 wait for a free put slot before a PutChunk starts. Non-zero waits mean the node is at its concurrent put limit.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 0,
-        "y": 40
+        "x": 12,
+        "y": 70
       },
       "fieldConfig": {
         "defaults": {
@@ -838,9 +1682,14 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -850,8 +1699,9 @@
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
-            "max"
+            "mean",
+            "max",
+            "lastNotNull"
           ]
         },
         "tooltip": {
@@ -867,213 +1717,28 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_total_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_slot_wait_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "total $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_data_put_slot_wait_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "slot wait $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_data_put_shed_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "shed/s $tag_node"
+          "alias": "p99 $tag_node"
         }
       ]
     },
     {
-      "id": 12,
+      "id": 26,
       "type": "timeseries",
-      "title": "Is the Raft fsync the bottleneck? (p99)",
-      "description": "Issue #158: raft_log_write_us is the log append plus fsync on the leader and followers.",
+      "title": "Data node puts shed and in flight",
+      "description": "Puts refused under memory pressure per second (left axis) and puts currently in flight (right axis). Shedding should stay at zero; it only happens when shed_threshold_pct is set and memory is tight.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 40
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_client_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "raft_client_write $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_write_or_forward_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "write_or_forward $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_log_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "raft_log_write (fsync) $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_apply_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "raft_apply $tag_node $col"
-        }
-      ]
-    },
-    {
-      "id": 13,
-      "type": "timeseries",
-      "title": "Raft append batch size",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 0,
-        "y": 48
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_append_entries\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "entries/append $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_append_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "bytes/append $tag_node $col"
-        }
-      ]
-    },
-    {
-      "id": 14,
-      "type": "timeseries",
-      "title": "Manager alloc/commit sizes, rejects, leases",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 48
+        "y": 79
       },
       "fieldConfig": {
         "defaults": {
@@ -1081,19 +1746,41 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
+            "mean",
             "max"
           ]
         },
@@ -1110,10 +1797,10 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_write_commit_rejects\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"reason\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_data_put_shed_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "commit reject  $tag_node $tag_reason"
+          "alias": "shed $tag_node"
         },
         {
           "datasource": {
@@ -1122,10 +1809,237 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_write_alloc_rejects\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"reason\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"v\" FROM \"dtfs_data_put_inflight\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "alloc reject  $tag_node $tag_reason"
+          "alias": "in flight $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Data node bytes stored",
+      "description": "Chunk bytes written per second per data node, disk and tier. Shows which disks absorb the write load.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 79
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_data_put_bytes_total\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"disk\", \"tier\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "stored $tag_node $tag_disk $tag_tier"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "row",
+      "title": "Manager / Raft",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 88
+      }
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Chunks per allocate / commit call",
+      "description": "Chunks handled per AllocateChunks and CommitChunkLocations call (mean p50, max p99). Large calls amortise the Raft write; a p50 of 1 means every chunk pays a full Raft round trip.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 89
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT mean(\"p50\") AS \"p50\", max(\"p99\") AS \"p99\" FROM \"dtfs_write_alloc_chunks\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "alloc $col $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT mean(\"p50\") AS \"p50\", max(\"p99\") AS \"p99\" FROM \"dtfs_write_commit_chunks\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "commit $col $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Manager rejects and leases",
+      "description": "Rejected allocations and commits per second by reason, and write leases granted and denied. Rejects should be empty; denied leases mean two writers on one file.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 89
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_write_commit_rejects\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"reason\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "commit reject $tag_node $tag_reason"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_write_alloc_rejects\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"reason\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "alloc reject $tag_node $tag_reason"
         },
         {
           "datasource": {
@@ -1134,7 +2048,7 @@
           },
           "refId": "C",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_write_lease_granted\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_write_lease_granted\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "lease granted $tag_node"
@@ -1146,10 +2060,238 @@
           },
           "refId": "D",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_write_lease_denied\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"rate\" FROM \"dtfs_write_lease_denied\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "lease denied $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Is the Raft fsync the bottleneck? (p99)",
+      "description": "Compare raft log write (the log append plus fsync) with raft client write (the whole proposal to applied). If log write p99 is close to client write p99, the disk fsync dominates; if client write is much larger, the time goes to replication to followers or to apply. write or forward adds the hop to the leader on followers.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 98
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_client_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "client write p99 $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_write_or_forward_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "write or forward p99 $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_log_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "log write p99 $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "D",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_apply_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "apply p99 $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Raft entries per log append",
+      "description": "Entries per Raft log append (mean p50, max p99). Higher values mean the leader batches proposals, which amortises the fsync.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 107
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT mean(\"p50\") AS \"p50\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_append_entries\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "$col $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Raft bytes per log append",
+      "description": "Bytes per Raft log append (mean p50, max p99). Together with the log write latency this shows the effective log fsync throughput.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 107
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT mean(\"p50\") AS \"p50\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_append_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "$col $tag_node"
         }
       ]
     }
@@ -1187,7 +2329,6 @@
         "sort": 1,
         "multi": true,
         "includeAll": true,
-        "allValue": ".*",
         "current": {
           "selected": true,
           "text": "All",
@@ -1195,7 +2336,32 @@
         },
         "options": [],
         "regex": "",
-        "hide": 0
+        "hide": 0,
+        "allValue": ".*"
+      },
+      {
+        "name": "role",
+        "label": "Role",
+        "type": "query",
+        "datasource": {
+          "type": "influxdb",
+          "uid": "${DS}"
+        },
+        "query": "SHOW TAG VALUES WITH KEY = \"role\"",
+        "definition": "SHOW TAG VALUES WITH KEY = \"role\"",
+        "refresh": 1,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": [],
+        "regex": "",
+        "hide": 0,
+        "allValue": ".*"
       },
       {
         "name": "node",
@@ -1205,13 +2371,12 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "SHOW TAG VALUES WITH KEY = \"node\" WHERE \"dc\" =~ /^$dc$/",
-        "definition": "SHOW TAG VALUES WITH KEY = \"node\" WHERE \"dc\" =~ /^$dc$/",
+        "query": "SHOW TAG VALUES WITH KEY = \"node\" WHERE \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/",
+        "definition": "SHOW TAG VALUES WITH KEY = \"node\" WHERE \"dc\" =~ /^$dc$/ AND \"role\" =~ /^$role$/",
         "refresh": 1,
         "sort": 1,
         "multi": true,
         "includeAll": true,
-        "allValue": ".*",
         "current": {
           "selected": true,
           "text": "All",
@@ -1219,7 +2384,8 @@
         },
         "options": [],
         "regex": "",
-        "hide": 0
+        "hide": 0,
+        "allValue": ".*"
       }
     ]
   },

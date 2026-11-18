@@ -9,98 +9,64 @@
   "panels": [
     {
       "id": 1,
-      "type": "timeseries",
-      "title": "FUSE write op latency",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
+      "type": "row",
+      "title": "Overview",
+      "collapsed": false,
+      "panels": [],
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 1,
+        "w": 24,
         "x": 0,
         "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_fuse_op_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> filter(fn: (r) => r.op =~ /^write$/)\n    |> map(fn: (r) => ({r with _field: \"write \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
+      }
     },
     {
       "id": 2,
-      "type": "timeseries",
-      "title": "FUSE fsync / flush / release latency (p99 by op)",
-      "description": "",
+      "type": "stat",
+      "title": "Write throughput",
+      "description": "Bytes per second FUSE clients push to data nodes (all selected clients, all tiers). Zero when nobody writes.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 0
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 1
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
+          "unit": "Bps",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "decimals": 1
         },
         "overrides": []
       },
       "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
           "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         }
       },
       "targets": [
@@ -111,24 +77,358 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_fuse_op_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> filter(fn: (r) => r.op =~ /^(fsync|flush|release)$/)\n    |> group(columns: [\"node\", \"op\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_put_chunk_bytes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"write\"}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         }
       ]
     },
     {
       "id": 3,
-      "type": "timeseries",
-      "title": "FUSE PutChunk latency by tier and DC",
-      "description": "",
+      "type": "stat",
+      "title": "PutChunk failures over range",
+      "description": "PutChunk failures seen by FUSE clients in the selected time range. Any value above zero means a data node refused or lost an upload; the client retries another target.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_put_chunk_failures\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> spread()\n  |> map(fn: (r) => ({r with _field: \"failures\"}))\n  |> group(columns: [\"_field\", \"_stop\"])\n  |> sum()\n  |> duplicate(column: \"_stop\", as: \"_time\")\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "FUSE write op errors over range",
+      "description": "Failed FUSE write, create, flush, fsync, release and setattr calls in the selected range: errors the application sees. Should stay zero.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_op_errors\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> filter(fn: (r) => r.op =~ /^(write|create|flush|fsync|release|setattr)$/)\n  |> spread()\n  |> map(fn: (r) => ({r with _field: \"errors\"}))\n  |> group(columns: [\"_field\", \"_stop\"])\n  |> sum()\n  |> duplicate(column: \"_stop\", as: \"_time\")\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Commit rejects over range",
+      "description": "Chunk commits the manager rejected in the selected range (for example fewer replicas than write_safety.min_replicas_before_ack). Should stay zero; see the Manager panels for the reason.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_write_commit_rejects\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> spread()\n  |> map(fn: (r) => ({r with _field: \"rejects\"}))\n  |> group(columns: [\"_field\", \"_stop\"])\n  |> sum()\n  |> duplicate(column: \"_stop\", as: \"_time\")\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Raft client write p99",
+      "description": "Highest p99 of a Raft client_write (proposal to applied) on the selected managers. Normal is a few ms to tens of ms; seconds mean a slow log fsync or a lagging follower.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 100000
+              },
+              {
+                "color": "red",
+                "value": 1000000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_client_write_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"p99\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Async batches in flight",
+      "description": "Background upload batches of FUSE async_commit writers, summed over the selected clients. Persistently at the configured maximum means uploads cannot keep up with the writers.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "noValue": "0",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_async_inflight_batches\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"in flight\"}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "Client (FUSE)",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "FUSE write latency (p50 vs p99)",
+      "description": "Latency of write(2) calls inside the FUSE client. Writes are buffered, so normal is microseconds; a p99 near the cap-wait time means writers are blocked at the dirty cap.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 6
       },
       "fieldConfig": {
         "defaults": {
@@ -136,128 +436,12 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_fuse_put_chunk_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> group(columns: [\"node\", \"tier\", \"src_dc\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
-    },
-    {
-      "id": 4,
-      "type": "timeseries",
-      "title": "FUSE PutChunk bytes and failures",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 8
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "Bps",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_put_chunk_bytes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"bytes/s\")\n  |> group(columns: [\"node\", \"tier\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_put_chunk_failures\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"failures/s\")\n  |> group(columns: [\"node\", \"tier\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        }
-      ]
-    },
-    {
-      "id": 5,
-      "type": "timeseries",
-      "title": "FUSE commits by trigger",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 16
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
             "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": 30000,
             "stacking": {
-              "mode": "normal",
+              "mode": "none",
               "group": "A"
             }
           }
@@ -269,7 +453,129 @@
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_fuse_op_us\" and (r._field == \"p50\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n    |> filter(fn: (r) => r.op =~ /^write$/)\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field == \"p50\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field == \"p99\")\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])\n  |> map(fn: (r) => ({r with _field: r._field + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "FUSE flush / fsync / release latency (p99)",
+      "description": "p99 latency of the calls that force data out. This is where a write waits for upload and commit: normal is bounded by one chunk upload, much more points at a slow data node or manager.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_op_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> filter(fn: (r) => r.op =~ /^(fsync|flush|release)$/)\n  |> group(columns: [\"node\", \"op\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"p99\" + \" \" + r.node + \" \" + r.op}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "FUSE op errors by op and errno",
+      "description": "Failed FUSE calls on the write path per second, by operation and errno: what the application sees. Should be empty; EIO or ENOSPC under load is an incident.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
             "max"
           ]
         },
@@ -286,24 +592,25 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_commits\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"fuse_commits\")\n  |> group(columns: [\"node\", \"trigger\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_op_errors\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> filter(fn: (r) => r.op =~ /^(write|create|flush|fsync|release|setattr)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"errors\" + \" \" + r.node + \" \" + r.op + \" \" + r.errno}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         }
       ]
     },
     {
-      "id": 6,
+      "id": 12,
       "type": "timeseries",
-      "title": "FUSE write buffer vs dirty cap, cap waits",
-      "description": "",
+      "title": "FUSE write buffer vs dirty cap",
+      "description": "Buffered dirty bytes against the dirty cap per client. A buffer that sits at the cap means writers are throttled by upload speed.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 12,
-        "y": 16
+        "y": 15
       },
       "fieldConfig": {
         "defaults": {
@@ -311,227 +618,12 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_write_buffered_bytes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"buffered\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_write_dirty_cap_bytes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"dirty cap\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_fuse_write_cap_wait_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"cap wait \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
-    },
-    {
-      "id": 7,
-      "type": "timeseries",
-      "title": "Client allocate / commit latency",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 24
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_client_allocate_chunks_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"allocate \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_client_commit_chunk_locations_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"commit \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
-    },
-    {
-      "id": 8,
-      "type": "timeseries",
-      "title": "Client failures and PutChunk retries",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 24
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_client_allocate_chunks_failures\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"allocate fail\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_client_commit_chunk_locations_failures\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"commit fail\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_client_put_chunk_retries\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"put retries\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_put_ladder_retries\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"ladder retries\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        }
-      ]
-    },
-    {
-      "id": 9,
-      "type": "timeseries",
-      "title": "Data node put stages stacked (p50)",
-      "description": "Sum of stage medians. Compare with the total below.",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 32
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
             "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": 30000,
             "stacking": {
-              "mode": "normal",
+              "mode": "none",
               "group": "A"
             }
           }
@@ -560,7 +652,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_recv_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"recv \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_write_buffered_bytes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"buffered\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         },
         {
           "datasource": {
@@ -569,397 +661,25 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_tmp_write_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"tmp_write \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_hash_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"hash \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_fsync_dat_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"fsync_dat \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "E",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_rename_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"rename \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "F",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_meta_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"meta \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "G",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_commit_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"commit \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
-    },
-    {
-      "id": 10,
-      "type": "timeseries",
-      "title": "Data node put stages stacked (p99)",
-      "description": "Sum of stage p99s is an upper bound of the total p99.",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 32
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "normal",
-              "group": "A"
-            }
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_recv_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"recv \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_tmp_write_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"tmp_write \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_hash_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"hash \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_fsync_dat_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"fsync_dat \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "E",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_rename_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"rename \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "F",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_meta_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"meta \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "G",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_commit_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"commit \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
-    },
-    {
-      "id": 11,
-      "type": "timeseries",
-      "title": "Data node put total, slot wait, shed",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 40
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_total_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"total \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_slot_wait_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"slot wait \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_shed_total\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"shed/s\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        }
-      ]
-    },
-    {
-      "id": 12,
-      "type": "timeseries",
-      "title": "Is the Raft fsync the bottleneck? (p99)",
-      "description": "Issue #158: raft_log_write_us is the log append plus fsync on the leader and followers.",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 40
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_client_write_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"raft_client_write \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_write_or_forward_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"write_or_forward \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_log_write_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"raft_log_write (fsync) \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_apply_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"raft_apply \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_write_dirty_cap_bytes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"dirty cap\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         }
       ]
     },
     {
       "id": 13,
       "type": "timeseries",
-      "title": "Raft append batch size",
-      "description": "",
+      "title": "FUSE writers blocked at the dirty cap",
+      "description": "Rate of writers blocked at the dirty cap (left axis) and the p99 time they waited (right axis). Any sustained blocking means the write rate exceeds what the cluster ingests.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 0,
-        "y": 48
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_append_entries\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"entries/append \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_append_bytes\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"bytes/append \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
-    },
-    {
-      "id": 14,
-      "type": "timeseries",
-      "title": "Manager alloc/commit sizes, rejects, leases",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 48
+        "y": 24
       },
       "fieldConfig": {
         "defaults": {
@@ -967,19 +687,41 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "µs"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
+            "mean",
             "max"
           ]
         },
@@ -996,7 +738,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_write_commit_rejects\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"commit reject \")\n  |> group(columns: [\"node\", \"reason\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_write_cap_waits\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"cap waits\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         },
         {
           "datasource": {
@@ -1005,7 +747,474 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_write_alloc_rejects\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"alloc reject \")\n  |> group(columns: [\"node\", \"reason\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_write_cap_wait_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"cap wait p99\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "FUSE commits by trigger",
+      "description": "Commit rate by what triggered it: batch_full is the healthy case, timer and dirty_cap mean slow or partial writers, close is the last writer closing the file.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_commits\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"commits\" + \" \" + r.node + \" \" + r.trigger}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "FUSE async batches: commit latency and in flight",
+      "description": "For async_commit writers: p99 time to commit one background batch (left axis) and the batches currently uploading (right axis). Latency rising while in-flight sits at the maximum means the cluster is the bottleneck.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_async_batch_commit_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"commit p99\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_async_inflight_batches\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"in flight\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "FUSE PutChunk latency by tier and DC (p99)",
+      "description": "p99 of one PutChunk upload from the client, per destination tier and source DC. The highest line is the slowest link; cross-DC uploads are expected to be slower.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 33
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_put_chunk_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\", \"tier\", \"src_dc\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"p99\" + \" \" + r.node + \" \" + r.tier + \" \" + (if exists r.src_dc then r.src_dc else \"-\")}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "FUSE PutChunk throughput by tier and DC",
+      "description": "Upload rate per client, destination tier and source DC. Compare with the DC link speed to see whether the link is saturated.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_put_chunk_bytes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"bytes\" + \" \" + r.node + \" \" + r.tier + \" \" + (if exists r.src_dc then r.src_dc else \"-\")}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "FUSE PutChunk failures by tier and DC",
+      "description": "Failed uploads per second per client, tier and source DC. Should be empty; occasional failures are retried on the next target (see the retry panel).",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_put_chunk_failures\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"failures\" + \" \" + r.node + \" \" + r.tier + \" \" + (if exists r.src_dc then r.src_dc else \"-\")}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Client allocate / commit latency (p99)",
+      "description": "p99 of the manager calls a client makes per chunk: AllocateChunks (placement) and CommitChunkLocations (Raft write). Compare with the manager Raft panels to see whether the time is in Raft or on the network.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 51
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_client_allocate_chunks_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"allocate p99\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_client_commit_chunk_locations_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"commit p99\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Client failures and PutChunk retries",
+      "description": "Failed manager calls and PutChunk retries per second. Retries are the client moving to the next target; failures surface as write errors if they persist.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 51
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_client_allocate_chunks_failures\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"allocate fail\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_client_commit_chunk_locations_failures\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"commit fail\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         },
         {
           "datasource": {
@@ -1014,7 +1223,7 @@
           },
           "refId": "C",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_write_lease_granted\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"lease granted\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_client_put_chunk_retries\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"put retries\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         },
         {
           "datasource": {
@@ -1023,7 +1232,898 @@
           },
           "refId": "D",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_write_lease_denied\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"lease denied\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_fuse_put_ladder_retries\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"ladder retries\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "row",
+      "title": "Data node",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Data node put stages (p50)",
+      "description": "Median time per PutChunk stage on the selected data nodes (mean over nodes and disks), stacked in request order. Approximate: percentiles do not add exactly. The tallest band is where a normal put spends its time.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 61
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_recv_us\" and (r._field == \"p50\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"recv\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_tmp_write_us\" and (r._field == \"p50\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"tmp write\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_hash_us\" and (r._field == \"p50\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"hash\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "D",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_fsync_dat_us\" and (r._field == \"p50\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"fsync dat\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "E",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_rename_us\" and (r._field == \"p50\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"rename\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "F",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_meta_us\" and (r._field == \"p50\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"meta\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "G",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_commit_us\" and (r._field == \"p50\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"commit\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Data node put stages (p99)",
+      "description": "p99 time per PutChunk stage (max over the selected nodes and disks), not stacked. A stage far above the others (usually recv or fsync dat) is the bottleneck for the slow puts.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 61
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_recv_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"recv\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_tmp_write_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"tmp write\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_hash_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"hash\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "D",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_fsync_dat_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"fsync dat\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "E",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_rename_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"rename\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "F",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_meta_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"meta\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "G",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_commit_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"commit\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Data node put total latency (p50 vs p99)",
+      "description": "Whole-call PutChunk latency per data node (mean p50, max p99 over its disks). A p99 far above p50 means a few slow puts, typically one slow disk or a congested link.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 70
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_data_put_total_us\" and (r._field == \"p50\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field == \"p50\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field == \"p99\")\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])\n  |> map(fn: (r) => ({r with _field: r._field + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "Data node put slot wait (p99)",
+      "description": "p99 wait for a free put slot before a PutChunk starts. Non-zero waits mean the node is at its concurrent put limit.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_slot_wait_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"p99\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Data node puts shed and in flight",
+      "description": "Puts refused under memory pressure per second (left axis) and puts currently in flight (right axis). Shedding should stay at zero; it only happens when shed_threshold_pct is set and memory is tight.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 79
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_shed_total\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"shed\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_inflight\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"in flight\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Data node bytes stored",
+      "description": "Chunk bytes written per second per data node, disk and tier. Shows which disks absorb the write load.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 79
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_data_put_bytes_total\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"stored\" + \" \" + r.node + \" \" + r.disk + \" \" + r.tier}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "row",
+      "title": "Manager / Raft",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 88
+      }
+    },
+    {
+      "id": 29,
+      "type": "timeseries",
+      "title": "Chunks per allocate / commit call",
+      "description": "Chunks handled per AllocateChunks and CommitChunkLocations call (mean p50, max p99). Large calls amortise the Raft write; a p50 of 1 means every chunk pays a full Raft round trip.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 89
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_write_alloc_chunks\" and (r._field == \"p50\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field == \"p50\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field == \"p99\")\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])\n  |> map(fn: (r) => ({r with _field: \"alloc\" + \" \" + r._field + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_write_commit_chunks\" and (r._field == \"p50\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field == \"p50\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field == \"p99\")\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])\n  |> map(fn: (r) => ({r with _field: \"commit\" + \" \" + r._field + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Manager rejects and leases",
+      "description": "Rejected allocations and commits per second by reason, and write leases granted and denied. Rejects should be empty; denied leases mean two writers on one file.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 89
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_write_commit_rejects\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"commit reject\" + \" \" + r.node + \" \" + r.reason}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_write_alloc_rejects\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"alloc reject\" + \" \" + r.node + \" \" + r.reason}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_write_lease_granted\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"lease granted\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "D",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_write_lease_denied\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"lease denied\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Is the Raft fsync the bottleneck? (p99)",
+      "description": "Compare raft log write (the log append plus fsync) with raft client write (the whole proposal to applied). If log write p99 is close to client write p99, the disk fsync dominates; if client write is much larger, the time goes to replication to followers or to apply. write or forward adds the hop to the leader on followers.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 98
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_client_write_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"client write p99\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_write_or_forward_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"write or forward p99\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_log_write_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"log write p99\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "D",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_apply_us\" and (r._field == \"p99\"))\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"apply p99\" + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Raft entries per log append",
+      "description": "Entries per Raft log append (mean p50, max p99). Higher values mean the leader batches proposals, which amortises the fsync.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 107
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_append_entries\" and (r._field == \"p50\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field == \"p50\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field == \"p99\")\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])\n  |> map(fn: (r) => ({r with _field: r._field + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Raft bytes per log append",
+      "description": "Bytes per Raft log append (mean p50, max p99). Together with the log write latency this shows the effective log fsync throughput.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 107
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_append_bytes\" and (r._field == \"p50\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}) and contains(value: r.node, set: ${node:json}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field == \"p50\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field == \"p99\")\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])\n  |> map(fn: (r) => ({r with _field: r._field + \" \" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         }
       ]
     }
@@ -1090,6 +2190,29 @@
         "hide": 0
       },
       {
+        "name": "role",
+        "label": "Role",
+        "type": "query",
+        "datasource": {
+          "type": "influxdb",
+          "uid": "${DS}"
+        },
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -7d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"role\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -7d)",
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "options": [],
+        "regex": "",
+        "hide": 0
+      },
+      {
         "name": "node",
         "label": "Node",
         "type": "query",
@@ -1097,8 +2220,8 @@
           "type": "influxdb",
           "uid": "${DS}"
         },
-        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -7d)",
-        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}), start: -7d)",
+        "query": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -7d)",
+        "definition": "import \"influxdata/influxdb/schema\"\n\nschema.tagValues(bucket: \"${bucket}\", tag: \"node\", predicate: (r) => r._measurement =~ /^dtfs_/ and contains(value: r.dc, set: ${dc:json}) and contains(value: r.role, set: ${role:json}), start: -7d)",
         "refresh": 2,
         "sort": 1,
         "multi": true,
