@@ -9,44 +9,89 @@
   "panels": [
     {
       "id": 1,
-      "type": "timeseries",
-      "title": "Leader / has leader (1 = yes)",
-      "description": "",
+      "type": "row",
+      "title": "Overview",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 2,
+      "type": "state-timeline",
+      "title": "Raft leader per manager",
+      "description": "One lane per manager: green is the Raft leader, blue a follower. Exactly one lane should be green at any time; flapping lanes mean repeated elections.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 4,
+        "w": 4,
         "x": 0,
-        "y": 0
+        "y": 1
       },
       "fieldConfig": {
         "defaults": {
           "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
           "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
+            "fillOpacity": 70,
+            "lineWidth": 0
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "leader",
+                  "color": "green",
+                  "index": 0
+                },
+                "0": {
+                  "text": "follower",
+                  "color": "blue",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
           }
         },
         "overrides": []
       },
       "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.9,
         "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom"
         },
         "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+          "mode": "single",
+          "sort": "none"
         }
       },
       "targets": [
@@ -57,61 +102,460 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_raft_is_leader\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT last(\"value\") AS \"v\" FROM \"dtfs_raft_is_leader\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "is leader $tag_node"
+          "alias": "leader $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Quorum has leader",
+      "description": "Minimum of raft_has_leader over the selected managers: YES while every manager sees a leader, NO as soon as one does not (election in progress or no quorum).",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "NO",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "YES",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
         },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
         {
           "datasource": {
             "type": "influxdb",
             "uid": "${DS}"
           },
-          "refId": "B",
+          "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_raft_has_leader\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT min(\"value\") AS \"v\" FROM \"dtfs_raft_has_leader\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "has leader $tag_node"
+          "alias": "has leader"
         }
       ]
     },
     {
-      "id": 2,
-      "type": "timeseries",
-      "title": "Term and leader changes",
-      "description": "",
+      "id": 4,
+      "type": "stat",
+      "title": "Leader changes (range)",
+      "description": "Leader changes seen over the selected time range (largest count among the selected managers). 0 is normal; a few mean restarts or elections, many mean an unstable cluster.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 0
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"s\") AS \"s\" FROM (SELECT spread(\"value\") AS \"s\" FROM \"dtfs_raft_leader_changes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY \"node\") WHERE $timeFilter",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "leader changes"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Raft log fsync p99",
+      "description": "p99 of the Raft log append plus fsync (worst selected manager). Compare with Client write p99: if fsync is most of it, deferring the fsync would pay off.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 10000
+              },
+              {
+                "color": "red",
+                "value": 50000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_log_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "log write p99"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Client write p99",
+      "description": "p99 of a client_write on the local Raft, from proposal to applied (worst selected manager). This is the end-to-end cost of one metadata mutation.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 50000
+              },
+              {
+                "color": "red",
+                "value": 250000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_client_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "client write p99"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Max follower lag",
+      "description": "Largest follower lag in log entries across all peers, reported by the leader. Near 0 is normal; a growing value means a follower is slow, partitioned or down.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"value\") AS \"v\" FROM \"dtfs_raft_follower_lag\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "max lag"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "Raft",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Raft log fsync vs client write, p50",
+      "description": "Median Raft log append plus fsync (orange) against the median end-to-end client write (blue), per manager. The gap is apply, replication and waiting; when the orange line is close to the blue one the fsync dominates a write.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": [
           {
             "matcher": {
               "id": "byRegexp",
-              "options": ".*leader changes.*"
+              "options": "^log write.*"
             },
             "properties": [
               {
-                "id": "custom.axisPlacement",
-                "value": "right"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^client write.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
               }
             ]
           }
@@ -120,11 +564,13 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -139,10 +585,10 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_raft_current_term\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"p50\") AS \"p50\" FROM \"dtfs_raft_log_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "term $tag_node"
+          "alias": "log write $tag_node"
         },
         {
           "datasource": {
@@ -151,38 +597,361 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT non_negative_difference(max(\"value\")) FROM \"dtfs_raft_leader_changes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"p50\") AS \"p50\" FROM \"dtfs_raft_client_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "leader changes $tag_node"
+          "alias": "client write $tag_node"
         }
       ]
     },
     {
-      "id": 3,
+      "id": 10,
       "type": "timeseries",
-      "title": "Apply lag per manager (last_log - last_applied)",
-      "description": "",
+      "title": "Raft log fsync vs client write, p99",
+      "description": "Tail latency of the Raft log append plus fsync (orange) against the end-to-end client write (blue), per manager. p50 uses the mean of the per-interval p50, p99 the maximum of the per-interval p99. Spikes in orange that carry the blue line up point at disk fsync stalls.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 0,
-        "y": 8
+        "x": 12,
+        "y": 6
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "µs",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^log write.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^client write.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_log_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "log write $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_client_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "client write $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Raft apply and vote write latency (p99)",
+      "description": "p99 time to apply one log entry to the state machine and to persist a vote, per manager. Apply should stay far below the client write latency; vote writes only happen during elections.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_apply_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "apply $tag_node"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_vote_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "vote write $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Entries per log append (p99)",
+      "description": "p99 number of log entries written per append, per manager. Higher values mean the leader batches many proposals into one fsync; always 1 means no batching.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_append_entries\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "entries $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Bytes per log append (p99)",
+      "description": "p99 size of one Raft log append, per manager. Large appends take longer to write and fsync.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_append_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "append $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Apply lag per manager",
+      "description": "Last log index minus last applied index of each manager. 0 or a few entries is normal; a lag that keeps growing means the state machine cannot keep up.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
         },
         "overrides": []
       },
@@ -193,7 +962,8 @@
           "calcs": [
             "lastNotNull",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -208,7 +978,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_raft_apply_lag\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"v\" FROM \"dtfs_raft_apply_lag\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "apply lag $tag_node"
@@ -216,30 +986,37 @@
       ]
     },
     {
-      "id": 4,
+      "id": 15,
       "type": "timeseries",
-      "title": "Follower lag by peer (leader only)",
-      "description": "Exported by the leader only; 0 on followers.",
+      "title": "Follower lag by peer",
+      "description": "Leader's last log index minus the matched index of each follower. `peer` is the numeric Raft node id, not a hostname. A former leader keeps exporting 0 for its peers, so each line is the maximum over the selected managers. Near 0 is normal; a growing line is a slow or unreachable follower.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 12,
-        "y": 8
+        "x": 0,
+        "y": 33
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "short",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
-          }
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
         },
         "overrides": []
       },
@@ -250,7 +1027,8 @@
           "calcs": [
             "lastNotNull",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -265,27 +1043,28 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_raft_follower_lag\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"peer\" fill(null)",
+          "query": "SELECT max(\"value\") AS \"v\" FROM \"dtfs_raft_follower_lag\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"peer\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "lag $tag_node $tag_peer"
+          "alias": "peer $tag_peer"
         }
       ]
     },
     {
-      "id": 5,
+      "id": 16,
       "type": "timeseries",
-      "title": "Millis since quorum ack (leader only)",
-      "description": "Exported by the leader only; 0 on followers.",
+      "title": "Millis since quorum ack",
+      "description": "Milliseconds since the leader last heard from a quorum (0 on non-leaders, so the maximum over managers is shown). Stays near the heartbeat interval; values reaching the election timeout predict a new election.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 0,
-        "y": 16
+        "x": 12,
+        "y": 33
       },
       "fieldConfig": {
         "defaults": {
@@ -293,9 +1072,14 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -307,7 +1091,8 @@
           "calcs": [
             "lastNotNull",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -322,38 +1107,45 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_raft_millis_since_quorum_ack\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"value\") AS \"v\" FROM \"dtfs_raft_millis_since_quorum_ack\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "since quorum ack $tag_node"
+          "alias": "quorum ack age"
         }
       ]
     },
     {
-      "id": 6,
+      "id": 17,
       "type": "timeseries",
-      "title": "Raft apply / log write / vote write latency (p99)",
-      "description": "",
+      "title": "Raft term",
+      "description": "Current Raft term per manager. All managers share one term; a rising term means elections took place.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 12,
-        "y": 16
+        "x": 0,
+        "y": 42
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "µs",
+          "unit": "short",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
-          }
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
         },
         "overrides": []
       },
@@ -364,7 +1156,8 @@
           "calcs": [
             "lastNotNull",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -379,63 +1172,118 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_apply_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT mean(\"value\") AS \"v\" FROM \"dtfs_raft_current_term\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "apply $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_log_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "log write $tag_node $col"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_vote_write_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "vote write $tag_node $col"
+          "alias": "term $tag_node"
         }
       ]
     },
     {
-      "id": 7,
+      "id": 18,
+      "type": "timeseries",
+      "title": "Leader changes per minute",
+      "description": "Rate of leader changes seen by each manager. Zero is normal; bursts mean elections.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "opm",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1m) AS \"r\" FROM \"dtfs_raft_leader_changes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "leader changes $tag_node"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "row",
+      "title": "RPC and REST",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 51
+      }
+    },
+    {
+      "id": 20,
       "type": "timeseries",
       "title": "gRPC requests by method",
-      "description": "",
+      "description": "Requests per second of each gRPC method, summed over the selected managers. Shows the mix of client, scheduler and Raft transport traffic.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 9,
+        "w": 24,
         "x": 0,
-        "y": 24
+        "y": 52
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "ops",
+          "unit": "reqps",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
             "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": 30000,
             "stacking": {
-              "mode": "normal",
+              "mode": "none",
               "group": "A"
             }
           }
@@ -445,11 +1293,12 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
-            "lastNotNull",
+            "mean",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -464,27 +1313,28 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_grpc_server_requests\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\" fill(null)",
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_grpc_server_requests\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\") WHERE $timeFilter GROUP BY time($__interval), \"method\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "$tag_node $tag_method"
+          "alias": "$tag_method"
         }
       ]
     },
     {
-      "id": 8,
+      "id": 21,
       "type": "timeseries",
-      "title": "gRPC latency by method",
-      "description": "",
+      "title": "gRPC latency by method (p99)",
+      "description": "p99 handler latency of each gRPC method, maximum over the selected managers. Long-polling or streaming methods are naturally slow; look for methods that got slower than usual.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 24
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 61
       },
       "fieldConfig": {
         "defaults": {
@@ -492,137 +1342,12 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_grpc_server_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "$tag_node $tag_method $col"
-        }
-      ]
-    },
-    {
-      "id": 9,
-      "type": "timeseries",
-      "title": "gRPC errors by method and code, inflight",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 32
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_grpc_server_errors\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\", \"code\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "$tag_node $tag_method $tag_code"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_grpc_server_inflight\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "inflight  $tag_node $tag_method"
-        }
-      ]
-    },
-    {
-      "id": 10,
-      "type": "timeseries",
-      "title": "REST requests by route and status class",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 32
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
             "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": 30000,
             "stacking": {
-              "mode": "normal",
+              "mode": "none",
               "group": "A"
             }
           }
@@ -632,11 +1357,13 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -651,37 +1378,43 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_rest_requests\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"route\", \"status\" fill(null)",
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_grpc_server_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"method\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "$tag_node $tag_route $tag_status"
+          "alias": "$tag_method"
         }
       ]
     },
     {
-      "id": 11,
+      "id": 22,
       "type": "timeseries",
-      "title": "REST latency by route",
-      "description": "",
+      "title": "gRPC errors by method and code",
+      "description": "gRPC calls that returned an error per second, by method and status code, summed over the selected managers. Normal is an empty graph or rare NotFound; sustained Unavailable or Internal needs attention.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 0,
-        "y": 40
+        "y": 70
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "µs",
+          "unit": "ops",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -689,11 +1422,12 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
-            "lastNotNull",
+            "mean",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -708,49 +1442,57 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_rest_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"route\" fill(null)",
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_grpc_server_errors\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"method\", \"code\") WHERE $timeFilter GROUP BY time($__interval), \"method\", \"code\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "$tag_node $tag_route $col"
+          "alias": "$tag_method $tag_code"
         }
       ]
     },
     {
-      "id": 12,
+      "id": 23,
       "type": "timeseries",
-      "title": "Forwarding latency",
-      "description": "",
+      "title": "gRPC in-flight calls",
+      "description": "Calls currently being handled, per method, summed over the selected managers. A value that stays high means handlers are blocked.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 12,
-        "y": 40
+        "y": 70
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "µs",
+          "unit": "short",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
-          }
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
         },
         "overrides": []
       },
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
             "lastNotNull",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -765,10 +1507,217 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_forward_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"value\") AS \"v\" FROM \"dtfs_grpc_server_inflight\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"method\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "forward $tag_node $col"
+          "alias": "$tag_method"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "REST requests by route and status",
+      "description": "REST requests per second by route and status class, summed over the selected managers. 2xx is normal; 4xx and 5xx lines show failing callers.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 79
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_rest_requests\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"route\", \"status\") WHERE $timeFilter GROUP BY time($__interval), \"route\", \"status\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "$tag_route $tag_status"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "REST latency by route (p99)",
+      "description": "p99 REST handler latency per route, maximum over the selected managers. Dashboard and CLI polling routes should stay in the low milliseconds.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 88
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_rest_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"route\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "$tag_route"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "row",
+      "title": "Forwarding",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 97
+      }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Forwarding latency (p99)",
+      "description": "p99 of a write forwarded from a follower to the leader (forward), and of a write served locally or forwarded (write or forward), per manager. The forward line is the network plus leader cost followers pay on top of a local write.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 98
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_forward_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "forward $tag_node"
         },
         {
           "datasource": {
@@ -777,27 +1726,28 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_raft_write_or_forward_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_raft_write_or_forward_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "write_or_forward $tag_node $col"
+          "alias": "write or forward $tag_node"
         }
       ]
     },
     {
-      "id": 13,
+      "id": 28,
       "type": "timeseries",
       "title": "Forwarding rates",
-      "description": "",
+      "description": "Writes forwarded by a follower (by request type), received by the leader, and failed forwards per second, per manager. Failed forwards should be zero; they appear during elections.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 0,
-        "y": 48
+        "x": 12,
+        "y": 98
       },
       "fieldConfig": {
         "defaults": {
@@ -805,9 +1755,14 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -815,11 +1770,12 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
-            "lastNotNull",
+            "mean",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -834,10 +1790,10 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_raft_forwarded\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"op\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_raft_forwarded\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"op\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "forwarded  $tag_node $tag_op"
+          "alias": "forwarded $tag_node $tag_op"
         },
         {
           "datasource": {
@@ -846,7 +1802,7 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_raft_forward_received\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_raft_forward_received\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "received $tag_node"
@@ -858,7 +1814,7 @@
           },
           "refId": "C",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_raft_forward_failed\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_raft_forward_failed\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
           "alias": "failed $tag_node"
@@ -866,19 +1822,33 @@
       ]
     },
     {
-      "id": 14,
+      "id": 29,
+      "type": "row",
+      "title": "Scheduler and tiering",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 107
+      }
+    },
+    {
+      "id": 30,
       "type": "timeseries",
-      "title": "Scheduler tasks and outcomes",
-      "description": "",
+      "title": "Scheduler tasks created",
+      "description": "Repair, replication and anchor-lag tasks created per second by kind (leader only). Steady near zero when the cluster is healthy; bursts follow node loss or new writes.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 12,
-        "y": 48
+        "x": 0,
+        "y": 108
       },
       "fieldConfig": {
         "defaults": {
@@ -886,9 +1856,14 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -898,9 +1873,10 @@
           "displayMode": "table",
           "placement": "bottom",
           "calcs": [
-            "lastNotNull",
+            "mean",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -915,10 +1891,138 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_scheduler_tasks_created\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"kind\" fill(null)",
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_scheduler_tasks_created\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"kind\") WHERE $timeFilter GROUP BY time($__interval), \"kind\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "created  $tag_node $tag_kind"
+          "alias": "created $tag_kind"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Scheduler tasks finished",
+      "description": "Finished tasks per second by status. `done` should track created; any `failed` rate needs a look at the scheduler logs.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 108
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_scheduler_tasks_finished\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"status\") WHERE $timeFilter GROUP BY time($__interval), \"status\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "finished $tag_status"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Replication outcomes and repair budget hits",
+      "description": "Outcomes of replication scheduling per second, and how often the repair budget ran out. Occasional budget hits are normal during a large repair; permanent ones mean the budget is too small.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 117
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_scheduler_replication_outcomes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"outcome\") WHERE $timeFilter GROUP BY time($__interval), \"outcome\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "$tag_outcome"
         },
         {
           "datasource": {
@@ -927,51 +2031,28 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_scheduler_tasks_finished\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"status\" fill(null)",
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_scheduler_repair_budget_hits\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\") WHERE $timeFilter GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "finished  $tag_node $tag_status"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_scheduler_replication_outcomes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"outcome\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "outcome  $tag_node $tag_outcome"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_scheduler_repair_budget_hits\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "budget hits $tag_node"
+          "alias": "budget hits"
         }
       ]
     },
     {
-      "id": 15,
+      "id": 33,
       "type": "timeseries",
-      "title": "Scheduler / tiering / precache tick latency",
-      "description": "",
+      "title": "Background task latency (p99)",
+      "description": "p99 duration of one scheduler, tiering, pre-cache, capacity-evict, retention and orphan-reap run (leader only, maximum over managers). Should stay well below the tick interval.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 0,
-        "y": 56
+        "x": 12,
+        "y": 117
       },
       "fieldConfig": {
         "defaults": {
@@ -979,9 +2060,14 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": []
@@ -989,11 +2075,13 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -1008,10 +2096,10 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_scheduler_tick_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_scheduler_tick_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "scheduler $tag_node $col"
+          "alias": "scheduler"
         },
         {
           "datasource": {
@@ -1020,10 +2108,10 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_tiering_tick_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_tiering_tick_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "tiering $tag_node $col"
+          "alias": "tiering"
         },
         {
           "datasource": {
@@ -1032,10 +2120,10 @@
           },
           "refId": "C",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_precache_tick_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_precache_tick_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "precache $tag_node $col"
+          "alias": "precache"
         },
         {
           "datasource": {
@@ -1044,10 +2132,10 @@
           },
           "refId": "D",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_tiering_capacity_evict_tick_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_tiering_capacity_evict_tick_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "capacity evict $tag_node $col"
+          "alias": "capacity evict"
         },
         {
           "datasource": {
@@ -1056,132 +2144,40 @@
           },
           "refId": "E",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_tiering_retention_tick_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_tiering_retention_tick_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "retention $tag_node $col"
+          "alias": "retention"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "F",
+          "hide": false,
+          "query": "SELECT max(\"p99\") AS \"p99\" FROM \"dtfs_orphan_reap_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "orphan reap"
         }
       ]
     },
     {
-      "id": 16,
+      "id": 34,
       "type": "timeseries",
       "title": "Cache copies, fills and removals",
-      "description": "",
+      "description": "Cache copies scheduled by the promote and pre-cache planners (by target DC), fill-on-read registrations (by reader DC) and cache copies removed (by reason), per second. Shows how actively the cache is churning.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 56
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_tiering_promote_copies\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"target_dc\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "promote  $tag_node $tag_target_dc"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_precache_copies\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"target_dc\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "precache  $tag_node $tag_target_dc"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_cache_fill_commits\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"reader_dc\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "fill  $tag_node $tag_reader_dc"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_cache_removed\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"reason\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "removed  $tag_node $tag_reason"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "E",
-          "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_precache_scheduled_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
-          "rawQuery": true,
-          "resultFormat": "time_series",
-          "alias": "precache bytes/s $tag_node"
-        }
-      ]
-    },
-    {
-      "id": 17,
-      "type": "timeseries",
-      "title": "Orphan reap",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 0,
-        "y": 64
+        "y": 126
       },
       "fieldConfig": {
         "defaults": {
@@ -1189,34 +2185,27 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": ".*freed bytes/s.*"
-            },
-            "properties": [
-              {
-                "id": "custom.axisPlacement",
-                "value": "right"
-              }
-            ]
-          }
-        ]
+        "overrides": []
       },
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
-            "lastNotNull",
+            "mean",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -1231,10 +2220,10 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_orphan_reap_runs\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"result\" fill(null)",
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_tiering_promote_copies\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"target_dc\") WHERE $timeFilter GROUP BY time($__interval), \"target_dc\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "runs  $tag_node $tag_result"
+          "alias": "promote $tag_target_dc"
         },
         {
           "datasource": {
@@ -1243,10 +2232,10 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_orphan_reap_candidates\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_precache_copies\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"target_dc\") WHERE $timeFilter GROUP BY time($__interval), \"target_dc\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "candidates $tag_node"
+          "alias": "precache $tag_target_dc"
         },
         {
           "datasource": {
@@ -1255,10 +2244,10 @@
           },
           "refId": "C",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_orphan_reap_chunks\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_cache_fill_commits\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"reader_dc\") WHERE $timeFilter GROUP BY time($__interval), \"reader_dc\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "reaped $tag_node"
+          "alias": "fill $tag_reader_dc"
         },
         {
           "datasource": {
@@ -1267,50 +2256,299 @@
           },
           "refId": "D",
           "hide": false,
-          "query": "SELECT non_negative_derivative(mean(\"value\"), 1s) FROM \"dtfs_orphan_reap_freed_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_cache_removed\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"reason\") WHERE $timeFilter GROUP BY time($__interval), \"reason\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "freed bytes/s $tag_node"
+          "alias": "removed $tag_reason"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Pre-cache and fill bytes",
+      "description": "Bytes per second scheduled by pre-cache and registered by fill-on-read. Compare with the WAN link budget; sustained peaks near the link speed starve other traffic.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 126
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_precache_scheduled_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\") WHERE $timeFilter GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "precache"
         },
         {
           "datasource": {
             "type": "influxdb",
             "uid": "${DS}"
           },
-          "refId": "E",
+          "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"p50\") AS \"p50\", mean(\"p90\") AS \"p90\", max(\"p99\") AS \"p99\" FROM \"dtfs_orphan_reap_us\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_cache_fill_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"reader_dc\") WHERE $timeFilter GROUP BY time($__interval), \"reader_dc\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "run $tag_node $col"
+          "alias": "fill $tag_reader_dc"
         }
       ]
     },
     {
-      "id": 18,
+      "id": 36,
+      "type": "row",
+      "title": "Orphan reap",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 135
+      }
+    },
+    {
+      "id": 37,
       "type": "timeseries",
-      "title": "Cluster state (files, nodes by health, transitions)",
-      "description": "",
+      "title": "Orphan reap runs and chunks",
+      "description": "Orphan reap runs (by result), candidate chunks found and chunks removed per second. Zero most of the time; chunks should follow candidates after the grace period.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
-        "x": 12,
-        "y": 64
+        "x": 0,
+        "y": 136
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "ops",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_orphan_reap_runs\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"result\") WHERE $timeFilter GROUP BY time($__interval), \"result\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "runs $tag_result"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_orphan_reap_candidates\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\") WHERE $timeFilter GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "candidates"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_orphan_reap_chunks\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\") WHERE $timeFilter GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "chunks"
+        }
+      ]
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Orphan reap freed bytes",
+      "description": "Bytes freed per second by orphan reaping. Zero most of the time; bursts follow deleted files after the grace period.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 136
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1s) AS \"r\" FROM \"dtfs_orphan_reap_freed_bytes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\") WHERE $timeFilter GROUP BY time($__interval) fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "freed"
+        }
+      ]
+    },
+    {
+      "id": 39,
+      "type": "row",
+      "title": "Cluster state",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 145
+      }
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Files and nodes in the state machine",
+      "description": "Number of files and of registered nodes in the replicated state machine (every manager reports the same values; maximum shown). A sudden drop in files is a red flag.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 146
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
         },
         "overrides": []
       },
@@ -1321,7 +2559,8 @@
           "calcs": [
             "lastNotNull",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -1336,10 +2575,10 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_sm_files\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\" fill(null)",
+          "query": "SELECT max(\"value\") AS \"v\" FROM \"dtfs_sm_files\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "files $tag_node"
+          "alias": "files"
         },
         {
           "datasource": {
@@ -1348,22 +2587,139 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "SELECT mean(\"value\") FROM \"dtfs_sm_nodes_by_health\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"health\" fill(null)",
+          "query": "SELECT max(\"value\") AS \"v\" FROM \"dtfs_sm_nodes\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval) fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "nodes  $tag_node $tag_health"
+          "alias": "nodes"
+        }
+      ]
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Nodes by health",
+      "description": "Registered nodes per health state. All nodes healthy is normal; suspect or down nodes start repair.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 146
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
         },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
         {
           "datasource": {
             "type": "influxdb",
             "uid": "${DS}"
           },
-          "refId": "C",
+          "refId": "A",
           "hide": false,
-          "query": "SELECT non_negative_difference(max(\"value\")) FROM \"dtfs_monitor_node_transitions\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"to\" fill(null)",
+          "query": "SELECT max(\"value\") AS \"v\" FROM \"dtfs_sm_nodes_by_health\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"health\" fill(null)",
           "rawQuery": true,
           "resultFormat": "time_series",
-          "alias": "transitions to  $tag_node $tag_to"
+          "alias": "nodes $tag_health"
+        }
+      ]
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Node health transitions per minute",
+      "description": "Node health transitions per minute by target state, summed over managers. Flapping nodes show up as repeated transitions.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 155
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "opm",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "SELECT sum(\"r\") AS \"r\" FROM (SELECT non_negative_derivative(last(\"value\"), 1m) AS \"r\" FROM \"dtfs_monitor_node_transitions\" WHERE $timeFilter AND \"dc\" =~ /^$dc$/ AND \"node\" =~ /^$node$/ GROUP BY time($__interval), \"node\", \"to\") WHERE $timeFilter GROUP BY time($__interval), \"to\" fill(null)",
+          "rawQuery": true,
+          "resultFormat": "time_series",
+          "alias": "to $tag_to"
         }
       ]
     }

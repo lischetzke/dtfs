@@ -9,44 +9,89 @@
   "panels": [
     {
       "id": 1,
-      "type": "timeseries",
-      "title": "Leader / has leader (1 = yes)",
-      "description": "",
+      "type": "row",
+      "title": "Overview",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": 2,
+      "type": "state-timeline",
+      "title": "Raft leader per manager",
+      "description": "One lane per manager: green is the Raft leader, blue a follower. Exactly one lane should be green at any time; flapping lanes mean repeated elections.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 4,
+        "w": 4,
         "x": 0,
-        "y": 0
+        "y": 1
       },
       "fieldConfig": {
         "defaults": {
           "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
           "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
+            "fillOpacity": 70,
+            "lineWidth": 0
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "leader",
+                  "color": "green",
+                  "index": 0
+                },
+                "0": {
+                  "text": "follower",
+                  "color": "blue",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
           }
         },
         "overrides": []
       },
       "options": {
+        "mergeValues": true,
+        "showValue": "auto",
+        "alignValue": "left",
+        "rowHeight": 0.9,
         "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+          "showLegend": false,
+          "displayMode": "list",
+          "placement": "bottom"
         },
         "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
+          "mode": "single",
+          "sort": "none"
         }
       },
       "targets": [
@@ -57,55 +102,442 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_is_leader\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"is leader\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_is_leader\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"leader\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Quorum has leader",
+      "description": "Minimum of raft_has_leader over the selected managers: YES while every manager sees a leader, NO as soon as one does not (election in progress or no quorum).",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "NO",
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "text": "YES",
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          }
         },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
         {
           "datasource": {
             "type": "influxdb",
             "uid": "${DS}"
           },
-          "refId": "B",
+          "refId": "A",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_has_leader\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"has leader\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_has_leader\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: min, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"has leader\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         }
       ]
     },
     {
-      "id": 2,
-      "type": "timeseries",
-      "title": "Term and leader changes",
-      "description": "",
+      "id": 4,
+      "type": "stat",
+      "title": "Leader changes (range)",
+      "description": "Leader changes seen over the selected time range (largest count among the selected managers). 0 is normal; a few mean restarts or elections, many mean an unstable cluster.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 0
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 1
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_leader_changes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> spread()\n  |> group(columns: [\"_field\"])\n  |> max()\n  |> map(fn: (r) => ({r with _field: \"leader changes\"}))\n  |> keep(columns: [\"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Raft log fsync p99",
+      "description": "p99 of the Raft log append plus fsync (worst selected manager). Compare with Client write p99: if fsync is most of it, deferring the fsync would pay off.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 10000
+              },
+              {
+                "color": "red",
+                "value": 50000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_log_write_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"log write p99\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Client write p99",
+      "description": "p99 of a client_write on the local Raft, from proposal to applied (worst selected manager). This is the end-to-end cost of one metadata mutation.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 50000
+              },
+              {
+                "color": "red",
+                "value": 250000
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_client_write_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"client write p99\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Max follower lag",
+      "description": "Largest follower lag in log entries across all peers, reported by the leader. Near 0 is normal; a growing value means a follower is slow, partitioned or down.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 1
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_follower_lag\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"max lag\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "Raft",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Raft log fsync vs client write, p50",
+      "description": "Median Raft log append plus fsync (orange) against the median end-to-end client write (blue), per manager. The gap is apply, replication and waiting; when the orange line is close to the blue one the fsync dominates a write.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
         "overrides": [
           {
             "matcher": {
               "id": "byRegexp",
-              "options": ".*leader changes.*"
+              "options": "^log write.*"
             },
             "properties": [
               {
-                "id": "custom.axisPlacement",
-                "value": "right"
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^client write.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
               }
             ]
           }
@@ -114,11 +546,13 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -133,7 +567,7 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_current_term\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"term\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_log_write_us\" and r._field == \"p50\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"log write\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         },
         {
           "datasource": {
@@ -142,100 +576,85 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_leader_changes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"leader changes\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> difference(nonNegative: true)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_client_write_us\" and r._field == \"p50\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"client write\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         }
       ]
     },
     {
-      "id": 3,
+      "id": 10,
       "type": "timeseries",
-      "title": "Apply lag per manager (last_log - last_applied)",
-      "description": "",
+      "title": "Raft log fsync vs client write, p99",
+      "description": "Tail latency of the Raft log append plus fsync (orange) against the end-to-end client write (blue), per manager. p50 uses the mean of the per-interval p50, p99 the maximum of the per-interval p99. Spikes in orange that carry the blue line up point at disk fsync stalls.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 8
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_apply_lag\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"apply lag\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
-        }
-      ]
-    },
-    {
-      "id": 4,
-      "type": "timeseries",
-      "title": "Follower lag by peer (leader only)",
-      "description": "Exported by the leader only; 0 on followers.",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 6
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "none",
+          "unit": "µs",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^log write.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "^client write.*"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "calcs": [
-            "lastNotNull",
-            "max"
-          ]
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -250,24 +669,354 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_follower_lag\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"lag\")\n  |> group(columns: [\"node\", \"peer\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_log_write_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"log write\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_client_write_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"client write\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         }
       ]
     },
     {
-      "id": 5,
+      "id": 11,
       "type": "timeseries",
-      "title": "Millis since quorum ack (leader only)",
-      "description": "Exported by the leader only; 0 on followers.",
+      "title": "Raft apply and vote write latency (p99)",
+      "description": "p99 time to apply one log entry to the state machine and to persist a vote, per manager. Apply should stay far below the client write latency; vote writes only happen during elections.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 0,
-        "y": 16
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_apply_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"apply\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_vote_write_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"vote write\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Entries per log append (p99)",
+      "description": "p99 number of log entries written per append, per manager. Higher values mean the leader batches many proposals into one fsync; always 1 means no batching.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_append_entries\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"entries\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Bytes per log append (p99)",
+      "description": "p99 size of one Raft log append, per manager. Large appends take longer to write and fsync.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_append_bytes\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"append\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Apply lag per manager",
+      "description": "Last log index minus last applied index of each manager. 0 or a few entries is normal; a lag that keeps growing means the state machine cannot keep up.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_apply_lag\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"apply lag\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Follower lag by peer",
+      "description": "Leader's last log index minus the matched index of each follower. `peer` is the numeric Raft node id, not a hostname. A former leader keeps exporting 0 for its peers, so each line is the maximum over the selected managers. Near 0 is normal; a growing line is a slow or unreachable follower.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_follower_lag\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"peer\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"peer\" + r.peer}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Millis since quorum ack",
+      "description": "Milliseconds since the leader last heard from a quorum (0 on non-leaders, so the maximum over managers is shown). Stays near the heartbeat interval; values reaching the election timeout predict a new election.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 33
       },
       "fieldConfig": {
         "defaults": {
@@ -275,137 +1024,12 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_millis_since_quorum_ack\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"since quorum ack\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
-        }
-      ]
-    },
-    {
-      "id": 6,
-      "type": "timeseries",
-      "title": "Raft apply / log write / vote write latency (p99)",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 16
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_apply_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"apply \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_log_write_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"log write \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_vote_write_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"vote write \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
-    },
-    {
-      "id": 7,
-      "type": "timeseries",
-      "title": "gRPC requests by method",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 24
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
             "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true,
+            "spanNulls": 30000,
             "stacking": {
-              "mode": "normal",
+              "mode": "none",
               "group": "A"
             }
           }
@@ -419,7 +1043,8 @@
           "calcs": [
             "lastNotNull",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -434,763 +1059,42 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_grpc_server_requests\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"grpc_server_requests\")\n  |> group(columns: [\"node\", \"method\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        }
-      ]
-    },
-    {
-      "id": 8,
-      "type": "timeseries",
-      "title": "gRPC latency by method",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 24
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_grpc_server_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> group(columns: [\"node\", \"method\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
-    },
-    {
-      "id": 9,
-      "type": "timeseries",
-      "title": "gRPC errors by method and code, inflight",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 32
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_grpc_server_errors\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"grpc_server_errors\")\n  |> group(columns: [\"node\", \"method\", \"code\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_grpc_server_inflight\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"inflight \")\n  |> group(columns: [\"node\", \"method\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
-        }
-      ]
-    },
-    {
-      "id": 10,
-      "type": "timeseries",
-      "title": "REST requests by route and status class",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 32
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 10,
-            "showPoints": "never",
-            "spanNulls": true,
-            "stacking": {
-              "mode": "normal",
-              "group": "A"
-            }
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_rest_requests\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"rest_requests\")\n  |> group(columns: [\"node\", \"route\", \"status\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        }
-      ]
-    },
-    {
-      "id": 11,
-      "type": "timeseries",
-      "title": "REST latency by route",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 40
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_rest_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> group(columns: [\"node\", \"route\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
-    },
-    {
-      "id": 12,
-      "type": "timeseries",
-      "title": "Forwarding latency",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 40
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_forward_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"forward \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_raft_write_or_forward_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"write_or_forward \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
-    },
-    {
-      "id": 13,
-      "type": "timeseries",
-      "title": "Forwarding rates",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 48
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_forwarded\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"forwarded \")\n  |> group(columns: [\"node\", \"op\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_forward_received\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"received\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_forward_failed\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"failed\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        }
-      ]
-    },
-    {
-      "id": 14,
-      "type": "timeseries",
-      "title": "Scheduler tasks and outcomes",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 48
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_scheduler_tasks_created\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"created \")\n  |> group(columns: [\"node\", \"kind\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_scheduler_tasks_finished\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"finished \")\n  |> group(columns: [\"node\", \"status\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_scheduler_replication_outcomes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"outcome \")\n  |> group(columns: [\"node\", \"outcome\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_scheduler_repair_budget_hits\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"budget hits\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        }
-      ]
-    },
-    {
-      "id": 15,
-      "type": "timeseries",
-      "title": "Scheduler / tiering / precache tick latency",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 56
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "µs",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_scheduler_tick_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"scheduler \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_tiering_tick_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"tiering \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_precache_tick_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"precache \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_tiering_capacity_evict_tick_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"capacity evict \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "E",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_tiering_retention_tick_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"retention \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
-    },
-    {
-      "id": 16,
-      "type": "timeseries",
-      "title": "Cache copies, fills and removals",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 56
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "A",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_tiering_promote_copies\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"promote \")\n  |> group(columns: [\"node\", \"target_dc\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_precache_copies\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"precache \")\n  |> group(columns: [\"node\", \"target_dc\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_cache_fill_commits\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"fill \")\n  |> group(columns: [\"node\", \"reader_dc\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_cache_removed\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"removed \")\n  |> group(columns: [\"node\", \"reason\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "E",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_precache_scheduled_bytes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"precache bytes/s\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_millis_since_quorum_ack\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"quorum ack age\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         }
       ]
     },
     {
       "id": 17,
       "type": "timeseries",
-      "title": "Orphan reap",
-      "description": "",
+      "title": "Raft term",
+      "description": "Current Raft term per manager. All managers share one term; a rising term means elections took place.",
       "datasource": {
         "type": "influxdb",
         "uid": "${DS}"
       },
+      "interval": "10s",
       "gridPos": {
-        "h": 8,
+        "h": 9,
         "w": 12,
         "x": 0,
-        "y": 64
+        "y": 42
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "ops",
+          "unit": "short",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 0,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
             "showPoints": "never",
-            "spanNulls": true
-          }
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": ".*freed bytes/s.*"
-            },
-            "properties": [
-              {
-                "id": "custom.axisPlacement",
-                "value": "right"
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
           },
-          "refId": "A",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_orphan_reap_runs\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"runs \")\n  |> group(columns: [\"node\", \"result\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "B",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_orphan_reap_candidates\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"candidates\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "C",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_orphan_reap_chunks\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"reaped\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "D",
-          "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_orphan_reap_freed_bytes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"freed bytes/s\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)"
-        },
-        {
-          "datasource": {
-            "type": "influxdb",
-            "uid": "${DS}"
-          },
-          "refId": "E",
-          "hide": false,
-          "query": "base = from(bucket: \"${bucket}\")\n    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n    |> filter(fn: (r) => r._measurement == \"dtfs_orphan_reap_us\" and (r._field == \"p50\" or r._field == \"p90\" or r._field == \"p99\"))\n    |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n    |> map(fn: (r) => ({r with _field: \"run \" + r._field}))\n    |> group(columns: [\"node\", \"_field\"])\n\nlo = base\n  |> filter(fn: (r) => r._field =~ /(p50|p90)$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\nhi = base\n  |> filter(fn: (r) => r._field =~ /p99$/)\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n\nunion(tables: [lo, hi])"
-        }
-      ]
-    },
-    {
-      "id": 18,
-      "type": "timeseries",
-      "title": "Cluster state (files, nodes by health, transitions)",
-      "description": "",
-      "datasource": {
-        "type": "influxdb",
-        "uid": "${DS}"
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 64
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "none",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": true
-          }
+          "decimals": 0
         },
         "overrides": []
       },
@@ -1201,7 +1105,8 @@
           "calcs": [
             "lastNotNull",
             "max"
-          ]
+          ],
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -1216,7 +1121,525 @@
           },
           "refId": "A",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_sm_files\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"files\")\n  |> group(columns: [\"node\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_current_term\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"term\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Leader changes per minute",
+      "description": "Rate of leader changes seen by each manager. Zero is normal; bursts mean elections.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 42
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "opm",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_leader_changes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1m, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"leader changes\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "row",
+      "title": "RPC and REST",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 51
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "gRPC requests by method",
+      "description": "Requests per second of each gRPC method, summed over the selected managers. Shows the mix of client, scheduler and Raft transport traffic.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 52
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_grpc_server_requests\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: r.method}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "gRPC latency by method (p99)",
+      "description": "p99 handler latency of each gRPC method, maximum over the selected managers. Long-polling or streaming methods are naturally slow; look for methods that got slower than usual.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 61
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_grpc_server_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"method\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: r.method}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "gRPC errors by method and code",
+      "description": "gRPC calls that returned an error per second, by method and status code, summed over the selected managers. Normal is an empty graph or rare NotFound; sustained Unavailable or Internal needs attention.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 70
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_grpc_server_errors\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: r.method + r.code}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "gRPC in-flight calls",
+      "description": "Calls currently being handled, per method, summed over the selected managers. A value that stays high means handlers are blocked.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_grpc_server_inflight\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"method\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: r.method}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "REST requests by route and status",
+      "description": "REST requests per second by route and status class, summed over the selected managers. 2xx is normal; 4xx and 5xx lines show failing callers.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 79
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_rest_requests\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: r.route + r.status}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "REST latency by route (p99)",
+      "description": "p99 REST handler latency per route, maximum over the selected managers. Dashboard and CLI polling routes should stay in the low milliseconds.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 88
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_rest_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"route\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: r.route}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "row",
+      "title": "Forwarding",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 97
+      }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Forwarding latency (p99)",
+      "description": "p99 of a write forwarded from a follower to the leader (forward), and of a write served locally or forwarded (write or forward), per manager. The forward line is the network plus leader cost followers pay on top of a local write.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 98
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_forward_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"forward\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         },
         {
           "datasource": {
@@ -1225,7 +1648,77 @@
           },
           "refId": "B",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_sm_nodes_by_health\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"nodes \")\n  |> group(columns: [\"node\", \"health\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: mean, createEmpty: false)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_write_or_forward_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"node\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"write or forward\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Forwarding rates",
+      "description": "Writes forwarded by a follower (by request type), received by the leader, and failed forwards per second, per manager. Failed forwards should be zero; they appear during elections.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 98
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_forwarded\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"forwarded\" + r.node + r.op}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_forward_received\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"received\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         },
         {
           "datasource": {
@@ -1234,7 +1727,837 @@
           },
           "refId": "C",
           "hide": false,
-          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_monitor_node_transitions\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> set(key: \"_field\", value: \"transitions to \")\n  |> group(columns: [\"node\", \"to\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> difference(nonNegative: true)"
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_raft_forward_failed\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"failed\" + r.node}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "type": "row",
+      "title": "Scheduler and tiering",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 107
+      }
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Scheduler tasks created",
+      "description": "Repair, replication and anchor-lag tasks created per second by kind (leader only). Steady near zero when the cluster is healthy; bursts follow node loss or new writes.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 108
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_scheduler_tasks_created\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"created\" + r.kind}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Scheduler tasks finished",
+      "description": "Finished tasks per second by status. `done` should track created; any `failed` rate needs a look at the scheduler logs.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 108
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_scheduler_tasks_finished\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"finished\" + r.status}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Replication outcomes and repair budget hits",
+      "description": "Outcomes of replication scheduling per second, and how often the repair budget ran out. Occasional budget hits are normal during a large repair; permanent ones mean the budget is too small.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 117
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_scheduler_replication_outcomes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: r.outcome}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_scheduler_repair_budget_hits\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"budget hits\"}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Background task latency (p99)",
+      "description": "p99 duration of one scheduler, tiering, pre-cache, capacity-evict, retention and orphan-reap run (leader only, maximum over managers). Should stay well below the tick interval.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 117
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_scheduler_tick_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"scheduler\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_tiering_tick_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"tiering\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_precache_tick_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"precache\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "D",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_tiering_capacity_evict_tick_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"capacity evict\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "E",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_tiering_retention_tick_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"retention\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "F",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_orphan_reap_us\" and r._field == \"p99\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"orphan reap\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Cache copies, fills and removals",
+      "description": "Cache copies scheduled by the promote and pre-cache planners (by target DC), fill-on-read registrations (by reader DC) and cache copies removed (by reason), per second. Shows how actively the cache is churning.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 126
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_tiering_promote_copies\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"promote\" + r.target_dc}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_precache_copies\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"precache\" + r.target_dc}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_cache_fill_commits\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"fill\" + r.reader_dc}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "D",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_cache_removed\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"removed\" + r.reason}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Pre-cache and fill bytes",
+      "description": "Bytes per second scheduled by pre-cache and registered by fill-on-read. Compare with the WAN link budget; sustained peaks near the link speed starve other traffic.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 126
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_precache_scheduled_bytes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"precache\"}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_cache_fill_bytes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"fill\" + r.reader_dc}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "type": "row",
+      "title": "Orphan reap",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 135
+      }
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Orphan reap runs and chunks",
+      "description": "Orphan reap runs (by result), candidate chunks found and chunks removed per second. Zero most of the time; chunks should follow candidates after the grace period.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 136
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_orphan_reap_runs\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"runs\" + r.result}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_orphan_reap_candidates\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"candidates\"}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "C",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_orphan_reap_chunks\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"chunks\"}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Orphan reap freed bytes",
+      "description": "Bytes freed per second by orphan reaping. Zero most of the time; bursts follow deleted files after the grace period.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 136
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_orphan_reap_freed_bytes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1s, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"freed\"}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 39,
+      "type": "row",
+      "title": "Cluster state",
+      "collapsed": false,
+      "panels": [],
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 145
+      }
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Files and nodes in the state machine",
+      "description": "Number of files and of registered nodes in the replicated state machine (every manager reports the same values; maximum shown). A sudden drop in files is a red flag.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 146
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_sm_files\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"files\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        },
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "B",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_sm_nodes\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"nodes\"}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Nodes by health",
+      "description": "Registered nodes per health state. All nodes healthy is normal; suspect or down nodes start repair.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 146
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_sm_nodes_by_health\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> group(columns: [\"health\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: max, createEmpty: false)\n  |> map(fn: (r) => ({r with _field: \"nodes\" + r.health}))\n  |> group(columns: [\"_field\"])\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
+        }
+      ]
+    },
+    {
+      "id": 42,
+      "type": "timeseries",
+      "title": "Node health transitions per minute",
+      "description": "Node health transitions per minute by target state, summed over managers. Flapping nodes show up as repeated transitions.",
+      "datasource": {
+        "type": "influxdb",
+        "uid": "${DS}"
+      },
+      "interval": "10s",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 155
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "opm",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "opacity",
+            "showPoints": "never",
+            "spanNulls": 30000,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "${DS}"
+          },
+          "refId": "A",
+          "hide": false,
+          "query": "from(bucket: \"${bucket}\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"dtfs_monitor_node_transitions\" and r._field == \"value\")\n  |> filter(fn: (r) => contains(value: r.dc, set: ${dc:json}) and contains(value: r.node, set: ${node:json}))\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> derivative(unit: 1m, nonNegative: true)\n  |> map(fn: (r) => ({r with _field: \"to\" + r.to}))\n  |> group(columns: [\"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)\n  |> keep(columns: [\"_time\", \"_value\", \"_field\"])"
         }
       ]
     }
